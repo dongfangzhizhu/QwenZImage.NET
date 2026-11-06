@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+*.c    text eol=lf
+*.h    text eol=lf
+*.cs   text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.csproj text eol=lf
+*.props  text eol=lf
+*.sln    text eol=crlf
+
+*.png  binary
+*.dll  binary
+*.so   binary
+*.nupkg binary

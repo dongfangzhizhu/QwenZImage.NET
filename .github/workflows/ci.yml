@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / .NET 10
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout (full history for SourceLink)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # The managed tests load the reference native library from
+      # artifacts/native/<Platform>-<Arch>/; build it first, on every OS.
+      - name: Build native reference library + C smoke test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/build-native.sh
+
+      - name: Build native reference library + C smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-native.ps1
+
+      - name: Build solution
+        run: dotnet build QwenZImage.NET.sln -c Release --nologo
+
+      - name: Run xUnit tests (31 tests, no GPU required)
+        run: dotnet test QwenZImage.NET.sln -c Release --no-build --nologo
+
+      - name: Pack NuGet package
+        run: dotnet pack src/QwenZImage.NET/QwenZImage.NET.csproj -c Release --no-build --nologo -o artifacts/packages
+
+      # pwsh is available on both runner images, so this check is OS-neutral.
+      - name: Verify package contents
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $packages = @(Get-ChildItem artifacts/packages/*.nupkg)
+          if ($packages.Count -eq 0) { throw 'no .nupkg produced' }
+          $required = @(
+            'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+            'docs/NATIVE_ABI.md', 'lib/net10.0/QwenZImage.NET.dll'
+          )
+          foreach ($p in $packages) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($p.FullName)
+            try {
+              $names = @($zip.Entries.FullName)
+              foreach ($r in $required) {
+                if (-not ($names -contains $r)) { throw "missing '$r' in $($p.Name)" }
+              }
+              Write-Host "== $($p.Name) ($($names.Count) entries, all required files present)"
+            } finally { $zip.Dispose() }
+          }
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg-${{ matrix.os }}
+          path: artifacts/packages/*
+          if-no-files-found: error

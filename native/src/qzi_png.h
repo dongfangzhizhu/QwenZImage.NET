@@ -1,0 +1,17 @@
+#ifndef QZI_PNG_H
+#define QZI_PNG_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* Minimal 8-bit RGB PNG encoder: stored (uncompressed) deflate blocks, no
+ * external dependencies. Used by the deterministic reference backend so the
+ * whole managed stack can be exercised without a GPU or model weights.
+ *
+ * Returns a malloc'd buffer, or NULL on failure (with a message in `error`).
+ * The caller frees it with free() -- the reference backend hands it to
+ * qzi_image_release(), which does exactly that. */
+uint8_t *qzi_png_encode_rgb8(const uint8_t *rgb, uint32_t width, uint32_t height,
+                             size_t *out_size, char *error, size_t error_cap);
+
+#endif /* QZI_PNG_H */

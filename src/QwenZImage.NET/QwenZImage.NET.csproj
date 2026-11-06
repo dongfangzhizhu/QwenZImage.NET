@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsPackable>true</IsPackable>
+    <RootNamespace>QwenZImage.NET</RootNamespace>
+    <AssemblyName>QwenZImage.NET</AssemblyName>
+
+    <!-- NuGet identity -->
+    <PackageId>QwenZImage.NET</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>alexhegit</Authors>
+    <Company>QwenZImage.NET contributors</Company>
+    <Product>QwenZImage.NET</Product>
+    <Title>QwenZImage.NET - .NET 10 wrapper for Qwen-Image 2.1 and Z-Image</Title>
+    <Description>High-performance .NET 10 P/Invoke wrapper over the native C ABI for Qwen-Image 2.1 (turbo/base, LoRA) and Z-Image (bf16/Nunchaku) text-to-image generation. Pure managed assembly, no Go and no HTTP hop; the caller supplies the qzi native library.</Description>
+    <Copyright>Copyright (c) 2026 QwenZImage.NET contributors</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>image-generation;qwen-image;z-image;diffusion;cuda;pinvoke;native;dotnet10;ai</PackageTags>
+    <PackageProjectUrl>https://github.com/alexhegit/QwenZImage.NET</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/alexhegit/QwenZImage.NET.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="/" />
+    <None Include="../../THIRD_PARTY_NOTICES.md" Pack="true" PackagePath="/" />
+    <None Include="../../docs/NATIVE_ABI.md" Pack="true" PackagePath="docs/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="QwenZImage.NET.Tests" />
+  </ItemGroup>
+
+</Project>

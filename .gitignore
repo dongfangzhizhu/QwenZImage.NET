@@ -1,0 +1,52 @@
+# .NET build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+TestResults/
+coverage*.json
+coverage*.xml
+*.coverage
+*.trx
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+
+# Native build trees and binaries (the reference lib is built by CI / locally)
+native/build/
+native/build-*/
+artifacts/*
+!artifacts/.gitkeep
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.o
+*.exe
+!scripts/*.ps1
+!scripts/*.sh
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local scratch / secrets
+.scratch/
+.run/
+*.local.json
+.env
