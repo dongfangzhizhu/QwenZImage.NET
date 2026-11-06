@@ -87,7 +87,7 @@ license text is reproduced at the top of `cJSON.h`.
 | xunit 2.9.2 / xunit.runner.visualstudio 2.8.2 | unit tests |
 | CMake, Ninja, GCC/Clang/MinGW/MSVC | native builds |
 | NVIDIA CUDA Toolkit (nvcc, cudart, cuBLAS, cuBLASLt) | only for `-DQZI_WITH_CUDA_ENGINE=ON` |
-| Windows SDK / ICU / OpenMP runtime | host build of the real backend |
+| Windows SDK / OpenMP runtime | host build of the real backend (on Linux ICU is only an optional runtime `dlopen`, never a link dependency) |
 
 Each of these carries its own license; consult the respective package or
 toolchain for the exact terms. They are referenced through NuGet / the

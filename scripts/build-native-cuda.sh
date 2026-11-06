@@ -2,16 +2,21 @@
 # Build libQwenZImageNative.so with the REAL Qwen-Image 2.1 / Z-Image C/CUDA
 # engine (engine/), instead of the deterministic reference backend.
 #
-# Usage:  scripts/build-native-cuda.sh [cuda-sm-arch] [build-dir]
+# Usage:  scripts/build-native-cuda.sh [cuda-sm-arch-list] [build-dir]
 #   e.g.  scripts/build-native-cuda.sh 89
+#         scripts/build-native-cuda.sh "80;86;89;90;120;121"
+#
+# The default is a fat binary covering Ampere -> Blackwell so the resulting
+# NuGet runtime works on a consumer's GPU without a rebuild. A single SM is
+# much faster to compile for local development.
 #
 # Requires: CUDA toolkit (nvcc), a host C/C++ compiler supported by that CUDA
-# version, CMake >= 3.20, Ninja (optional), OpenMP and ICU development files
-# (libicuuc). Model weights are NOT needed to build.
+# version, CMake >= 3.20, Ninja (optional) and OpenMP. Model weights are NOT
+# needed to build.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-arch="${1:-${QZEN_CUDA_ARCH:-89}}"
+arch="${1:-${QZEN_CUDA_ARCH:-80;86;87;88;89;90;100;103;110;120;121}}"
 build_dir="${2:-${QZI_BUILD_DIR:-$root/native/build-cuda}}"
 build_type="${QZI_BUILD_TYPE:-Release}"
 

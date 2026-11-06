@@ -20,9 +20,9 @@ want_cuda="${QZI_STAGE_CUDA:-0}"
 stage() {
   local name="$1" rid="$2" src dst
   if [[ "$want_cuda" == "1" ]]; then
-    src="$(find "$src_root" -type f -path '*/-cuda/*' -name "$name" -print -quit 2>/dev/null || true)"
+    src="$(find "$src_root" -type f -path '*-cuda/*' -name "$name" -print -quit 2>/dev/null || true)"
   else
-    src="$(find "$src_root" -type f -name "$name" ! -path '*/-cuda/*' -print -quit 2>/dev/null || true)"
+    src="$(find "$src_root" -type f -name "$name" ! -path '*-cuda/*' -print -quit 2>/dev/null || true)"
   fi
   if [[ -z "$src" ]]; then
     echo "  skip  $name (not built yet)"

@@ -4,9 +4,13 @@ rem ---------------------------------------------------------------------------
 rem Build QwenZImageNative.dll with the REAL Qwen-Image 2.1 / Z-Image C/CUDA
 rem engine (engine/), instead of the deterministic reference backend.
 rem
-rem Usage:  scripts\build-native-cuda.bat [cuda-sm-arch] [build-dir]
+rem Usage:  scripts\build-native-cuda.bat [cuda-sm-arch-list] [build-dir]
 rem   e.g.  scripts\build-native-cuda.bat 89
-rem         scripts\build-native-cuda.bat 121 D:\temp\qzi-cuda
+rem         scripts\build-native-cuda.bat "80;86;89;90;120;121" D:\temp\qzi-cuda
+rem
+rem The default is a fat binary covering Ampere -^> Blackwell so the resulting
+rem NuGet runtime works on a consumer's GPU without a rebuild. A single SM is
+rem much faster to compile for local development.
 rem
 rem Requires: CUDA toolkit (nvcc), a MSVC toolchain supported by that CUDA
 rem version, CMake >= 3.20 and Ninja. Model weights are NOT needed to build.
@@ -20,7 +24,8 @@ rem ---------------------------------------------------------------------------
 
 set "ROOT=%~dp0.."
 set "ARCH=%~1"
-if "%ARCH%"=="" set "ARCH=89"
+if "%ARCH%"=="" set "ARCH=%QZEN_CUDA_ARCH%"
+if "%ARCH%"=="" set "ARCH=80;86;87;88;89;90;100;103;110;120;121"
 set "BUILD_DIR=%~2"
 if "%BUILD_DIR%"=="" set "BUILD_DIR=%ROOT%\native\build-cuda"
 

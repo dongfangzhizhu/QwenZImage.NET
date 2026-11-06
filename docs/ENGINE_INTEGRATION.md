@@ -95,10 +95,12 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 ## 构建与验证真实后端
 
 ```bash
-# Windows（脚本自动加载 vcvars64，参数为 CUDA SM 版本）
-scripts\build-native-cuda.bat 89
+# Windows / Linux：默认生成覆盖 Ampere -> Blackwell 的 fat binary
+scripts\build-native-cuda.bat
+bash scripts/build-native-cuda.sh
 
-# Linux
+# 本地快速构建：只编一个 SM（脚本第一个参数是分号分隔的 SM 列表）
+scripts\build-native-cuda.bat 89
 bash scripts/build-native-cuda.sh 89
 
 # 或手工
@@ -108,7 +110,11 @@ cmake --build native/build-cuda
 ctest --test-dir native/build-cuda --output-on-failure
 ```
 
-`QZEN_CUDA_ARCH` 必须与显卡匹配（RTX 4090 = `89`，GB10 = `121`）；它会成为 `QZEN_SM_ARCH` 编译定义，架构不匹配会静默走低效路径或加载失败。Windows 需要 MSVC + CUDA Toolkit（nvcc / cudart / cuBLAS / cuBLASLt），Linux 还需要 OpenMP 与 ICU。
+`QZEN_CUDA_ARCH` 默认是分号分隔的多架构列表 `80;86;87;88;89;90;100;103;110;120;121`：一个二进制覆盖 Ampere / Ada / Hopper / Blackwell，NuGet 使用者不必按自己的显卡重编译。刻意不含 sm_75 —— attention kernel 使用 `mma.sync.m16n8k16`，要求 sm_80+。CMake 会查询 `nvcc --list-gpu-arch`，自动剔除当前 CUDA 工具链不认识的架构（例如 CUDA 12.x 没有 sm_121），全部不支持时明确报错。
+
+单架构构建时该值成为 `QZEN_SM_ARCH`；fat binary 则由 configure 生成的 `qzen_arch_config.h` 提供 `QZEN_SM_ARCH_LIST`，`qzen_gpu.cu` 在初始化时检查设备是否落在列表内，不匹配会直接打印「rebuild with -DQZEN_CUDA_ARCH=<sm>」，而不是让每个 kernel 静默返回 `cudaErrorNoKernelImageForDevice`。
+
+Windows 需要 MSVC + CUDA Toolkit 13+（nvcc / cudart / cuBLAS / cuBLASLt），Linux 需要 GCC/Clang + OpenMP。**Linux 不再需要 ICU 开发包**：`engine/platform/posix/qzen_posix_unicode.c` 在运行时 `dlopen` 宿主 ICU 并解析带版本后缀的符号（如 `u_charType_72`），完全没有 ICU 时退化为内置 UTF-8/UTF-16 转换与 ASCII/CJK 字符分类。这样 `libQwenZImageNative.so` 不带 `NEEDED libicuuc.so.NN`，可跨发行版加载；ICU 存在时 NFC 归一化仍由真实 ICU 完成。OpenMP 通过 `OpenMP::OpenMP_C` 显式链接，避免共享库留下未解析的 `omp_*` 符号。
 
 `build-native-cuda.bat` 会：如果当前 shell 已经有完整的 `cl` / `rc` / `nvcc` 环境就直接复用（不调用 `vcvars64.bat`）；否则自动 `call vcvars64.bat`；若注册表查询不可用导致 Windows SDK 的 `rc.exe` / `mt.exe` 没进 PATH，则**从文件系统**枚举 `%ProgramFiles(x86)%\Windows Kits\10\Include` 补齐 SDK 的 `PATH` / `INCLUDE` / `LIB`，避免 CMake 的 MSVC 编译检查失败。脚本最后用 `QZI_STAGE_CUDA=1` 把产物 stage 进 `artifacts/runtimes/win-x64/native/`。
 
@@ -149,7 +155,7 @@ ABI 是可替换的，`engine/` 只是本仓库提供的默认真实实现。
 - **字符串生命周期**：请求里的 `const char *` 只在调用期间有效，需要保存就自己复制。
 - **结构体布局**：`qzi_abi_layout()` 是硬门槛；改字段必须升 `QZI_ABI_VERSION` 并同步 `.NET` 的 `NativeStructs.cs` / `AbiGuard`。
 - **符号导出**：产物名固定 `QwenZImageNative.dll` / `libQwenZImageNative.so`；Windows 只导出 `QZI_API` 函数，不要带 `lib` 前缀。
-- **SM 架构**：`QZEN_CUDA_ARCH` 不匹配会导致 kernel 走错路径；构建脚本第一个参数就是它。
+- **SM 架构**：默认列表覆盖 sm_80 → sm_121，设备不在其中时 native 初始化会打印明确的 rebuild 提示，而不是让所有 kernel 静默失败；本地可用脚本第一个参数（分号分隔的 SM 列表，如 `89`）只编一个架构加速。CUDA 12.x 不认识 Blackwell 架构时 CMake 会自动剔除，全部不支持才报错。
 - **reference / CUDA 产物混用**：两者同名但内容不同，务必用 `-cuda` 目录或 `QZI_STAGE_CUDA` 区分，否则「明明跑了 build 却还是噪点」。
 - **不要静默忽略非法参数**：Turbo 非 8 步、`svdq-fp4` checkpoint、带路径的 LoRA 都必须明确失败。
 - **许可**：`engine/` 是上游 MIT 代码的改名子集，分发时必须保留 [`engine/LICENSE`](../engine/LICENSE) 的版权与许可声明；仓库根 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) 已列出全部第三方依赖。

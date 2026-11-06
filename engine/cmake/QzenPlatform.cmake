@@ -34,10 +34,27 @@ function(qzen_apply_platform_flags target)
             "$<$<COMPILE_LANGUAGE:CXX>:/bigobj>"
             "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>")
     else()
-        target_compile_options(${target} PRIVATE
-            "$<$<COMPILE_LANGUAGE:C>:-fopenmp>"
-            "$<$<COMPILE_LANGUAGE:CXX>:-fopenmp>")
+        # -fopenmp as a *compile option* alone is not enough: generator
+        # expressions guarded by COMPILE_LANGUAGE are empty at link time, so
+        # the shared object ends up with unresolved omp_get_thread_num /
+        # GOMP_parallel symbols and ld refuses to link qzi_abi_smoke against
+        # it. Carry the OpenMP runtime through as a real link dependency.
+        find_package(OpenMP QUIET COMPONENTS C)
+        if(OpenMP_C_FOUND)
+            target_compile_options(${target} PRIVATE
+                "$<$<COMPILE_LANGUAGE:C>:${OpenMP_C_FLAGS}>"
+                "$<$<COMPILE_LANGUAGE:CXX>:${OpenMP_C_FLAGS}>")
+            target_link_libraries(${target} PUBLIC OpenMP::OpenMP_C)
+        else()
+            target_compile_options(${target} PRIVATE
+                "$<$<COMPILE_LANGUAGE:C>:-fopenmp>"
+                "$<$<COMPILE_LANGUAGE:CXX>:-fopenmp>")
+            target_link_options(${target} PRIVATE -fopenmp)
+        endif()
+        # No -licuuc: a link-time dependency on libicuuc.so.72 would make the
+        # NuGet linux-x64 runtime unloadable on distros shipping .so.70/.so.74.
+        # qzen_posix_unicode.c dlopen()s ICU instead, hence CMAKE_DL_LIBS.
         target_link_libraries(${target} PUBLIC
-            m pthread stdc++ "$<$<NOT:$<PLATFORM_ID:Darwin>>:icuuc>")
+            m pthread stdc++ ${CMAKE_DL_LIBS})
     endif()
 endfunction()

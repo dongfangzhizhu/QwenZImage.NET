@@ -40,7 +40,7 @@
 | --- | --- |
 | 稳定 C ABI v1、`.NET 10` 源生成 P/Invoke、队列、预设、托管 + native 测试 | ✅ 已完成并通过 |
 | 跨平台 WebUI（health / presets / jobs / SSE / gallery / trash / unload） | ✅ 已完成，Windows + Linux |
-| **真实 C/CUDA 引擎直接绑定**（`engine/` + `qzi_engine_backend.c`，无 HTTP） | ✅ 已编译链接通过（MSVC 19.51 + CUDA 13.3 + SM 89） |
+| **真实 C/CUDA 引擎直接绑定**（`engine/` + `qzi_engine_backend.c`，无 HTTP） | ✅ Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL GCC 12 + CUDA 13.0）双平台构建 + `ctest` 通过；默认 fat binary 覆盖 11 个 SM；Linux 产物无版本化 ICU 依赖 |
 | `QwenZImage.config.json` 配置模型路径，`.NET` / native 双侧加载 | ✅ 已完成 |
 | native 产物统一命名 `QwenZImageNative.dll` / `libQwenZImageNative.so` | ✅ 已完成，无 `h3` 命名产物 |
 | 单个 NuGet 包含 .NET 程序集 + win-x64 + linux-x64 native | ✅ 已完成，`QziEnsureNativeRuntimes` 缺平台即拒绝打包 |
@@ -76,7 +76,8 @@
 
 - **.NET 10 SDK**（`global.json` 锁定 `10.0.100`）
 - 参考 native 构建：**CMake ≥ 3.20 + C11 编译器 + Ninja**（Windows MinGW/MSVC，Linux GCC/Clang）
-- 真实 native 构建：上述工具 **+ NVIDIA CUDA Toolkit（nvcc / cudart / cuBLAS / cuBLASLt）+ MSVC（Windows）或 GCC/Clang + OpenMP + ICU（Linux）**；`-DQZEN_CUDA_ARCH=<SM>` 要匹配显卡（RTX 4090 = `89`，GB10 = `121`）
+- 真实 native 构建：上述工具 **+ NVIDIA CUDA Toolkit 13+（nvcc / cudart / cuBLAS / cuBLASLt）+ MSVC（Windows）或 GCC/Clang + OpenMP（Linux）**。Linux **不需要 ICU**：`engine/platform/posix/qzen_posix_unicode.c` 在运行时 `dlopen` 宿主系统的 ICU（找不到时用内置 ASCII/CJK 回退），产物因此不带版本化的 `libicuuc.so.NN` 依赖，可直接跨发行版分发。
+- 默认 `QZEN_CUDA_ARCH` 是覆盖 Ampere → Blackwell 的 **fat binary**（`80;86;87;88;89;90;100;103;110;120;121`；不含 sm_75，因为 attention kernel 用 `mma.sync.m16n8k16`）：一个同名库适配常见显卡，无需按 GPU 重编译。CMake 会查询 `nvcc --list-gpu-arch` 自动剔除当前工具链不支持的架构；本地开发传单个 SM（如 `89`）可显著加快编译。
 - 打包前需要 Windows 与 Linux 两个平台的 native 产物（Windows 主机可用 WSL 一次构建两者）
 - 真实推理还需要**自备模型权重**并在配置文件里指向它们
 
@@ -89,8 +90,9 @@ cmake --build native/build
 ctest --test-dir native/build --output-on-failure
 
 # 1b) 真实 C/CUDA native（需要 nvcc；产物单独放 artifacts/native/<Platform>-<Arch>-cuda/）
-scripts/build-native-cuda.bat 89                 # Windows（自动加载 MSVC 环境）
-bash scripts/build-native-cuda.sh 89             # Linux
+scripts/build-native-cuda.bat                   # Windows：默认 fat binary，自动加载 MSVC 环境
+bash scripts/build-native-cuda.sh               # Linux：默认 fat binary
+# 本地只编一个 SM 更快：scripts\build-native-cuda.bat 89 / bash scripts/build-native-cuda.sh 89
 # 或手工：cmake -S native -B native/build-cuda -G Ninja \
 #           -DQZI_WITH_CUDA_ENGINE=ON -DQZEN_CUDA_ARCH=89 -DCMAKE_BUILD_TYPE=Release
 
@@ -119,8 +121,8 @@ export QZI_CONFIG=/path/to/QwenZImage.config.json
 powershell -File scripts/build-native-all.ps1   # Windows + WSL Linux，参考后端
 powershell -File scripts/build-native.ps1       # 仅 Windows，参考后端
 bash scripts/build-native.sh                    # 仅当前 Unix 平台，参考后端
-scripts/build-native-cuda.bat 89                # Windows 真实后端
-bash scripts/build-native-cuda.sh 89            # Linux 真实后端
+scripts/build-native-cuda.bat                # Windows 真实后端（默认 fat binary；传 89 只编单 SM）
+bash scripts/build-native-cuda.sh            # Linux 真实后端（同上）
 ```
 
 > 参考构建与 CUDA 构建输出到不同的 `artifacts/native` 子目录，避免互相覆盖；`QZI_STAGE_CUDA=1` 才把 CUDA 产物 stage 进 `artifacts/runtimes/<rid>/native/`。
@@ -248,7 +250,7 @@ QwenZImage.NET.0.1.0.nupkg
 dotnet pack src/QwenZImage.NET/QwenZImage.NET.csproj -c Release -o artifacts/packages
 ```
 
-> 默认打进包里的是**参考后端**（无 GPU 依赖、开箱即用、输出噪点）。真实 CUDA 构建与显卡 SM 架构绑定，无法为所有用户预编译；请用自己的 `scripts/build-native-cuda.*` 构建同名库，再用 `QZI_NATIVE_LIBRARY` 指向它，或直接替换应用输出目录里的 `runtimes/<rid>/native/` 文件。托管 API 不变，权重始终由使用方自带。
+> 默认打进包里的仍是**参考后端**（无 GPU 依赖、开箱即用、输出噪点），因为 CI 没有 GPU。真实 CUDA 构建现在默认产出覆盖 Ampere → Blackwell 的 **fat binary**，一个同名库即可直接替换 `runtimes/<rid>/native/`，或用 `QZI_NATIVE_LIBRARY` 指向 `artifacts/native/<Platform>-<Arch>-cuda/` 里的产物，不必按显卡重编译；单 SM 构建仍可用脚本参数指定。托管 API 不变，权重始终由使用方自带。
 
 ## native 库解析顺序
 
@@ -272,7 +274,7 @@ native/src/qzi_stub.c           确定性参考后端（噪点，CI 用）
 native/src/qzi_png.c            无依赖最小 PNG 编码器
 native/tests/                   C ABI smoke test（按后端自动分支）
 engine/                         vendored + 改名的真实 C/CUDA 推理引擎
-  src/, platform/win32/, third_party/, cmake/, CMakeLists.txt
+  src/, platform/win32/, platform/posix/, third_party/, cmake/, CMakeLists.txt
   LICENSE / UPSTREAM.md         上游 MIT 许可与来源说明
 src/QwenZImage.NET/             .NET 10 库（NuGet 包体）
   Configuration/QziConfig.cs    配置文件加载器
@@ -300,7 +302,7 @@ CI 另做 WebUI Linux 运行时冒烟：启动 Kestrel → 验证 `/api/health` 
 
 ## 路线与发布
 
-见 [PLAN.md](PLAN.md)：阶段 0–10（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**）已完成；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
+见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）亦已完成；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
 
 ## 许可与声明
 

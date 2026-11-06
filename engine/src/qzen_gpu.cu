@@ -1241,29 +1241,54 @@ __global__ static void qzen_add_bf16_kernel(const uint16_t *left,
     }
 }
 
-/* QZEN_SM_ARCH is the architecture this build emitted -- CMakeLists' QZEN_CUDA_ARCH
- * or Makefile.linux's SM_ARCH, passed in as a define by both.
+/* QZEN_SM_ARCH / QZEN_SM_ARCH_LIST describe the architectures this build
+ * emitted -- CMakeLists' QZEN_CUDA_ARCH (a fat binary for NuGet) or
+ * Makefile.linux's SM_ARCH (one value). CMake writes qzen_arch_config.h; the
+ * fallbacks below keep standalone builds working.
  *
  * A cubin built for another architecture loads without complaint and then fails
  * every launch with cudaErrorNoKernelImageForDevice, while the ops hand back
  * zeros: the symptom is a wrong number, not an error, and it reads like the
  * kernel is broken (§27). One line at init carrying both numbers turns that
- * into "rebuild with SM_ARCH". Silent when they match, which is the normal
- * case, and silent when the build did not say (0), which is every build that
- * predates the define. */
+ * into "rebuild with SM_ARCH". */
+#if defined(__has_include)
+#  if __has_include("qzen_arch_config.h")
+#    include "qzen_arch_config.h"
+#  endif
+#endif
 #ifndef QZEN_SM_ARCH
 #define QZEN_SM_ARCH 0
 #endif
+#ifndef QZEN_SM_ARCH_LIST
+#define QZEN_SM_ARCH_LIST ""
+#endif
+
+/* Is `device` one of the comma-separated SM values in QZEN_SM_ARCH_LIST? */
+static int qzen_gpu_arch_listed(int device) {
+    const char *p = QZEN_SM_ARCH_LIST;
+    while (*p) {
+        if (*p < '0' || *p > '9') { p++; continue; }
+        int value = 0;
+        while (*p >= '0' && *p <= '9') {
+            value = value * 10 + (*p - '0');
+            p++;
+        }
+        if (value == device) return 1;
+    }
+    return 0;
+}
 
 static void qzen_gpu_check_arch(const cudaDeviceProp *props) {
-    if (QZEN_SM_ARCH == 0) return;
+    if (QZEN_SM_ARCH == 0 && QZEN_SM_ARCH_LIST[0] == '\0') return;
     const int device = props->major * 10 + props->minor;
-    if (QZEN_SM_ARCH == device) return;
+    if (QZEN_SM_ARCH == device || qzen_gpu_arch_listed(device)) return;
     fprintf(stderr,
-            "QwenZImageNative gpu: this build's cubin is sm_%d, the device is sm_%d (%s)\n"
-            "QwenZImageNative gpu: every kernel launch will fail with \"no kernel image is "
-            "available for execution on the device\"; rebuild with SM_ARCH=%d\n",
-            QZEN_SM_ARCH, device, props->name, device);
+            "QwenZImageNative gpu: the device is sm_%d (%s) but this build has "
+            "no matching cubin\n"
+            "QwenZImageNative gpu: built for sm_%s; every kernel launch will fail "
+            "with \"no kernel image is available for execution on the device\"\n"
+            "QwenZImageNative gpu: rebuild with -DQZEN_CUDA_ARCH=%d\n",
+            device, props->name, QZEN_SM_ARCH_LIST, device);
 }
 
 __global__ static void qzen_sub_bf16_kernel(const uint16_t *left,

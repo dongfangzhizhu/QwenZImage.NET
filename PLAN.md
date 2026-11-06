@@ -50,7 +50,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 
 **D10 边界**：`QziClient` 直接 P/Invoke 同一个进程内的 `QwenZImageNative`；WebUI 与用户应用处于同一层，都只走 `QziClient`。**没有任何外部服务、HTTP transport、sidecar 或 Go 进程**。`QZI_CONFIG` 让 native backend 读取 ABI 里没有的 `qwen21_lora_dir` / `zimage_nunchaku_dir` 等字段；`QziClientOptions` 里显式传值优先。
 
-**为什么保留两种构建**：真实 CUDA 引擎与 GPU 的 SM 架构绑定（本机 RTX 4090 = SM 89），无法为所有用户预编译一个通用二进制；CI 与托管测试也必须在无 GPU 环境运行。所以 `QZI_WITH_CUDA_ENGINE=OFF` 的参考后端仍是默认打包形态，`ON` 的构建由使用方按自己显卡生成同名 DLL/SO，用 `QZI_NATIVE_LIBRARY` 覆盖即可，托管 API 不变。
+**为什么保留两种构建**：CI 与托管测试必须在无 GPU 环境运行，且真实 CUDA 库依赖 cudart / cuBLAS 与 GPU 驱动，不适合塞进默认包。因此 `QZI_WITH_CUDA_ENGINE=OFF` 的参考后端仍是默认打包形态；`ON` 的构建默认生成覆盖 sm_80 → sm_121 的 **fat binary**（CMake 查询 `nvcc --list-gpu-arch` 并按工具链能力自动过滤），一个同名 DLL/SO 即可适配常见显卡，不必按 GPU 重编译。用 `QZI_NATIVE_LIBRARY` 覆盖或替换 `runtimes/<rid>/native/` 即可，托管 API 不变。CI 不含 GPU，所以发布 workflow 里打包的仍是参考后端。
 
 **打包形态（D8）**：单个 `.nupkg` 按 NuGet RID 约定同时携带 `lib/net10.0/QwenZImage.NET.dll`、`runtimes/win-x64/native/QwenZImageNative.dll`、`runtimes/linux-x64/native/libQwenZImageNative.so`。`QziEnsureNativeRuntimes` MSBuild target 在 `GenerateNuspec` 前强制校验两者存在。
 
@@ -71,6 +71,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 10 | **单包双平台 native**（D8）：RID staging、`csproj` 打包 + 缺失校验、`NativeLibraryLoader` 支持 `NATIVE_DLL_SEARCH_DIRECTORIES` | ✅ |
 | 11 | **噪点根因排查**（D9）：定位到 `qzi_stub.c` 伪随机 RGB + 空转 `dit`；README / WebUI 黄色告警 | ✅；其中 HTTP 适配器方案在 D10 被删除 |
 | 12 | **D10 直接绑定真实 native 后端**：删除 `H3ServeExecutor` / `IWebUiEngine` / `NativeEngineAdapter` 与 `QZI_ENGINE_URL`；统一 native 名 `QwenZImageNative`；新增 `QwenZImage.config.json` + `QziConfig` + `qzen_config.c`；复制并改名 64 个引擎文件；写 `qzi_engine_backend.c` 真实适配器；`qzi.c` 编译期选择 backend；`build-native-cuda.bat/.sh`；C smoke 按后端分支；合规文件；收尾补齐文档一致性、`engine/LICENSE` 入包、`QziConfig` 向上查找配置、CUDA 脚本的 MSVC/SDK 环境兜底 | ✅ |
+| 12b | **真实后端跨 GPU / 跨发行版可分发**（阶段 12 之后的收尾）：默认 fat binary 覆盖 11 个 SM + CMake 按 nvcc 能力过滤；Linux 运行时 `dlopen` ICU、产物无版本化 `libicuuc.so.NN` 依赖；OpenMP 显式链接；修复 `stage-native.sh` 的 `-cuda` 路径匹配 | ✅ |
 | 13 | **推送 GitHub 开源 + 发布 NuGet** | ⏸ **按 D6 暂缓**，命令见第 5 节 |
 
 本机验证结果（D10 完成度）：
@@ -83,6 +84,14 @@ Your app (.NET 10)                     Browser (manual testing only)
 - `.NET` 端到端：WebUI 设 `QZI_NATIVE_LIBRARY` 指向 CUDA 构建后，`/api/health` 返回 `backend: "QwenZImageNative"`、`transport: "native-pinvoke"`、`reference_backend: false`、`config_path` 已解析。
 - **真图验证**：提交 qwen21 turbo / 256×256 / seed 42 / 8 steps，约 2 分钟后产出 196,947 字节 PNG，内容为清晰的雪地红狐，**不再是噪点**。
 - `dotnet pack` 产出 `QwenZImage.NET.0.1.0.nupkg` + `.snupkg`（含两个 RID native）。
+
+阶段 12b 本机验证结果（本轮新增）：
+
+- Windows 真实后端以**默认 fat binary**（`80;86;87;88;89;90;100;103;110;120;121`）重编通过：MSVC 19.51.36260 + CUDA 13.3，`QwenZImageNative.dll` 22,176,768 字节，生成的 `qzen_arch_config.h` 为 `QZEN_SM_ARCH 0` / `QZEN_SM_ARCH_LIST "80,...,121"`，且该字符串确实嵌入 DLL（架构提示宏生效）；`ctest` 1/1。
+- Linux 真实后端（WSL Debian 12 / GCC 12.2 + CUDA 13.0）先以单 SM 89、再以**默认 fat binary** 各重编一次，`ctest` 均 1/1；最终 `libQwenZImageNative.so` 22,434,336 字节，`readelf -d` 的 `NEEDED` **不再含 `libicuuc.so.72`**，改为正常的 `libgomp.so.1`，未解析 ICU 符号为 0，架构列表宏同样嵌入产物。此前该 `.so` 带版本化 ICU 依赖，跨发行版会加载失败。
+- 修掉两个既有构建缺陷：① OpenMP 只以 `COMPILE_LANGUAGE` 保护的编译选项传入，链接阶段求值为空，导致 `.so` 留下未解析 `omp_*` / `GOMP_parallel` 并让 smoke 链接失败 → 改用 `OpenMP::OpenMP_C` 显式链接；② `scripts/stage-native.sh` 的 `find -path '*/-cuda/*'` 永远匹配不到 `Linux-x86_64-cuda`，CUDA 产物 stage 不到且 reference 排除规则失效 → 改为 `'*-cuda/*'`，两种 flavour 均已实测。
+- `dotnet build` 0 警告 0 错误（5 项目）；`dotnet test` **42 + 4 = 46** 全绿；`dotnet pack` 产出 16 项包（含 `lib/net10.0/*.dll`、两个 RID native、4 份 docs、`engine/LICENSE`）。打包前已把 RID staging 恢复为 reference 后端。
+- POSIX ICU 兼容层另做了**独立运行时双路径验证**：正常链接（`dlopen` 命中系统 ICU 72）与用 `-Wl,--wrap=dlopen` 强制「无 ICU」两条路径，字符分类、UTF-8/UTF-16（含 4 字节代理对）round-trip、非法 UTF-8 报错、NFC 调用全部通过；前者把 `e + U+0301` 正确组合为 `é`，后者按设计退化为恒等归一化。该一次性检查脚本放在 `.scratch/`（git 忽略），未接进 CTest。
 
 ## 4. 交付物清单
 
@@ -99,7 +108,7 @@ QwenZImage.NET/
 │   ├─ include/qzi_backend.h      vtable 契约
 │   └─ src/qzi_engine_backend.c   真实引擎 in-process 适配器
 ├─ engine/                       vendored + 改名的真实 C/CUDA 推理引擎（64 文件）
-│   ├─ src/, platform/win32/, third_party/, cmake/, CMakeLists.txt
+│   ├─ src/, platform/win32/, platform/posix/, third_party/, cmake/, CMakeLists.txt
 │   └─ LICENSE / UPSTREAM.md     上游 MIT 许可与来源说明
 ├─ src/QwenZImage.NET/            NuGet 包体
 │   └─ Configuration/QziConfig.cs 配置文件加载器
@@ -164,14 +173,14 @@ dotnet nuget push artifacts/packages/QwenZImage.NET.0.1.0.nupkg \
 - [ ] 包内同时包含 `lib/net10.0/QwenZImage.NET.dll`、`runtimes/win-x64/native/QwenZImageNative.dll`、`runtimes/linux-x64/native/libQwenZImageNative.so`
 - [ ] `.snupkg` 符号包可上传、SourceLink 指向公开仓库
 - [ ] 仓库 secret `NUGET_API_KEY` 已配置；CI 不需要 GPU（跑的是参考后端）
-- [ ] README 中「默认捆绑 reference native、真实 CUDA 需自行构建」的说明保持准确
+- [ ] README 中「默认捆绑 reference native、真实 CUDA 为 fat binary 且由使用方自行构建 / 替换」的说明保持准确
 - [ ] `engine/LICENSE` 与 `THIRD_PARTY_NOTICES.md` 中上游 MIT 版权声明完整
 
 ## 6. 已知边界 / 后续工作
 
 1. **参考后端不是图像模型**：默认包里的 native 输出确定性合成 PNG，只用于验证 ABI、内存所有权、进度与队列；真实生成请用 `-DQZI_WITH_CUDA_ENGINE=ON` 构建。
 2. **真实引擎已实现**：`native/src/qzi_engine_backend.c` 完整实现 `qzi_backend`，编排参考上游 `serve_execute_qwen21()` / `serve_execute_zimage()`，PNG 直接在内存里编码而非临时文件。仍需针对更多 checkpoint（Z-Image Nunchaku / LoRA）与更大分辨率做回归。
-3. **平台**：Windows（MSVC + CUDA 13.3）与 Linux（WSL GCC）参考库均已构建、`ctest` 通过；Linux 真实 CUDA 构建脚本已提供但本机 WSL 无 `nvcc`，尚未实测。macOS 未构建。
+3. **平台**：参考库 Windows / Linux 均已构建、`ctest` 通过；真实 CUDA 后端也已在 Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL Debian 12 / GCC 12.2 + CUDA 13.0）双平台实测，默认 fat binary 各 11 个 SM、`ctest` 1/1。WSL 自带 CUDA 13.0，但 `nvcc` 不在默认 PATH，构建前需 `export PATH=/usr/local/cuda/bin:$PATH`。Linux 产物不再依赖版本化 ICU；macOS 未构建（POSIX 兼容层已可探测 `libicuuc.N.dylib`，但 CMake 仍链接 `stdc++`，上 macOS 前需换成 `c++`）。
 4. **CI 不含 GPU**：CI 只构建参考后端；真实后端由使用方或带 GPU 的自托管 runner 构建。
 5. **ABI 演进**：任何结构体/签名/所有权变化都必须升 `QZI_ABI_VERSION`，并同步 `NativeStructs.cs` 与 `AbiGuard`。
 6. **异步语义**：native 调用本质同步长任务，`Generate*Async` 是 `Task.Run` 外壳；高并发行走 `QziGenerationQueue`，不要用多个 `QziClient` 抢同一张 GPU。
