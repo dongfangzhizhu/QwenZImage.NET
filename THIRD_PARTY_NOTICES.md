@@ -6,9 +6,12 @@ QwenZImage.NET itself is licensed under the MIT license (see `LICENSE`).
 
 This repository does **not** vendor third-party source code. In particular:
 
-- No source from `h3-spark.c`, no Go code from any WebUI, and no copy of any
-  HTTP/JSON server implementation is included here. The `qzi_*` C ABI and the
-  .NET wrapper are original implementations written for this project.
+- No source from `h3-spark.c`, no Go code from any WebUI, and no copy of the
+  original C/Go HTTP server is included here. The `qzi_*` C ABI, the .NET
+  wrapper, and the optional `QwenZImage.NET.WebUI` (an original ASP.NET Core
+  Minimal API app using only the .NET framework) were written for this project.
+  The WebUI reproduces the *functional surface* of the old Go WebUI, not its
+  source code.
 - The minimal PNG encoder in `native/src/qzi_png.c` is original code written for
   this repository. It implements PNG chunks, stored (uncompressed) DEFLATE
   blocks, CRC-32 and Adler-32 directly, and does **not** link zlib, libpng,
@@ -40,7 +43,7 @@ This repository does **not** vendor third-party source code. In particular:
 | Microsoft.SourceLink.GitHub 8.0.0 | deterministic builds, source debugging |
 | Microsoft.NET.Test.Sdk 17.12.0 | test host |
 | xunit 2.9.2 / xunit.runner.visualstudio 2.8.2 | unit tests |
-| CMake, Ninja, GCC/Clang/MinGW/MSVC | building the optional reference native library |
+| CMake, Ninja, GCC/Clang/MinGW/MSVC | building the bundled win-x64 / linux-x64 reference native libraries |
 
 Each of these carries its own open-source license; consult the respective
 package or toolchain for the exact terms. They are referenced through NuGet /

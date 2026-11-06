@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QwenZImage.NET — manual test console</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">QZI</span>
+    <div>
+      <h1>QwenZImage.NET</h1>
+      <p class="subtitle">Manual test console · Qwen-Image 2.1 / Z-Image</p>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <span id="health-pill" class="pill pill-wait">checking…</span>
+    <button id="unload-btn" class="btn btn-ghost" type="button">Unload model</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="panel form-panel" aria-label="Generation request">
+    <h2>Request</h2>
+
+    <div class="field">
+      <label for="model">Model</label>
+      <select id="model">
+        <option value="qwen21">Qwen-Image 2.1</option>
+        <option value="zimage">Z-Image</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="preset">Preset <span class="hint">optional</span></label>
+      <select id="preset"><option value="">Custom</option></select>
+    </div>
+
+    <div class="field">
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" rows="4" placeholder="A quiet mountain lake at dawn, soft light, highly detailed"></textarea>
+    </div>
+
+    <div class="field" data-only="qwen21">
+      <label for="negative">Negative prompt <span class="hint">base tier only</span></label>
+      <textarea id="negative" rows="2" placeholder="blurry, low quality"></textarea>
+    </div>
+
+    <div class="grid-2">
+      <div class="field">
+        <label for="width">Width <span class="hint" id="width-hint">multiple of 32</span></label>
+        <input id="width" type="number" min="32" max="2048" step="32" value="1024">
+      </div>
+      <div class="field">
+        <label for="height">Height <span class="hint" id="height-hint">multiple of 32</span></label>
+        <input id="height" type="number" min="32" max="2048" step="32" value="1024">
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="field">
+        <label for="seed">Seed</label>
+        <div class="input-row">
+          <input id="seed" type="number" min="0" value="42">
+          <button id="seed-dice" class="btn btn-ghost btn-icon" type="button" title="Random seed">🎲</button>
+        </div>
+      </div>
+      <div class="field" data-only="qwen21">
+        <label for="tier">Tier</label>
+        <select id="tier">
+          <option value="turbo">turbo (8 steps)</option>
+          <option value="base">base</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="grid-2" data-only="qwen21">
+      <div class="field" data-requires="base">
+        <label for="steps">Steps <span class="hint">1–50</span></label>
+        <input id="steps" type="number" min="1" max="50" value="8" disabled>
+      </div>
+      <div class="field" data-requires="base">
+        <label for="guidance">Guidance <span class="hint">1–20</span></label>
+        <input id="guidance" type="number" min="1" max="20" step="0.5" value="1" disabled>
+      </div>
+    </div>
+
+    <div class="grid-2" data-only="qwen21" data-requires="base">
+      <div class="field">
+        <label for="lora">LoRA <span class="hint">bare file name</span></label>
+        <input id="lora" type="text" placeholder="dmd2.safetensors" disabled>
+      </div>
+      <div class="field">
+        <label for="lora-scale">LoRA scale <span class="hint">0.05–4</span></label>
+        <input id="lora-scale" type="number" min="0.05" max="4" step="0.05" value="1" disabled>
+      </div>
+    </div>
+
+    <div class="field" data-only="zimage">
+      <label for="checkpoint">Checkpoint</label>
+      <select id="checkpoint">
+        <option value="bf16">bf16</option>
+        <option value="nunchaku">nunchaku (int4)</option>
+        <option value="nunchaku-r32">nunchaku-r32</option>
+        <option value="nunchaku-r64">nunchaku-r64</option>
+        <option value="nunchaku-r128">nunchaku-r128</option>
+      </select>
+    </div>
+
+    <button id="generate" class="btn btn-primary btn-block" type="button">Queue generation</button>
+    <p class="note">Jobs run strictly one at a time on the native engine. This console uses no Go process, no HTTP hop to a sidecar — only the C ABI via .NET.</p>
+  </section>
+
+  <div class="right-column">
+    <section class="panel" aria-label="Jobs">
+      <div class="panel-head">
+        <h2>Jobs</h2>
+        <div class="head-actions">
+          <span id="sse-pill" class="pill pill-wait">SSE connecting…</span>
+          <button id="jobs-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="job-table">
+          <thead>
+            <tr><th>ID</th><th>Model</th><th>Status</th><th>Progress</th><th>Output</th><th></th></tr>
+          </thead>
+          <tbody id="job-rows"></tbody>
+        </table>
+      </div>
+      <p id="jobs-empty" class="empty">No jobs yet. Submit a request on the left.</p>
+    </section>
+
+    <section class="panel" aria-label="Output gallery">
+      <div class="panel-head">
+        <h2>Outputs</h2>
+        <div class="head-actions">
+          <button id="select-all" class="btn btn-ghost btn-sm" type="button">Select all</button>
+          <button id="clear-selection" class="btn btn-ghost btn-sm" type="button">Clear</button>
+          <button id="restore-selected" class="btn btn-ghost btn-sm" type="button" title="Restore the most recently deleted files">Undo delete</button>
+          <button id="delete-selected" class="btn btn-danger btn-sm" type="button">Delete</button>
+          <button id="gallery-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+        </div>
+      </div>
+      <div id="gallery" class="gallery"></div>
+      <p id="gallery-empty" class="empty">No outputs yet.</p>
+    </section>
+  </div>
+</main>
+
+<div id="lightbox" class="lightbox" hidden>
+  <div class="lightbox-bar">
+    <span id="lightbox-name"></span>
+    <div>
+      <button id="lightbox-download" class="btn btn-ghost btn-sm" type="button">Open original</button>
+      <button id="lightbox-close" class="btn btn-ghost btn-sm" type="button">Close ✕</button>
+    </div>
+  </div>
+  <img id="lightbox-image" alt="Generated output preview">
+</div>
+
+<div id="toast" class="toast" hidden><span id="toast-text"></span><button id="toast-close" type="button">✕</button></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

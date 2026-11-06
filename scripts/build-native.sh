@@ -34,3 +34,6 @@ ctest --test-dir "$build_dir" -C "$build_type" --output-on-failure
 echo "==> native library output:"
 find "$root/artifacts/native" -maxdepth 2 -type f \
      \( -name 'qzi.dll' -o -name 'libqzi.so' -o -name 'libqzi.dylib' \) -print
+
+echo "==> staging for NuGet"
+bash "$root/scripts/stage-native.sh"

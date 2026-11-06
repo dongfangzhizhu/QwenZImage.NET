@@ -11,8 +11,58 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: ${{ matrix.os }} / .NET 10
+  # One native library is built natively per runner. Each is uploaded in the
+  # exact RID layout NuGet expects, so the pack job can merge both platforms
+  # into a single package without any cross-compiler or WSL dependency.
+  native:
+    name: native ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build Windows native library + C smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-native.ps1
+
+      - name: Build Linux native library + C smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/build-native-linux.sh
+
+      - name: Verify staged RID library
+        shell: pwsh
+        run: |
+          $dir = Join-Path 'artifacts/runtimes' '${{ matrix.rid }}/native'
+          $files = @(Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue)
+          if ($files.Count -eq 0) { throw "no native library staged in $dir" }
+          $files | ForEach-Object { Write-Host "== $($_.FullName) ($($_.Length) bytes)" }
+
+      - name: Upload native runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: artifacts/runtimes/${{ matrix.rid }}/native/*
+          if-no-files-found: error
+
+  # Runs on both operating systems with BOTH native libraries present, so the
+  # managed tests, the WebUI build and the NuGet pack are verified on Windows
+  # and Linux with the exact contents that will be shipped.
+  verify:
+    name: verify ${{ matrix.os }}
+    needs: native
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -30,29 +80,30 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      # The managed tests load the reference native library from
-      # artifacts/native/<Platform>-<Arch>/; build it first, on every OS.
-      - name: Build native reference library + C smoke test (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: bash scripts/build-native.sh
+      - name: Download win-x64 native runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: native-win-x64
+          path: artifacts/runtimes/win-x64/native
 
-      - name: Build native reference library + C smoke test (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/build-native.ps1
+      - name: Download linux-x64 native runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: native-linux-x64
+          path: artifacts/runtimes/linux-x64/native
 
-      - name: Build solution
+      - name: Build solution (library, tests, sample, WebUI)
         run: dotnet build QwenZImage.NET.sln -c Release --nologo
 
-      - name: Run xUnit tests (31 tests, no GPU required)
+      - name: Run xUnit tests (no GPU required)
         run: dotnet test QwenZImage.NET.sln -c Release --no-build --nologo
 
       - name: Pack NuGet package
         run: dotnet pack src/QwenZImage.NET/QwenZImage.NET.csproj -c Release --no-build --nologo -o artifacts/packages
 
       # pwsh is available on both runner images, so this check is OS-neutral.
-      - name: Verify package contents
+      # The package MUST carry the managed assembly plus both native RIDs.
+      - name: Verify package contents (managed + win-x64 + linux-x64)
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -60,7 +111,10 @@ jobs:
           if ($packages.Count -eq 0) { throw 'no .nupkg produced' }
           $required = @(
             'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
-            'docs/NATIVE_ABI.md', 'lib/net10.0/QwenZImage.NET.dll'
+            'docs/NATIVE_ABI.md',
+            'lib/net10.0/QwenZImage.NET.dll',
+            'runtimes/win-x64/native/qzi.dll',
+            'runtimes/linux-x64/native/libqzi.so'
           )
           foreach ($p in $packages) {
             $zip = [System.IO.Compression.ZipFile]::OpenRead($p.FullName)
@@ -69,9 +123,64 @@ jobs:
               foreach ($r in $required) {
                 if (-not ($names -contains $r)) { throw "missing '$r' in $($p.Name)" }
               }
-              Write-Host "== $($p.Name) ($($names.Count) entries, all required files present)"
+              foreach ($rid in @('runtimes/win-x64/native/qzi.dll', 'runtimes/linux-x64/native/libqzi.so')) {
+                $entry = $zip.Entries | Where-Object { $_.FullName -eq $rid }
+                if ($entry.Length -le 0) { throw "empty native library '$rid' in $($p.Name)" }
+              }
+              Write-Host "== $($p.Name) ($($names.Count) entries, managed + both RID natives present)"
             } finally { $zip.Dispose() }
           }
+
+      # Runtime smoke test of the cross-platform WebUI on Linux. The Windows
+      # half is covered by the solution build above; the same ASP.NET Core app
+      # runs unchanged on either OS.
+      - name: WebUI runtime smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          QZI_WEBUI_URLS: http://127.0.0.1:17860
+          QZI_WEBUI_OUTPUT: ${{ github.workspace }}/artifacts/webui-smoke-output
+          QZI_NATIVE_LIBRARY: ${{ github.workspace }}/artifacts/runtimes/linux-x64/native/libqzi.so
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/qzi-webui.log"
+          dotnet run --project src/QwenZImage.NET.WebUI/QwenZImage.NET.WebUI.csproj \
+            -c Release --no-build > "$log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; cat "$log"' EXIT
+          base=http://127.0.0.1:17860
+          for _ in $(seq 1 60); do
+            if curl -fsS "$base/api/health" > "$RUNNER_TEMP/health.json" 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          python3 - <<'PY'
+          import json, os, urllib.request
+          base = "http://127.0.0.1:17860"
+          health = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "health.json")))
+          assert health["ok"] is True, health
+          assert health["engine"]["reference_backend"] is True, health
+          presets = json.load(urllib.request.urlopen(base + "/api/presets"))["presets"]
+          assert any(p["model"] == "qwen21" for p in presets), presets
+          assert any(p["model"] == "zimage" for p in presets), presets
+          req = urllib.request.Request(
+              base + "/api/jobs",
+              data=json.dumps({"model": "zimage", "prompt": "ci smoke",
+                               "width": 256, "height": 256}).encode(),
+              headers={"Content-Type": "application/json"}, method="POST")
+          job = json.load(urllib.request.urlopen(req))
+          print("submitted job", job["id"], job["state"])
+          import time
+          for _ in range(60):
+              job = json.load(urllib.request.urlopen(f"{base}/api/jobs/{job['id']}"))
+              if job["state"] in ("done", "error", "cancelled"):
+                  break
+              time.sleep(0.5)
+          assert job["state"] == "done", job
+          assert job["output_name"], job
+          outputs = json.load(urllib.request.urlopen(base + "/api/outputs"))["outputs"]
+          assert any(o["name"] == job["output_name"] for o in outputs), outputs
+          print("WebUI smoke OK:", job["output_name"], len(outputs), "outputs")
+          PY
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4

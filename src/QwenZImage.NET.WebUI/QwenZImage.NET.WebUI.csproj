@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>QwenZImage.NET.WebUI</RootNamespace>
+    <AssemblyName>QwenZImage.NET.WebUI</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../QwenZImage.NET/QwenZImage.NET.csproj" />
+  </ItemGroup>
+
+  <!-- A ProjectReference does not flow the NuGet runtime assets, so copy the
+       staged RID natives into the WebUI's output. This makes `dotnet run` and
+       a published deployment work on Windows and Linux without QZI_NATIVE_LIBRARY.
+       Conditions keep a fresh checkout (before any native build) buildable. -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)../../artifacts/runtimes/win-x64/native/qzi.dll"
+          Link="runtimes/win-x64/native/qzi.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          Condition="Exists('$(MSBuildThisFileDirectory)../../artifacts/runtimes/win-x64/native/qzi.dll')" />
+    <None Include="$(MSBuildThisFileDirectory)../../artifacts/runtimes/linux-x64/native/libqzi.so"
+          Link="runtimes/linux-x64/native/libqzi.so"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          Condition="Exists('$(MSBuildThisFileDirectory)../../artifacts/runtimes/linux-x64/native/libqzi.so')" />
+  </ItemGroup>
+
+</Project>

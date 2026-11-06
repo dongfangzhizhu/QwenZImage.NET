@@ -2,6 +2,8 @@
 
 本仓库提供的是**契约 + 托管封装 + 参考实现**，不含真实的扩散推理引擎。要让 `QwenZImage.NET` 产出真实图像，需要一个实现 `qzi` ABI 的 native 库。有三种路径，按工作量从大到小：
 
+> NuGet 包默认已捆绑 `runtimes/win-x64/native/qzi.dll` 与 `runtimes/linux-x64/native/libqzi.so`（确定性参考后端），因此安装即可跑通。下面三种路径的产物通过 `QZI_NATIVE_LIBRARY` / `QziClientOptions.NativeLibraryPath` 覆盖默认探测，或直接替换应用输出目录里的同名文件；托管程序集与调用代码无需改动。
+
 ## 路径 A：引擎自己导出 `qzi_*`（完全替换）
 
 引擎（例如从 `h3-spark.c` 的 `h3 serve` 编排逻辑中抽出）直接实现并导出 `native/include/qzi.h` 中的全部函数：

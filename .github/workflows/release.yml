@@ -2,7 +2,7 @@ name: Release to NuGet
 
 # Publishing is intentionally opt-in: it only runs on an explicit v* tag
 # (or a manual dispatch). The repository owner must configure the
-# NUGET_API_KEY secret before the first release. See PLAN.md section 5.
+# NUGET_API_KEY secret before the first release. See PLAN.md section 9.
 on:
   push:
     tags: ['v*']
@@ -17,8 +17,46 @@ permissions:
   contents: write   # needed to create the GitHub release
 
 jobs:
+  # A single NuGet package ships the managed assembly plus BOTH native RIDs.
+  # Build each shared library on its own OS, then merge them in publish.
+  native:
+    name: native ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build Windows native library + C smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-native.ps1
+
+      - name: Build Linux native library + C smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/build-native-linux.sh
+
+      - name: Upload native runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: artifacts/runtimes/${{ matrix.rid }}/native/*
+          if-no-files-found: error
+
   publish:
     name: Pack and publish QwenZImage.NET
+    needs: native
     runs-on: ubuntu-latest
 
     steps:
@@ -32,10 +70,20 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Download win-x64 native runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: native-win-x64
+          path: artifacts/runtimes/win-x64/native
+
+      - name: Download linux-x64 native runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: native-linux-x64
+          path: artifacts/runtimes/linux-x64/native
+
       - name: Build and test (reference backend, no GPU required)
-        shell: bash
         run: |
-          bash scripts/build-native.sh
           dotnet build QwenZImage.NET.sln -c Release --nologo
           dotnet test QwenZImage.NET.sln -c Release --no-build --nologo
 
@@ -53,13 +101,34 @@ jobs:
           echo "value=$version" >> "$GITHUB_OUTPUT"
           echo "Publishing QwenZImage.NET $version"
 
-      - name: Pack
+      - name: Pack (managed + win-x64 + linux-x64)
         run: >-
           dotnet pack src/QwenZImage.NET/QwenZImage.NET.csproj
           -c Release
           -p:Version=${{ steps.version.outputs.value }}
           -o artifacts/packages
           --nologo
+
+      - name: Verify package contains both native RIDs before publishing
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $package = Get-Item "artifacts/packages/QwenZImage.NET.${{ steps.version.outputs.value }}.nupkg"
+          $required = @(
+            'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+            'docs/NATIVE_ABI.md',
+            'lib/net10.0/QwenZImage.NET.dll',
+            'runtimes/win-x64/native/qzi.dll',
+            'runtimes/linux-x64/native/libqzi.so'
+          )
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($package.FullName)
+          try {
+            $names = @($zip.Entries.FullName)
+            foreach ($r in $required) {
+              if (-not ($names -contains $r)) { throw "refusing to publish: missing '$r'" }
+            }
+            Write-Host "== $($package.Name) contains all $($required.Count) required entries"
+          } finally { $zip.Dispose() }
 
       - name: Push to nuget.org
         env:

@@ -35,11 +35,19 @@ internal static class NativeTestLibrary
         DirectoryInfo? dir = new(AppContext.BaseDirectory);
         for (int i = 0; i < 8 && dir is not null; i++, dir = dir.Parent)
         {
-            string artifacts = Path.Combine(dir.FullName, "artifacts", "native");
-            if (!Directory.Exists(artifacts)) continue;
-            string? found = Directory.EnumerateFiles(artifacts, name, SearchOption.AllDirectories)
-                                     .FirstOrDefault();
-            if (found is not null) return found;
+            // Prefer the staged NuGet RID layout: CI downloads only that tree,
+            // and it is exactly what ends up in the .nupkg.
+            foreach (string tree in new[]
+                     {
+                         Path.Combine(dir.FullName, "artifacts", "runtimes"),
+                         Path.Combine(dir.FullName, "artifacts", "native")
+                     })
+            {
+                if (!Directory.Exists(tree)) continue;
+                string? found = Directory.EnumerateFiles(tree, name, SearchOption.AllDirectories)
+                                         .FirstOrDefault();
+                if (found is not null) return found;
+            }
         }
         string? env = Environment.GetEnvironmentVariable("QZI_NATIVE_LIBRARY");
         return !string.IsNullOrEmpty(env) && File.Exists(env) ? env : null;

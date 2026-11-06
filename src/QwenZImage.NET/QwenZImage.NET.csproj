@@ -15,7 +15,7 @@
     <Company>QwenZImage.NET contributors</Company>
     <Product>QwenZImage.NET</Product>
     <Title>QwenZImage.NET - .NET 10 wrapper for Qwen-Image 2.1 and Z-Image</Title>
-    <Description>High-performance .NET 10 P/Invoke wrapper over the native C ABI for Qwen-Image 2.1 (turbo/base, LoRA) and Z-Image (bf16/Nunchaku) text-to-image generation. Pure managed assembly, no Go and no HTTP hop; the caller supplies the qzi native library.</Description>
+    <Description>High-performance .NET 10 P/Invoke wrapper over the native C ABI for Qwen-Image 2.1 (turbo/base, LoRA) and Z-Image (bf16/Nunchaku) text-to-image generation. Ships the managed assembly plus win-x64 and linux-x64 native runtimes; a real C/CUDA engine can replace the bundled reference backend. No Go and no HTTP hop.</Description>
     <Copyright>Copyright (c) 2026 QwenZImage.NET contributors</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -32,8 +32,32 @@
     <None Include="../../README.md" Pack="true" PackagePath="/" />
     <None Include="../../LICENSE" Pack="true" PackagePath="/" />
     <None Include="../../THIRD_PARTY_NOTICES.md" Pack="true" PackagePath="/" />
-    <None Include="../../docs/NATIVE_ABI.md" Pack="true" PackagePath="docs/" />
+    <!-- Ship every doc so links in the NuGet README remain valid. -->
+    <None Include="../../docs/*.md" Pack="true" PackagePath="docs/" />
   </ItemGroup>
+
+  <!-- Native runtimes shipped IN the same package. NuGet's runtimes/<rid>/native/
+       convention makes the matching library available automatically on Windows
+       and Linux; the host's native probing plus NativeLibraryLoader resolves it.
+       Callers can still override with QZI_NATIVE_LIBRARY for a real CUDA engine. -->
+  <PropertyGroup>
+    <QziNativeWin>$(MSBuildThisFileDirectory)../../artifacts/runtimes/win-x64/native/qzi.dll</QziNativeWin>
+    <QziNativeLinux>$(MSBuildThisFileDirectory)../../artifacts/runtimes/linux-x64/native/libqzi.so</QziNativeLinux>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(QziNativeWin)" Pack="true" PackagePath="runtimes/win-x64/native/" Visible="false" />
+    <None Include="$(QziNativeLinux)" Pack="true" PackagePath="runtimes/linux-x64/native/" Visible="false" />
+  </ItemGroup>
+
+  <!-- Never publish a package with a missing platform runtime. Build both with
+       scripts/build-native-all.ps1 (Windows + WSL) or let CI stage them. -->
+  <Target Name="QziEnsureNativeRuntimes" BeforeTargets="GenerateNuspec">
+    <Error Condition="!Exists('$(QziNativeWin)')"
+           Text="Missing win-x64 native library: $(QziNativeWin). Run scripts/build-native.ps1 (or build-native-all.ps1) before dotnet pack." />
+    <Error Condition="!Exists('$(QziNativeLinux)')"
+           Text="Missing linux-x64 native library: $(QziNativeLinux). Run scripts/build-native-linux.sh on Linux/WSL before dotnet pack." />
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
