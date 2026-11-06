@@ -45,6 +45,9 @@ artifacts/*
 .DS_Store
 Thumbs.db
 
+# Generated sample images
+outputs/
+
 # Local scratch / secrets
 .scratch/
 .run/

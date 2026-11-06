@@ -79,10 +79,12 @@ QwenZImage.NET/
 
 前置条件（当前本机**均不满足**）：已安装并登录 `gh` **或** 配好 git 凭据；`NUGET_API_KEY` 可用；GitHub 上 `alexhegit/QwenZImage.NET` 仓库已创建且有推送权限。
 
+> 本地仓库**已配置** `origin = https://github.com/alexhegit/QwenZImage.NET.git`（仅配置远程，未推送），这样 SourceLink 能生成正确的源码映射。若目标仓库不同，用 `git remote set-url origin <url>` 修改。
+
 ```bash
 # 9.1 建仓并推送（示例，需自行确认仓库归属）
 cd D:/AI/convert/QwenZImage.NET
-git remote add origin https://github.com/alexhegit/QwenZImage.NET.git
+git remote -v                 # 确认 origin；必要时 git remote set-url origin <url>
 git branch -M main
 git push -u origin main
 
