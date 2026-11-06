@@ -60,6 +60,15 @@ h2 { font-size: 15px; font-weight: 650; letter-spacing: .01em; }
 .subtitle { margin: 1px 0 0; color: var(--muted); font-size: 12px; }
 .topbar-actions, .head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
+.banner {
+  margin: 14px 24px 0; padding: 11px 14px; border-radius: 8px;
+  background: var(--warn-soft); color: var(--warn);
+  border: 1px solid var(--warn); font-size: 12.5px; line-height: 1.55;
+}
+.banner[hidden] { display: none; }
+.banner code { background: rgba(127, 127, 127, .16); padding: 1px 4px; border-radius: 3px; }
+.banner a { color: inherit; font-weight: 650; }
+
 .layout {
   display: grid; grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
   gap: 18px; padding: 18px 24px 32px; align-items: start;

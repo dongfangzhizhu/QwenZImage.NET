@@ -3,6 +3,8 @@
 > **High-performance .NET 10 wrapper over a stable C ABI for Qwen-Image 2.1 and Z-Image text-to-image generation.**
 > Pure C at the bottom, source-generated P/Invoke at the top: no Go, no HTTP hop to a sidecar, no JSON marshalling in the hot path.
 
+> ⚠️ **本项目自带的 native 库不生成真实图像。** 包内 `qzi.dll` / `libqzi.so` 是 deterministic **reference backend**：输出由 prompt / seed / 尺寸哈希出来的**噪点图**，`steps`、`guidance`、`seed` 只驱动进度条，不做任何扩散推理。原 Go WebUI 能出正常图像，是因为它连的是 `h3 serve`（真正的 C/CUDA 引擎 + 模型权重）；**那个引擎没有被搬进本仓库**。要出真实图，必须按 [docs/ENGINE_INTEGRATION.md](docs/ENGINE_INTEGRATION.md) 接入真实引擎，或让 WebUI 连到本机 `h3 serve`。WebUI 在检测到参考后端时会显示醒目的黄色横幅。
+
 一个把 **Qwen-Image 2.1（turbo / base / LoRA）** 与 **Z-Image（bf16 / Nunchaku int4）** 两个文生图能力封装成 `.NET 10` 可调用包的独立项目。底层是 C 语言定义的稳定 ABI（C/CUDA 引擎可实现它），上层是 `.NET 10` 的高性能源生成 P/Invoke 封装。原 Go WebUI 的队列、进度、取消、重试、预设等功能全部用纯 `.NET` 重写，**仓库中不含任何 Go 代码、库调用链上不依赖 HTTP 服务**。
 
 仓库另附一个**可选的跨平台 WebUI 手动测试控制台**（`src/QwenZImage.NET.WebUI`，ASP.NET Core Minimal API，Windows / Linux 均可运行），把原本 Go WebUI 的交互面用纯 `.NET` 复刻出来；它只是浏览器到库的本地前端，不参与 NuGet 包，也不是 SDK 的一部分。详见 [docs/WEBUI.md](docs/WEBUI.md)。

@@ -44,11 +44,14 @@ async function refreshHealth() {
     const h = await api("/api/health");
     const pill = $("health-pill");
     if (h.ok) {
-      const backend = h.engine?.reference_backend ? "reference backend" : "engine backend";
-      pill.className = "pill pill-ok";
+      const reference = h.engine?.reference_backend === true;
+      const backend = reference ? "reference backend (noise)" : "engine backend";
+      pill.className = reference ? "pill pill-wait" : "pill pill-ok";
       pill.textContent = `● ${backend} · ${h.engine?.resident_model || "no model"}`;
       pill.title = `out_dir: ${h.out_dir}\nmodel_dir: ${h.model_dir}\nserved: ${h.engine?.served ?? 0}`;
+      $("backend-banner").hidden = !reference;
     } else {
+      $("backend-banner").hidden = true;
       pill.className = "pill pill-bad";
       pill.textContent = "● engine unavailable";
       pill.title = h.error || "unknown error";

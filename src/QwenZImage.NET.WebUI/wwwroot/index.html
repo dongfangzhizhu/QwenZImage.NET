@@ -21,6 +21,16 @@
   </div>
 </header>
 
+<div id="backend-banner" class="banner" hidden>
+  <strong>Reference backend — not real inference.</strong>
+  The bundled <code>qzi.dll</code> / <code>libqzi.so</code> is a deterministic
+  test implementation: it emits pseudo-random pixels (noise), and steps / seed /
+  guidance only drive the progress bar. To get real images, start
+  <code>h3 serve</code> or point <code>QZI_NATIVE_LIBRARY</code> at a native
+  library that implements <code>qzi_backend</code> with the real CUDA engine.
+  See <a href="https://github.com/alexhegit/QwenZImage.NET" target="_blank" rel="noopener">docs/ENGINE_INTEGRATION.md</a>.
+</div>
+
 <main class="layout">
   <section class="panel form-panel" aria-label="Generation request">
     <h2>Request</h2>
