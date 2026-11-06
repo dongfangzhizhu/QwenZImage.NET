@@ -1,0 +1,8 @@
+#ifndef QZEN_CUDA_H
+#define QZEN_CUDA_H
+
+#include "qzen.h"
+
+int qzen_cuda_probe(qzen_device_info *info, char *error, size_t error_size);
+
+#endif

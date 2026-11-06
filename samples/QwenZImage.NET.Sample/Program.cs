@@ -1,22 +1,20 @@
 using QwenZImage.NET;
 
-// Minimal end-to-end sample. Works out of the box against the bundled
-// deterministic reference backend (build it with scripts/build-native.* first),
-// and against a real CUDA engine by pointing QZI_NATIVE_LIBRARY at its qzi
-// build and supplying the model directories.
+// Minimal end-to-end sample. Model packs come from QwenZImage.config.json
+// (or QZI_CONFIG / --config / QZI_MODEL_DIR). Works out of the box against the
+// bundled deterministic reference backend; a CUDA build of QwenZImageNative
+// uses the same config and produces real images.
 
-string modelDir = args.Length > 0
-    ? args[0]
-    : Environment.GetEnvironmentVariable("QZI_MODEL_DIR") ?? ".";
 string outDir = Path.Combine(Directory.GetCurrentDirectory(), "outputs");
 Directory.CreateDirectory(outDir);
 
-var options = new QziClientOptions
-{
-    Qwen21Directory = modelDir,
-    ZImageDirectory = modelDir,
-    CacheDirectory = Path.Combine(Path.GetTempPath(), "qzi-text-cache")
-};
+// No explicit options: the library loads QwenZImage.config.json itself. Pass a
+// path here (or set QZI_CONFIG) to use a different file.
+QziClientOptions options = args.Length > 0
+    ? QziClientOptions.FromConfig(args[0])
+    : QziClientOptions.FromConfig();
+Console.WriteLine($"config: {options.ConfigPath ?? "(none - defaults)"}");
+Console.WriteLine($"qwen21 pack: {options.Qwen21Directory ?? "(unset)"}");
 
 try
 {
@@ -78,7 +76,7 @@ catch (DllNotFoundException ex)
     Console.Error.WriteLine(
         "No qzi native library found. Build the reference library first:\n" +
         "  cmake -S native -B native/build -G Ninja && cmake --build native/build\n" +
-        "or set QZI_NATIVE_LIBRARY to your engine's qzi.dll / libqzi.so.\n" + ex.Message);
+        "or set QZI_NATIVE_LIBRARY to your engine's QwenZImageNative.dll / libQwenZImageNative.so.\n" + ex.Message);
     return 1;
 }
 catch (QziException ex)

@@ -110,11 +110,11 @@ jobs:
           $packages = @(Get-ChildItem artifacts/packages/*.nupkg)
           if ($packages.Count -eq 0) { throw 'no .nupkg produced' }
           $required = @(
-            'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+            'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'engine/LICENSE',
             'docs/NATIVE_ABI.md',
             'lib/net10.0/QwenZImage.NET.dll',
-            'runtimes/win-x64/native/qzi.dll',
-            'runtimes/linux-x64/native/libqzi.so'
+            'runtimes/win-x64/native/QwenZImageNative.dll',
+            'runtimes/linux-x64/native/libQwenZImageNative.so'
           )
           foreach ($p in $packages) {
             $zip = [System.IO.Compression.ZipFile]::OpenRead($p.FullName)
@@ -123,7 +123,7 @@ jobs:
               foreach ($r in $required) {
                 if (-not ($names -contains $r)) { throw "missing '$r' in $($p.Name)" }
               }
-              foreach ($rid in @('runtimes/win-x64/native/qzi.dll', 'runtimes/linux-x64/native/libqzi.so')) {
+              foreach ($rid in @('runtimes/win-x64/native/QwenZImageNative.dll', 'runtimes/linux-x64/native/libQwenZImageNative.so')) {
                 $entry = $zip.Entries | Where-Object { $_.FullName -eq $rid }
                 if ($entry.Length -le 0) { throw "empty native library '$rid' in $($p.Name)" }
               }
@@ -140,12 +140,12 @@ jobs:
         env:
           QZI_WEBUI_URLS: http://127.0.0.1:17860
           QZI_WEBUI_OUTPUT: ${{ github.workspace }}/artifacts/webui-smoke-output
-          QZI_NATIVE_LIBRARY: ${{ github.workspace }}/artifacts/runtimes/linux-x64/native/libqzi.so
+          QZI_NATIVE_LIBRARY: ${{ github.workspace }}/artifacts/runtimes/linux-x64/native/libQwenZImageNative.so
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/qzi-webui.log"
           dotnet run --project src/QwenZImage.NET.WebUI/QwenZImage.NET.WebUI.csproj \
-            -c Release --no-build > "$log" 2>&1 &
+            -c Release --no-build --no-launch-profile > "$log" 2>&1 &
           pid=$!
           trap 'kill "$pid" 2>/dev/null || true; cat "$log"' EXIT
           base=http://127.0.0.1:17860
@@ -158,6 +158,8 @@ jobs:
           base = "http://127.0.0.1:17860"
           health = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "health.json")))
           assert health["ok"] is True, health
+          assert health["transport"] == "native-pinvoke", health
+          assert health["config_path"], health
           assert health["engine"]["reference_backend"] is True, health
           presets = json.load(urllib.request.urlopen(base + "/api/presets"))["presets"]
           assert any(p["model"] == "qwen21" for p in presets), presets
@@ -181,68 +183,6 @@ jobs:
           assert any(o["name"] == job["output_name"] for o in outputs), outputs
           print("WebUI smoke OK:", job["output_name"], len(outputs), "outputs")
           PY
-
-      # Same WebUI, but pointed at a stand-in `h3 serve`. This is the path that
-      # produces REAL images in production: verify the engine's PNG bytes travel
-      # through the queue and land byte-for-byte in the output gallery.
-      - name: WebUI real-engine (QZI_ENGINE_URL) smoke test
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          QZI_WEBUI_URLS: http://127.0.0.1:17861
-          QZI_WEBUI_OUTPUT: ${{ github.workspace }}/artifacts/webui-engine-smoke-output
-        run: |
-          set -euo pipefail
-          mock_log="$RUNNER_TEMP/qzi-mock-engine.log"
-          ui_log="$RUNNER_TEMP/qzi-webui-engine.log"
-          python3 scripts/mock-h3-serve.py --port 18411 > "$mock_log" 2>&1 &
-          mock_pid=$!
-          QZI_ENGINE_URL=http://127.0.0.1:18411 \
-            dotnet run --project src/QwenZImage.NET.WebUI/QwenZImage.NET.WebUI.csproj \
-              -c Release --no-build > "$ui_log" 2>&1 &
-          ui_pid=$!
-          trap 'kill "$ui_pid" "$mock_pid" 2>/dev/null || true; cat "$ui_log" "$mock_log"' EXIT
-          base=http://127.0.0.1:17861
-          for _ in $(seq 1 60); do
-            if curl -fsS "$base/api/health" > "$RUNNER_TEMP/engine-health.json" 2>/dev/null; then break; fi
-            sleep 0.5
-          done
-          python3 - <<'PY'
-          import json, os, time, urllib.request
-          base = "http://127.0.0.1:17861"
-          health = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "engine-health.json")))
-          assert health["ok"] is True, health
-          assert health["transport"] == "h3-serve-http", health
-          assert health["engine"]["reference_backend"] is False, health
-          assert health["engine"]["backend"] == "h3-serve", health
-          req = urllib.request.Request(
-              base + "/api/jobs",
-              data=json.dumps({"model": "qwen21", "prompt": "ci real-engine smoke",
-                               "width": 256, "height": 256, "seed": 42,
-                               "tier": "turbo", "steps": 8, "guidance": 1.0}).encode(),
-              headers={"Content-Type": "application/json"}, method="POST")
-          job = json.load(urllib.request.urlopen(req))
-          for _ in range(60):
-              job = json.load(urllib.request.urlopen(f"{base}/api/jobs/{job['id']}"))
-              if job["state"] in ("done", "error", "cancelled"):
-                  break
-              time.sleep(0.5)
-          assert job["state"] == "done", job
-          data = urllib.request.urlopen(base + job["output_url"]).read()
-          assert data == b"\x89PNG\r\n\x1a\nQZI-MOCK-ENGINE-PNG", data
-          print("real-engine bridge OK:", job["output_name"], len(data), "bytes")
-          PY
-          # Assert against the raw WIRE bytes, not the fixture's re-serialised
-          # JSON: this is exactly what H3ServeExecutor sent to the C engine.
-          wire=$(grep '^WIRE ' "$mock_log" | tail -n 1)
-          test -n "$wire"
-          grep -q '"model":"qwen21"' <<< "$wire"
-          grep -q '"tier":"turbo"' <<< "$wire"
-          grep -q '"steps":8' <<< "$wire"
-          grep -q '"guidance":1.0' <<< "$wire"      # literal 1.0, not 1
-          if grep -q '"negative_prompt"' <<< "$wire"; then
-            echo "::error::qwen21 turbo must not send negative_prompt"; exit 1
-          fi
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4

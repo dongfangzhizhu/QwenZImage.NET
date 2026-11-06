@@ -57,7 +57,7 @@ static uint64_t next_rand(uint64_t *state)
     return x * 2685821657736338717ULL;
 }
 
-/* Runs the same coarse phase sequence as h3 serve: model load (when the
+/* Runs the same coarse phase sequence as the real backend: model load (when the
  * resident model changes), text, dit (step/steps), vae, encode. */
 static qzi_status run_phases(const qzi_callbacks *callbacks, double start,
                              qzi_model_kind model, int switched,

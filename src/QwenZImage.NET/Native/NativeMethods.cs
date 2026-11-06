@@ -9,7 +9,9 @@ namespace QwenZImage.NET.Native;
 /// </summary>
 internal static unsafe partial class NativeMethods
 {
-    internal const string LibraryName = "qzi";
+    // Platform-neutral name: resolves to QwenZImageNative.dll on Windows,
+    // libQwenZImageNative.so on Linux and libQwenZImageNative.dylib on macOS.
+    internal const string LibraryName = "QwenZImageNative";
     internal const uint ExpectedAbiVersion = 1;
     internal const int ErrorCapacity = 512;
 

@@ -3,90 +3,77 @@ using QwenZImage.NET;
 
 namespace QwenZImage.NET.WebUI;
 
-/// <summary>Configuration read from environment variables / CLI, all optional.</summary>
+/// <summary>Configuration read from <c>QwenZImage.config.json</c> plus optional overrides.</summary>
 public sealed class WebUiConfig
 {
     public string Urls { get; init; } = "http://127.0.0.1:7860";
     public string OutputDirectory { get; init; } = "";
-    public string ModelDirectory { get; init; } = "";
-    public string CacheDirectory { get; init; } = "";
-    public string? NativeLibraryPath { get; init; }
-    public int DeviceId { get; init; } = -1;
 
     /// <summary>
-    /// Base URL of a real <c>h3 serve</c> instance. When set, the WebUI uses the
-    /// HTTP transport instead of the bundled native reference backend, and the
-    /// bundled noise-only library is never loaded.
+    /// Fully resolved options handed to <see cref="QziClient"/>. Model pack
+    /// directories come from the config file; the <c>QZI_*</c> environment
+    /// variables and the CLI switches below override individual fields.
     /// </summary>
-    public string? EngineUrl { get; init; }
+    public QziClientOptions ClientOptions { get; init; } = new();
 
-    /// <summary>Whole-request deadline for the HTTP transport, in minutes.</summary>
-    public double EngineTimeoutMinutes { get; init; } = 30;
+    /// <summary>Config file actually used, for the health endpoint.</summary>
+    public string? ConfigPath => ClientOptions.ConfigPath;
 
-    /// <summary>Poll interval for the engine's optional /progress endpoint.</summary>
-    public int EngineProgressPollMs { get; init; } = 500;
+    /// <summary>Primary model pack directory, for the health endpoint.</summary>
+    public string ModelDirectory => ClientOptions.Qwen21Directory ?? "";
 
     public static WebUiConfig FromEnvironment(string contentRoot, string[] args)
     {
         string output = Environment.GetEnvironmentVariable("QZI_WEBUI_OUTPUT") ?? "";
-        string model = Environment.GetEnvironmentVariable("QZI_MODEL_DIR") ?? "";
-        string cache = Environment.GetEnvironmentVariable("QZI_MODEL_CACHE") ?? "";
         string urls = Environment.GetEnvironmentVariable("QZI_WEBUI_URLS") ?? "";
-        string? engine = Environment.GetEnvironmentVariable("QZI_ENGINE_URL");
+        string? model = NullIfBlank(Environment.GetEnvironmentVariable("QZI_MODEL_DIR"));
+        string? cache = NullIfBlank(Environment.GetEnvironmentVariable("QZI_MODEL_CACHE"));
+        string? native = NullIfBlank(Environment.GetEnvironmentVariable("QZI_NATIVE_LIBRARY"));
+        string? configPath = NullIfBlank(Environment.GetEnvironmentVariable(QziConfig.EnvironmentVariable));
 
-        int device = -1;
+        int? device = null;
         string? deviceText = Environment.GetEnvironmentVariable("QZI_DEVICE_ID");
-        if (!string.IsNullOrWhiteSpace(deviceText) && int.TryParse(deviceText, out int parsed))
-            device = parsed;
+        if (int.TryParse(deviceText, out int parsedDevice)) device = parsedDevice;
 
-        double timeout = 30;
-        string? timeoutText = Environment.GetEnvironmentVariable("QZI_ENGINE_TIMEOUT_MIN");
-        if (double.TryParse(timeoutText, out double parsedTimeout) && parsedTimeout > 0)
-            timeout = parsedTimeout;
-
-        int pollMs = 500;
-        string? pollText = Environment.GetEnvironmentVariable("QZI_ENGINE_PROGRESS_MS");
-        if (int.TryParse(pollText, out int parsedPoll) && parsedPoll >= 100)
-            pollMs = parsedPoll;
-
-        // `--engine URL` mirrors the original Go WebUI's --engine flag and wins
-        // over the environment variable. It is intentionally the only extra CLI
-        // switch; ASP.NET Core ignores unknown command-line configuration keys.
+        // Explicit CLI switches win over the environment. ASP.NET Core ignores
+        // unknown command-line configuration keys, so these are harmless there.
         for (int i = 0; i < args.Length - 1; i++)
-            if (string.Equals(args[i], "--engine", StringComparison.Ordinal))
-                engine = args[i + 1];
+        {
+            if (string.Equals(args[i], "--config", StringComparison.Ordinal))
+                configPath = args[i + 1];
+            else if (string.Equals(args[i], "--models", StringComparison.Ordinal))
+                model = args[i + 1];
+        }
+
+        QziClientOptions baseline = QziClientOptions.FromConfig(configPath);
+        QziClientOptions options = new()
+        {
+            NativeLibraryPath = native ?? baseline.NativeLibraryPath,
+            Qwen21Directory = model ?? baseline.Qwen21Directory,
+            ZImageDirectory = model ?? baseline.ZImageDirectory,
+            CacheDirectory = cache ?? baseline.CacheDirectory,
+            DeviceId = device ?? baseline.DeviceId,
+            ThreadCount = baseline.ThreadCount,
+            ConfigPath = baseline.ConfigPath
+        };
 
         return new WebUiConfig
         {
             Urls = string.IsNullOrWhiteSpace(urls) ? "http://127.0.0.1:7860" : urls,
             OutputDirectory = string.IsNullOrWhiteSpace(output)
                 ? Path.Combine(contentRoot, "outputs") : output,
-            ModelDirectory = string.IsNullOrWhiteSpace(model) ? contentRoot : model,
-            CacheDirectory = string.IsNullOrWhiteSpace(cache)
-                ? Path.Combine(Path.GetTempPath(), "qzi-text-cache") : cache,
-            NativeLibraryPath = Environment.GetEnvironmentVariable("QZI_NATIVE_LIBRARY"),
-            DeviceId = device,
-            EngineUrl = string.IsNullOrWhiteSpace(engine) ? null : engine.Trim(),
-            EngineTimeoutMinutes = timeout,
-            EngineProgressPollMs = pollMs
+            ClientOptions = options
         };
     }
 
-    /// <summary>Wire-level transport name, surfaced in /api/health.</summary>
-    public string Transport => EngineUrl is null ? "native-pinvoke" : "h3-serve-http";
+    private static string? NullIfBlank(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value;
 }
 
 /// <summary>
-/// Owns the single engine, the serial job queue and the output gallery.
-///
-/// Two transports are supported:
-///  * default — in-process native P/Invoke (<see cref="QziClient"/>), which with
-///    the bundled library is the deterministic noise-only reference backend;
-///  * <c>QZI_ENGINE_URL</c> — an HTTP adapter for the real C/CUDA <c>h3 serve</c>,
-///    giving real Qwen-Image 2.1 / Z-Image output. WebUI-only, not in NuGet.
-///
-/// If native initialisation fails the WebUI still starts and serves a clear
-/// error in /api/health.
+/// Owns the single in-process native engine, the serial job queue and the
+/// output gallery. If native initialisation fails the WebUI still starts and
+/// serves a clear error in /api/health.
 /// </summary>
 public sealed class WebUiRuntime : IDisposable
 {
@@ -101,12 +88,7 @@ public sealed class WebUiRuntime : IDisposable
 
         try
         {
-            Engine = config.EngineUrl is null
-                ? new NativeEngineAdapter(config)
-                : new H3ServeExecutor(config.EngineUrl,
-                                      TimeSpan.FromMinutes(config.EngineTimeoutMinutes),
-                                      config.EngineProgressPollMs);
-
+            Engine = new WebUiEngine(config.ClientOptions);
             Queue = new QziGenerationQueue(Engine, async (job, result, token) =>
             {
                 string name = await Outputs.SaveAsync(job.Id, result, token);
@@ -121,7 +103,7 @@ public sealed class WebUiRuntime : IDisposable
 
     public WebUiConfig Config { get; }
     public OutputStore Outputs { get; }
-    public IWebUiEngine? Engine { get; }
+    public WebUiEngine? Engine { get; }
     public QziGenerationQueue? Queue { get; }
     public string? InitError { get; }
     public DateTimeOffset StartedAt { get; }

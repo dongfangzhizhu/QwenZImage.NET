@@ -16,16 +16,16 @@
        a published deployment work on Windows and Linux without QZI_NATIVE_LIBRARY.
        Conditions keep a fresh checkout (before any native build) buildable. -->
   <ItemGroup>
-    <None Include="$(MSBuildThisFileDirectory)../../artifacts/runtimes/win-x64/native/qzi.dll"
-          Link="runtimes/win-x64/native/qzi.dll"
+    <None Include="$(MSBuildThisFileDirectory)../../artifacts/runtimes/win-x64/native/QwenZImageNative.dll"
+          Link="runtimes/win-x64/native/QwenZImageNative.dll"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest"
-          Condition="Exists('$(MSBuildThisFileDirectory)../../artifacts/runtimes/win-x64/native/qzi.dll')" />
-    <None Include="$(MSBuildThisFileDirectory)../../artifacts/runtimes/linux-x64/native/libqzi.so"
-          Link="runtimes/linux-x64/native/libqzi.so"
+          Condition="Exists('$(MSBuildThisFileDirectory)../../artifacts/runtimes/win-x64/native/QwenZImageNative.dll')" />
+    <None Include="$(MSBuildThisFileDirectory)../../artifacts/runtimes/linux-x64/native/libQwenZImageNative.so"
+          Link="runtimes/linux-x64/native/libQwenZImageNative.so"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest"
-          Condition="Exists('$(MSBuildThisFileDirectory)../../artifacts/runtimes/linux-x64/native/libqzi.so')" />
+          Condition="Exists('$(MSBuildThisFileDirectory)../../artifacts/runtimes/linux-x64/native/libQwenZImageNative.so')" />
   </ItemGroup>
 
 </Project>

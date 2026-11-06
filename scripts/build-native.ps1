@@ -31,7 +31,7 @@ if ($LASTEXITCODE -ne 0) { throw "ctest failed with exit code $LASTEXITCODE" }
 
 Write-Host '==> native library output:'
 Get-ChildItem -Path (Join-Path $root 'artifacts/native') -Recurse -File |
-  Where-Object { $_.Name -in @('qzi.dll', 'libqzi.so', 'libqzi.dylib') } |
+  Where-Object { $_.Name -in @('QwenZImageNative.dll', 'libQwenZImageNative.so', 'libQwenZImageNative.dylib') } |
   ForEach-Object { $_.FullName }
 
 Write-Host '==> staging for NuGet'

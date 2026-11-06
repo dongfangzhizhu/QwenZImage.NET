@@ -115,8 +115,8 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         error,
         out_dir = rt.Outputs.Root,
         model_dir = rt.Config.ModelDirectory,
-        transport = rt.Config.Transport,
-        engine_url = rt.Config.EngineUrl,
+        transport = "native-pinvoke",
+        config_path = rt.Config.ConfigPath,
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
     });
@@ -396,14 +396,22 @@ app.Lifetime.ApplicationStarted.Register(() =>
     app.Logger.LogInformation("QwenZImage.NET WebUI listening on {Urls}",
                               string.Join(", ", app.Urls));
     app.Logger.LogInformation("Output directory: {OutputDirectory}", runtime.Outputs.Root);
-    app.Logger.LogInformation("Engine transport: {Transport}{EngineUrl}",
-                              runtime.Config.Transport,
-                              runtime.Config.EngineUrl is null
-                                  ? "" : $" ({runtime.Config.EngineUrl})");
-    if (runtime.Config.Transport == "native-pinvoke")
-        app.Logger.LogWarning(
-            "Bundled native library is the deterministic REFERENCE backend: it emits noise. " +
-            "Set QZI_ENGINE_URL=http://127.0.0.1:8411 to use a real h3 serve engine.");
+    app.Logger.LogInformation("Config file: {ConfigPath}",
+                              runtime.Config.ConfigPath ?? "(none - using defaults)");
+    app.Logger.LogInformation("Model pack: {ModelDirectory}", runtime.Config.ModelDirectory);
+    app.Logger.LogInformation("Transport: in-process P/Invoke into QwenZImageNative");
+    try
+    {
+        if (runtime.Engine?.GetHealth().IsReferenceBackend == true)
+            app.Logger.LogWarning(
+                "The loaded native library is the deterministic REFERENCE backend: it emits " +
+                "noise. Build with -DQZI_WITH_CUDA_ENGINE=ON and point " +
+                "QwenZImage.config.json at the model packs for real images.");
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogWarning("Could not query the native backend: {Error}", ex.Message);
+    }
     if (runtime.InitError is not null)
         app.Logger.LogWarning("Engine unavailable: {Error}", runtime.InitError);
 });

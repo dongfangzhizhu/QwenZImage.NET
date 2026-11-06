@@ -91,7 +91,7 @@ typedef struct qzi_engine_config {
     uint32_t     flags;         /* reserved, must be 0 */
 } qzi_engine_config;
 
-/* Qwen-Image 2.1 text-to-image request. Rules mirror the h3-spark.c engine:
+/* Qwen-Image 2.1 text-to-image request. Rules mirror the vendored engine:
  * width/height are multiples of 32 in [32, 2048], w*h <= 2048*2048;
  * tier "turbo" forces steps == 8 and guidance == 1.0 and rejects
  * negative_prompt; "base" allows steps 1..50, guidance 1..20;

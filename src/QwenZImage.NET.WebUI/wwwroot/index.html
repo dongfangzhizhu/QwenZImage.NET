@@ -23,12 +23,13 @@
 
 <div id="backend-banner" class="banner" hidden>
   <strong>Reference backend — not real inference.</strong>
-  The bundled <code>qzi.dll</code> / <code>libqzi.so</code> is a deterministic
+  The bundled <code>QwenZImageNative.dll</code> / <code>libQwenZImageNative.so</code> is a deterministic
   test implementation: it emits pseudo-random pixels (noise), and steps / seed /
   guidance only drive the progress bar — no diffusion happens at all.
-  <strong>To get real images:</strong> start <code>h3 serve --port 8411</code>
-  and relaunch this WebUI with <code>QZI_ENGINE_URL=http://127.0.0.1:8411</code>
-  (or <code>--engine http://127.0.0.1:8411</code>). See
+  <strong>To get real images:</strong> build the native backend with
+  <code>-DQZI_WITH_CUDA_ENGINE=ON</code> and point <code>QwenZImage.config.json</code>
+  at your model packs. The managed library P/Invokes that backend directly;
+  there is no separate server to start. See
   <a href="https://github.com/alexhegit/QwenZImage.NET" target="_blank" rel="noopener">docs/WEBUI.md</a>.
 </div>
 

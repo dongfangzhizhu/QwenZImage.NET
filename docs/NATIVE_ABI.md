@@ -1,6 +1,6 @@
 # QwenZImage.NET Native C ABI (v1)
 
-`native/include/qzi.h` 是**唯一**的托管/原生契约。任何实现并导出其中 `qzi_*` 函数的共享库都可以被 `QwenZImage.NET` 加载，无论内部是 CPU 参考实现还是 CUDA 引擎。本文件说明调用规则、内存所有权与版本策略；参数语义见 [PARAMETERS.md](PARAMETERS.md)，后端接入见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
+`native/include/qzi.h` 是**唯一**的托管/原生契约。任何实现并导出其中 `qzi_*` 函数的共享库都可以被 `QwenZImage.NET` 加载，无论内部是确定性参考实现还是真实 CUDA 引擎。本仓库统一产出 `QwenZImageNative.dll` / `libQwenZImageNative.so` 两个 flavour：默认链接 `qzi_stub.c`（噪点，CI 用），`-DQZI_WITH_CUDA_ENGINE=ON` 链接 `qzi_engine_backend.c` + `engine/`（真实推理）。两者 ABI 完全相同，托管侧一行不用改。本文件说明调用规则、内存所有权与版本策略；参数语义见 [PARAMETERS.md](PARAMETERS.md)，后端实现与构建见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
 
 ## 设计原则
 
@@ -42,7 +42,7 @@
 | `uint32_t qzi_abi_version(void)` | 返回 `QZI_ABI_VERSION` |
 | `const char *qzi_status_text(qzi_status)` | 静态状态描述，不释放 |
 | `qzi_status qzi_abi_layout(size_t *sizes, size_t count)` | 写 6 个 `sizeof()`；`count < 6` 返回 `QZI_ERR_INVALID_ARGUMENT` |
-| `qzi_status qzi_register_backend(const qzi_backend *)` | 复制 vtable；`NULL` 恢复内置参考后端；必须在 `qzi_engine_create` 之前调用 |
+| `qzi_status qzi_register_backend(const qzi_backend *)` | 复制 vtable，运行时覆盖编译期默认 backend；`NULL` 恢复编译期默认值（reference 构建 → 参考后端，CUDA 构建 → 真实后端）；必须在 `qzi_engine_create` 之前调用 |
 | `qzi_status qzi_engine_create(const qzi_engine_config *, qzi_engine **, char *error, size_t cap)` | 创建 engine；`config->abi_version` 必须等于 `QZI_ABI_VERSION` |
 | `void qzi_engine_destroy(qzi_engine *)` | 释放 engine（调用前必须没有正在进行的生成） |
 | `qzi_status qzi_engine_health(qzi_engine *, qzi_health *, char *, size_t)` | 状态/计数快照 |
@@ -51,7 +51,7 @@
 | `qzi_status qzi_generate_zimage(...)` | 同步生成 Z-Image PNG |
 | `void qzi_image_release(qzi_engine *, qzi_image *)` | 释放 `data` 并把结构体清零；对已清零的结构体是幂等的 |
 
-`qzi_register_backend` 引用的 `qzi_backend` 定义在 `native/include/qzi_backend.h`，由 `qzi_reference_backend()` 导出内置参考 vtable 供包装/对照使用。
+`qzi_register_backend` 引用的 `qzi_backend` 定义在 `native/include/qzi_backend.h`，由 `qzi_reference_backend()` 导出内置参考 vtable 供包装/对照使用。默认 vtable 由 `qzi.c` 的 `ensure_backend()` **编译期**选择：定义 `QZI_HAS_REAL_BACKEND` 时取 `qzi_real_backend()`（真实 C/CUDA 引擎），否则取 `qzi_reference_vtable`。这样 real 构建不依赖 DLL 构造函数顺序，reference 构建也完全不含引擎符号。
 
 ## 状态码
 
@@ -74,14 +74,16 @@ char error[QZI_ERROR_CAPACITY] = {0};
 size_t sizes[QZI_LAYOUT_SLOTS];
 qzi_engine *engine = NULL;
 
-/* 0. 可选：换成真实引擎后端（必须在 create 之前） */
-qzi_register_backend(&my_h3_backend);
+/* 0. 可选：运行时覆盖编译期默认 backend（必须在 create 之前）。
+ *    本仓库的 CUDA 构建已默认选中真实后端，这一步通常不需要。 */
+qzi_register_backend(&my_real_backend);
 
 /* 1. 版本 + 布局自检 */
 if (qzi_abi_version() != QZI_ABI_VERSION) abort();
 if (qzi_abi_layout(sizes, QZI_LAYOUT_SLOTS) != QZI_OK) abort();
 
-/* 2. 创建 engine；目录可为 NULL（参考后端不读权重） */
+/* 2. 创建 engine；目录可为 NULL（参考后端不读权重；真实后端需要
+ *    QwenZImage.config.json 或这里传入的目录） */
 qzi_engine_config config = {0};
 config.abi_version = QZI_ABI_VERSION;
 config.qwen21_dir = "/models/qwen21";
@@ -136,6 +138,9 @@ qzi_engine_destroy(engine);
 
 只要以下任一项变化，就**必须**提升 `QZI_ABI_VERSION`：结构体字段增删/顺序变化、函数签名变化、状态码语义变化、缓冲区所有权变化、phase 字面量集合变化。新增可选能力应优先用 `flags` 位或新增独立导出函数表达，并保持旧结构体布局不变。`QwenZImage.NET` 的 `AbiGuard` 会同时校验版本号和 6 个结构体尺寸，因此不兼容的 native 库会在构造 `QziClient` 时立刻报错。
 
-## 内置参考后端
+## 两个内置 backend
 
-`native/src/qzi_stub.c` 实现的 `qzi-reference` 后端：无需 GPU/权重/网络，按 prompt、seed、尺寸、模型标签生成确定性 RGB 图，再由 `native/src/qzi_png.c` 编码为 PNG（stored DEFLATE 块，无 zlib 依赖）。它跑完整的 5 个阶段并上报 8 个 `dit` 步，`qzi_health.reference_backend == 1`。用途：CI、托管单测、C smoke test、以及给真实引擎做 ABI 对照。**它不是图像模型，输出不是真实生成结果。**
+- **参考后端**：`native/src/qzi_stub.c` 实现的 `qzi-reference`，无需 GPU/权重/网络，按 prompt、seed、尺寸、模型标签生成确定性 RGB 噪点图，再由 `native/src/qzi_png.c` 编码为 PNG（stored DEFLATE 块，无 zlib 依赖）。它跑完整的 5 个阶段并上报 `dit` 步，`qzi_health.reference_backend == 1`。用途：CI、托管单测、C smoke test、ABI 对照。**它不是图像模型，输出不是真实生成结果。**
+- **真实后端**：`native/src/qzi_engine_backend.c` + `engine/` 的 C/CUDA 引擎，仅在 `-DQZI_WITH_CUDA_ENGINE=ON` 时链入。做文本编码、DiT 去噪与 VAE 解码，PNG 直接在内存里编码，`qzi_health.reference_backend == 0`。需要 CUDA Toolkit、匹配的 SM 架构以及自备的模型权重。
+
+`native/tests/qzi_abi_smoke.c` 会根据 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release），真实构建只验证 ABI 布局与参数校验，避免 CI 加载多 GB 权重。详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。

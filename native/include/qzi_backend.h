@@ -2,9 +2,9 @@
  * qzi_backend.h -- pluggable generation backend for the reference ABI.
  *
  * The C ABI in qzi.h is the managed/native contract. This header is the
- * native/native contract: an engine such as h3-spark.c implements one
- * qzi_backend vtable and calls qzi_register_backend(&vtable) (or exports the
- * qzi_* functions itself) and the whole managed stack works unchanged.
+ * native/native contract: a backend implements one qzi_backend vtable and
+ * either calls qzi_register_backend(&vtable) or is selected at compile time
+ * (see QZI_HAS_REAL_BACKEND in qzi.c). The whole managed stack works unchanged.
  *
  * The vtable is copied by qzi_register_backend, so it may live on the stack.
  * All callbacks run on the calling thread except where noted. Every function
@@ -22,14 +22,14 @@ extern "C" {
 
 typedef struct qzi_backend {
     uint32_t     abi_version;      /* QZI_ABI_VERSION */
-    const char  *name;             /* static literal, e.g. "h3-spark.c" */
+    const char  *name;             /* static literal, e.g. "QwenZImageNative" */
 
     /* Called once by qzi_engine_create. The backend allocates its own
      * per-engine state and writes it to *out_context; qzi.c owns the pointer
      * and passes it to every other callback, then to shutdown(). Resolve model
      * directories and validate the device here, but do NOT mmap multi-GB
      * weights yet -- do that lazily in generate_* so a bad path fails on the
-     * first real request, like h3 serve. */
+     * first real request, like the resident inference backend. */
     qzi_status (*init)(void **out_context, const qzi_engine_config *config,
                        char *error, size_t error_cap);
     void       (*shutdown)(void *context);

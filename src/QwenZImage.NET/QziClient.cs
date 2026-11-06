@@ -28,12 +28,27 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     /// <summary>ABI version reported by the loaded native library.</summary>
     public uint AbiVersion => NativeMethods.AbiVersion();
 
-    /// <summary>Creates a native engine instance.</summary>
-    /// <exception cref="DllNotFoundException">No qzi native library could be resolved.</exception>
+    /// <summary>
+    /// Creates a native engine instance. With no options,
+    /// <c>QwenZImage.config.json</c> is loaded automatically and its model
+    /// directories are passed straight into the native backend; an explicit
+    /// <see cref="QziClientOptions"/> wins over the file.
+    /// </summary>
+    /// <exception cref="DllNotFoundException">No QwenZImageNative library could be resolved.</exception>
     /// <exception cref="QziException">The native library rejected the configuration.</exception>
+    /// <exception cref="InvalidDataException">An invalid config file was found.</exception>
     public QziClient(QziClientOptions? options = null)
     {
-        options ??= new QziClientOptions();
+        options ??= QziClientOptions.FromConfig();
+
+        // The ABI carries the three core directories. QZI_CONFIG tells the
+        // native backend which file to read for the fields the ABI does not
+        // carry (Nunchaku packs, LoRA directory, platform overrides), so both
+        // sides always agree on the same configuration.
+        if (!string.IsNullOrWhiteSpace(options.ConfigPath))
+            Environment.SetEnvironmentVariable(QziConfig.EnvironmentVariable,
+                                               options.ConfigPath);
+
         NativeLibraryLoader.Configure(options.NativeLibraryPath);
         AbiGuard.Verify();
 

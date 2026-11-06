@@ -3,6 +3,11 @@ name: Release to NuGet
 # Publishing is intentionally opt-in: it only runs on an explicit v* tag
 # (or a manual dispatch). The repository owner must configure the
 # NUGET_API_KEY secret before the first release. See PLAN.md section 5.
+#
+# The shipped natives are the GPU-free REFERENCE backend (deterministic noise):
+# a real CUDA build is tied to a specific SM architecture and to model weights
+# the user supplies. Users who want real inference build QwenZImageNative with
+# -DQZI_WITH_CUDA_ENGINE=ON and point QZI_NATIVE_LIBRARY at that artefact.
 on:
   push:
     tags: ['v*']
@@ -82,7 +87,7 @@ jobs:
           name: native-linux-x64
           path: artifacts/runtimes/linux-x64/native
 
-      - name: Build and test (reference backend, no GPU required)
+      - name: Build and test (shipped reference backend, no GPU required)
         run: |
           dotnet build QwenZImage.NET.sln -c Release --nologo
           dotnet test QwenZImage.NET.sln -c Release --no-build --nologo
@@ -115,11 +120,11 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $package = Get-Item "artifacts/packages/QwenZImage.NET.${{ steps.version.outputs.value }}.nupkg"
           $required = @(
-            'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+            'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'engine/LICENSE',
             'docs/NATIVE_ABI.md',
             'lib/net10.0/QwenZImage.NET.dll',
-            'runtimes/win-x64/native/qzi.dll',
-            'runtimes/linux-x64/native/libqzi.so'
+            'runtimes/win-x64/native/QwenZImageNative.dll',
+            'runtimes/linux-x64/native/libQwenZImageNative.so'
           )
           $zip = [System.IO.Compression.ZipFile]::OpenRead($package.FullName)
           try {

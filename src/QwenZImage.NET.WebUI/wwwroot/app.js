@@ -50,7 +50,7 @@ async function refreshHealth() {
       pill.textContent = `● ${backend} · ${h.engine?.resident_model || "no model"}`;
       pill.title = [
         `transport: ${h.transport}`,
-        `engine_url: ${h.engine_url || "(in-process native)"}`,
+        `config: ${h.config_path || "(defaults)"}`,
         `out_dir: ${h.out_dir}`,
         `model_dir: ${h.model_dir}`,
         `served: ${h.engine?.served ?? 0}`,

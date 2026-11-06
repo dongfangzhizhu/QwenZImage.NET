@@ -4,10 +4,11 @@ using System.Runtime.InteropServices;
 namespace QwenZImage.NET.Native;
 
 /// <summary>
-/// Resolves the <c>qzi</c> shared library. The NuGet package bundles a
-/// deterministic reference build for win-x64 and linux-x64, but no CUDA engine
-/// or multi-gigabyte weights: <c>QZI_NATIVE_LIBRARY</c> lets callers point at
-/// any other build implementing the same ABI. Resolution order:
+/// Resolves <c>QwenZImageNative.dll</c> / <c>libQwenZImageNative.so</c>, the
+/// native backend implementing the qzi C ABI. The NuGet package bundles the
+/// reference build for win-x64 and linux-x64; a CUDA build of the same ABI is
+/// selected by <c>QZI_NATIVE_LIBRARY</c> or by replacing the bundled file.
+/// Resolution order:
 /// <list type="number">
 ///   <item><c>QziClientOptions.NativeLibraryPath</c> / <c>QZI_NATIVE_LIBRARY</c></item>
 ///   <item>next to the managed assembly, including <c>runtimes/&lt;rid&gt;/native/</c></item>
@@ -62,9 +63,9 @@ internal static class NativeLibraryLoader
         if (!string.IsNullOrWhiteSpace(_explicitPath))
             yield return _explicitPath!;
 
-        string name = OperatingSystem.IsWindows() ? "qzi.dll"
-                    : OperatingSystem.IsMacOS() ? "libqzi.dylib"
-                    : "libqzi.so";
+        string name = OperatingSystem.IsWindows() ? "QwenZImageNative.dll"
+                    : OperatingSystem.IsMacOS() ? "libQwenZImageNative.dylib"
+                    : "libQwenZImageNative.so";
         string rid = RuntimeInformation.RuntimeIdentifier;
         string baseDir = AppContext.BaseDirectory;
 

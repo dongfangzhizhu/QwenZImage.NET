@@ -288,10 +288,23 @@ qzi_status qzi_validate_zimage(const qzi_zimage_request *request,
 
 /* ---- backend registration ---------------------------------------------- */
 
+#ifdef QZI_HAS_REAL_BACKEND
+/* Implemented by src/qzi_engine_backend.c, linked into this same shared
+ * library only when -DQZI_WITH_CUDA_ENGINE=ON. Compile-time selection avoids
+ * constructor-order hazards on Windows and keeps the reference build free of
+ * any engine symbols. qzi_register_backend(NULL) still restores the
+ * compiled-in default backend for in-process comparison. */
+extern const qzi_backend *qzi_real_backend(void);
+#endif
+
 static void ensure_backend(void)
 {
     if (g_backend_selected) return;
+#ifdef QZI_HAS_REAL_BACKEND
+    g_backend = *qzi_real_backend();
+#else
     g_backend = qzi_reference_vtable;
+#endif
     g_backend_selected = 1;
 }
 

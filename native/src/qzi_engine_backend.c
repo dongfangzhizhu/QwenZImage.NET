@@ -1,0 +1,971 @@
+/*
+ * qzi_engine_backend.c -- real Qwen-Image 2.1 / Z-Image backend.
+ *
+ * Compiled into QwenZImageNative.dll / libQwenZImageNative.so only when
+ * -DQZI_WITH_CUDA_ENGINE=ON. It implements the qzi_backend vtable by calling
+ * the vendored C/CUDA engine in engine/ directly -- in-process, no HTTP, no
+ * Go, no JSON hop. qzi.c still owns validation, single-flight serialisation,
+ * progress plumbing and buffer ownership.
+ *
+ * Orchestration is a direct port of the upstream resident service's
+ * serve_execute_qwen21() / serve_execute_zimage() paths, minus the HTTP
+ * server state: the DiT stays resident across calls, the text tower is
+ * attached lazily, and PNG bytes are produced in memory rather than written
+ * to a temp file and read back.
+ */
+
+#include "qzi.h"
+#include "qzi_backend.h"
+#include "qzi_internal.h"
+#include "qzi_png.h"
+
+#include "qzen_config.h"
+#include "qzen_tokenizer.h"
+#include "qzen_qwen21_dit.h"
+#include "qzen_qwen21_text.h"
+#include "qzen_qwen21_vae.h"
+#include "qzen_qwen21_pipeline.h"
+#include "qzen_zimage_pipeline.h"
+#include "qzen_zimage_vae.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+/* On Windows the vendored engine's win32 shim supplies <dirent.h> (it is
+ * force-included via /FI by qzen_apply_platform_flags and lives in the shim's
+ * include directory). Keep the include unconditional: resolve_zimage_pack()
+ * enumerates SVDQ packs on every platform. */
+#include <dirent.h>
+
+#define QZEN_PATH_CAP 1024
+#define QZEN_ERR_CAP  512
+
+/* ------------------------------------------------------------------ state */
+
+typedef struct qzen_state {
+    /* Paths resolved from QwenZImage.config.json / the qzi_engine_config. */
+    char qwen21_dir[QZEN_PATH_CAP];
+    char qwen21_lora_dir[QZEN_PATH_CAP];
+    char zimage_dir[QZEN_PATH_CAP];
+    char zimage_nunchaku_dir[QZEN_PATH_CAP];
+    char text_cache_dir[QZEN_PATH_CAP];
+    int  device_id;
+
+    /* Qwen-Image 2.1 pack. */
+    char q_turbo[QZEN_PATH_CAP];
+    char q_base[QZEN_PATH_CAP];
+    char q_vae[QZEN_PATH_CAP];
+    char q_text[QZEN_PATH_CAP];
+    char q_tokenizer[QZEN_PATH_CAP];
+    int  q_paths_resolved;
+    qzen_tokenizer     *tokenizer;
+    qzen_qwen21_text   *text;
+    qzen_qwen21_model  *dit;
+    qzen_qwen21_vae    *vae;
+    int   tier_resident;        /* -1 none, 0 base, 1 turbo */
+    char  lora_resident[128];
+    float lora_scale_resident;
+    float *uncond;
+    int    uncond_tokens;
+
+    /* Z-Image pack. */
+    char z_dit[QZEN_PATH_CAP];
+    char z_vae[QZEN_PATH_CAP];
+    char z_text[QZEN_PATH_CAP];
+    char z_pack_file[QZEN_PATH_CAP];
+    char z_pack_id[64];
+    int  z_pack;                /* 0 none, -1 bf16, 1 nunchaku resident */
+    qzen_zimage_pipeline *zpipe;
+    int  z_text_resident;
+
+    qzi_model_kind resident;
+    uint64_t served;
+    double   started;
+} qzen_state;
+
+/* --------------------------------------------------------------- utilities */
+
+static void copy_path(char *out, size_t cap, const char *value)
+{
+    if (!value || !*value) { out[0] = '\0'; return; }
+    snprintf(out, cap, "%s", value);
+}
+
+static int join_path(char *out, size_t cap, const char *dir, const char *name)
+{
+    int n = snprintf(out, cap, "%s/%s", dir, name);
+    return n > 0 && (size_t)n < cap;
+}
+
+static int is_regular(const char *path)
+{
+    struct stat info;
+    return stat(path, &info) == 0 && S_ISREG(info.st_mode);
+}
+
+static int is_directory(const char *path)
+{
+    struct stat info;
+    return stat(path, &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+/* A pack may be laid out as <pack>/<component>/ or as flat files directly in
+ * <pack>. Prefer the subdirectory, fall back to the pack itself -- the same
+ * rule the upstream service uses. */
+static int component_dir(const char *pack, const char *name,
+                         char *out, size_t cap)
+{
+    char sub[QZEN_PATH_CAP];
+    if (!join_path(sub, sizeof(sub), pack, name)) return 0;
+    if (is_directory(sub)) return join_path(out, cap, pack, name);
+    return copy_path(out, cap, pack), 1;
+}
+
+static int first_file(const char *dir, const char *const *names, size_t count,
+                      char *out, size_t cap)
+{
+    for (size_t i = 0; i < count; i++) {
+        char path[QZEN_PATH_CAP];
+        if (!join_path(path, sizeof(path), dir, names[i])) continue;
+        if (is_regular(path)) return copy_path(out, cap, path), 1;
+    }
+    return 0;
+}
+
+/* The engine's GPU paths are opt-in through environment switches. An explicit
+ * 0 in the environment is respected so small cards can stay on the CPU. */
+static void enable_env(const char *name, const char *value)
+{
+    const char *current = getenv(name);
+    if (current && *current) return;
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+static void enable_gpu_switches(void)
+{
+    static const char *const names[] = {
+        "QWEN21_GPU", "QWEN21_VAE_GPU", "QWEN21_TEXT_GPU",
+        "ZIMAGE_GPU", "ZIMAGE_VAE_GPU"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        enable_env(names[i], "1");
+}
+
+/* splitmix64 + Box-Muller, byte-for-byte the upstream sampler's noise so a
+ * given seed reproduces the service's image. */
+static void fill_noise(uint64_t seed, float *out, size_t count)
+{
+    uint64_t state = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    for (size_t i = 0; i < count; i++) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        double u1 = (double)((state >> 11) + 1) / 9007199254740993.0;
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        double u2 = (double)(state >> 11) / 9007199254740992.0;
+        double radius = sqrt(-2.0 * log(u1));
+        out[i] = (float)(radius * cos(6.283185307179586 * u2));
+    }
+}
+
+/* Planar RGB8 [3][H][W] -> interleaved [H][W][3] for the PNG encoder. */
+static void pack_planar_rgb8(const uint8_t *planar, uint32_t width,
+                             uint32_t height, uint8_t *packed)
+{
+    size_t pixels = (size_t)width * height;
+    for (size_t i = 0; i < pixels; i++) {
+        packed[i * 3 + 0] = planar[i];
+        packed[i * 3 + 1] = planar[pixels + i];
+        packed[i * 3 + 2] = planar[2 * pixels + i];
+    }
+}
+
+/* Planar F32 [-1,1] [3][H][W] -> interleaved RGB8, matching
+ * qzen_png_write_pixels_f32's clamp/round exactly. */
+static void pack_pixels_f32(const float *pixels, uint32_t width,
+                            uint32_t height, uint8_t *rgb)
+{
+    size_t plane = (size_t)width * height;
+    const size_t offset[3] = {0, plane, 2 * plane};
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            uint8_t *out = rgb + ((size_t)y * width + x) * 3;
+            for (uint32_t c = 0; c < 3; c++) {
+                float value = pixels[offset[c] + (size_t)y * width + x];
+                value = value * 0.5f + 0.5f;
+                if (value < 0.0f) value = 0.0f;
+                if (value > 1.0f) value = 1.0f;
+                out[c] = (uint8_t)(value * 255.0f + 0.5f);
+            }
+        }
+    }
+}
+
+static qzi_status emit_png(const uint8_t *rgb, uint32_t width, uint32_t height,
+                           qzi_image *out, char *error, size_t error_cap)
+{
+    size_t size = 0;
+    uint8_t *png = qzi_png_encode_rgb8(rgb, width, height, &size,
+                                       error, error_cap);
+    if (!png) return QZI_ERR_ENGINE;
+    out->data = png;
+    out->size = size;
+    out->width = width;
+    out->height = height;
+    out->token = (uint64_t)(uintptr_t)png;
+    return QZI_OK;
+}
+
+/* --------------------------------------------------------------- progress */
+
+typedef struct progress_bridge {
+    const qzi_callbacks *callbacks;
+    double start;
+    int cancelled;
+} progress_bridge;
+
+static void bridge_emit(progress_bridge *bridge, const char *phase,
+                        int32_t completed, int32_t total)
+{
+    qzi_emit_progress(bridge->callbacks, phase, completed, total, bridge->start);
+    if (qzi_cancelled(bridge->callbacks)) bridge->cancelled = 1;
+}
+
+static void qwen21_progress(const char *phase, int completed, int total,
+                            void *opaque)
+{
+    progress_bridge *bridge = (progress_bridge *)opaque;
+    if (!bridge) return;
+    bridge_emit(bridge, phase, (int32_t)completed, (int32_t)total);
+}
+
+/* qzen_zpipe_denoise's progress callback has no opaque pointer. The qzi ABI
+ * serialises generation (single-flight), so exactly one denoise can be in
+ * flight per process and a single static bridge is sufficient. */
+static progress_bridge *g_zimage_bridge;
+
+static void zimage_progress(uint32_t step, uint32_t steps)
+{
+    progress_bridge *bridge = g_zimage_bridge;
+    if (!bridge) return;
+    bridge_emit(bridge, "dit", (int32_t)step, (int32_t)steps);
+}
+
+/* ------------------------------------------------------- model residency */
+
+static void release_zimage(qzen_state *s)
+{
+    if (s->zpipe) {
+        if (s->z_text_resident) qzen_zpipe_release_text(s->zpipe);
+        qzen_zpipe_free(s->zpipe);
+        s->zpipe = NULL;
+    }
+    s->z_text_resident = 0;
+    s->z_pack = 0;
+    s->z_pack_id[0] = '\0';
+}
+
+static void release_qwen21(qzen_state *s)
+{
+    if (s->text) { qzen_qwen21_text_close(s->text); s->text = NULL; }
+    if (s->tokenizer) { qzen_tokenizer_free(s->tokenizer); s->tokenizer = NULL; }
+    if (s->dit) { qzen_qwen21_close(s->dit); s->dit = NULL; }
+    if (s->vae) { qzen_qwen21_vae_close(s->vae); s->vae = NULL; }
+    free(s->uncond);
+    s->uncond = NULL;
+    s->uncond_tokens = 0;
+    s->tier_resident = -1;
+    s->lora_resident[0] = '\0';
+    s->lora_scale_resident = 0.0f;
+}
+
+static qzi_status resolve_qwen21_pack(qzen_state *s, char *error, size_t cap)
+{
+    if (s->q_paths_resolved) return QZI_OK;
+    if (!*s->qwen21_dir) {
+        qzi_set_error(error, cap,
+            "qwen21_dir is not configured (see QwenZImage.config.json)");
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    char dit_dir[QZEN_PATH_CAP], vae_dir[QZEN_PATH_CAP], text_dir[QZEN_PATH_CAP];
+    if (!component_dir(s->qwen21_dir, "dit", dit_dir, sizeof(dit_dir)) ||
+        !component_dir(s->qwen21_dir, "vae", vae_dir, sizeof(vae_dir)) ||
+        !component_dir(s->qwen21_dir, "text_encoder", text_dir,
+                       sizeof(text_dir))) {
+        qzi_set_error(error, cap, "the qwen21 pack path is too long");
+        return QZI_ERR_ENGINE;
+    }
+    static const char *const turbo_names[] = {
+        "qwen_image_21_turbo_7B_int8_convrot.safetensors",
+        "dit_turbo.safetensors", "turbo.safetensors",
+        "dit_turbo_int8.safetensors"};
+    static const char *const base_names[] = {
+        "qwen_image_21_7B_int8_convrot.safetensors", "dit_base.safetensors",
+        "base.safetensors", "dit_base_int8.safetensors"};
+    static const char *const vae_names[] = {"qwen_image_21_vae.safetensors",
+                                            "vae.safetensors"};
+    static const char *const text_names[] = {
+        "Qwen3-VL-8B-Instruct_int8_convrot.safetensors",
+        "text_encoder.safetensors", "text_encoder_int8.safetensors"};
+    static const char *const tokenizer_names[] = {"tokenizer.json",
+                                                  "tokenizer_legacy.json"};
+
+    first_file(dit_dir, turbo_names, 4, s->q_turbo, sizeof(s->q_turbo));
+    first_file(dit_dir, base_names, 4, s->q_base, sizeof(s->q_base));
+    if (!*s->q_turbo && !*s->q_base) {
+        qzi_set_error_fmt(error, cap,
+            "qwen21 pack has no DiT checkpoint in %s", dit_dir);
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    if (!first_file(vae_dir, vae_names, 2, s->q_vae, sizeof(s->q_vae))) {
+        qzi_set_error_fmt(error, cap, "qwen21 pack is missing %s/%s",
+                          vae_dir, vae_names[0]);
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    if (!first_file(text_dir, text_names, 3, s->q_text, sizeof(s->q_text))) {
+        qzi_set_error_fmt(error, cap, "qwen21 pack is missing %s/%s",
+                          text_dir, text_names[0]);
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    if (!first_file(text_dir, tokenizer_names, 2, s->q_tokenizer,
+                    sizeof(s->q_tokenizer))) {
+        qzi_set_error_fmt(error, cap, "qwen21 pack is missing %s/%s",
+                          text_dir, tokenizer_names[0]);
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    s->q_paths_resolved = 1;
+    return QZI_OK;
+}
+
+/* The ABI already guarantees `lora` is a bare file name. Keep the check here
+ * too: the backend is the last line of defence before joining a user-supplied
+ * name onto a directory. */
+static int adapter_name_is_bare(const char *name)
+{
+    if (!name || !*name) return 0;
+    if (strchr(name, '/') || strchr(name, '\\') || strchr(name, ':')) return 0;
+    return strncmp(name, "..", 2) != 0;
+}
+
+static qzi_status ensure_qwen21_dit(qzen_state *s, int turbo,
+                                    const char *lora, float lora_scale,
+                                    progress_bridge *bridge,
+                                    char *error, size_t cap)
+{
+    const char *tier_path = turbo ? s->q_turbo : s->q_base;
+    if (!*tier_path) {
+        qzi_set_error_fmt(error, cap,
+            "the qwen21 pack has no %s checkpoint", turbo ? "turbo" : "base");
+        return QZI_ERR_UNSUPPORTED;
+    }
+    const char *wanted = lora && *lora ? lora : "";
+    int resident = s->lora_resident[0] != '\0';
+    int same_adapter = (*wanted == '\0' && !resident) ||
+                       (*wanted && resident &&
+                        !strcmp(wanted, s->lora_resident) &&
+                        lora_scale == s->lora_scale_resident);
+    int need_reload = !s->dit || s->tier_resident != turbo ||
+                      (resident && !same_adapter) ||
+                      (!resident && *wanted);
+
+    if (need_reload) {
+        if (s->dit) { qzen_qwen21_close(s->dit); s->dit = NULL; }
+        bridge_emit(bridge, "model load", 0, 1);
+        char load_error[QZEN_ERR_CAP] = "";
+        s->dit = qzen_qwen21_open(tier_path, 0, load_error,
+                                  sizeof(load_error));
+        if (!s->dit) {
+            qzi_set_error_fmt(error, cap, "qwen21 DiT: %s", load_error);
+            return QZI_ERR_ENGINE;
+        }
+        s->tier_resident = turbo;
+        s->lora_resident[0] = '\0';
+        s->lora_scale_resident = 0.0f;
+        free(s->uncond);
+        s->uncond = NULL;
+        s->uncond_tokens = 0;
+    }
+    if (*wanted && !same_adapter) {
+        if (!adapter_name_is_bare(wanted)) {
+            qzi_set_error_fmt(error, cap, "invalid adapter name \"%s\"",
+                              wanted);
+            return QZI_ERR_INVALID_ARGUMENT;
+        }
+        if (!*s->qwen21_lora_dir) {
+            qzi_set_error(error, cap,
+                "qwen21_lora_dir is not configured (see QwenZImage.config.json)");
+            return QZI_ERR_NOT_CONFIGURED;
+        }
+        char lora_path[QZEN_PATH_CAP];
+        if (!join_path(lora_path, sizeof(lora_path), s->qwen21_lora_dir,
+                       wanted)) {
+            qzi_set_error(error, cap, "the LoRA path is too long");
+            return QZI_ERR_ENGINE;
+        }
+        char load_error[QZEN_ERR_CAP] = "";
+        if (!qzen_qwen21_apply_lora(s->dit, lora_path, lora_scale,
+                                    load_error, sizeof(load_error))) {
+            qzi_set_error_fmt(error, cap, "qwen21 LoRA: %s", load_error);
+            return QZI_ERR_ENGINE;
+        }
+        snprintf(s->lora_resident, sizeof(s->lora_resident), "%s", wanted);
+        s->lora_scale_resident = lora_scale;
+    }
+    if (!s->vae) {
+        char load_error[QZEN_ERR_CAP] = "";
+        s->vae = qzen_qwen21_vae_open(s->q_vae, 0, load_error,
+                                      sizeof(load_error));
+        if (!s->vae) {
+            qzi_set_error_fmt(error, cap, "qwen21 VAE: %s", load_error);
+            return QZI_ERR_ENGINE;
+        }
+    }
+    if (!s->tokenizer) {
+        char load_error[QZEN_ERR_CAP] = "";
+        s->tokenizer = qzen_tokenizer_load(s->q_tokenizer, load_error,
+                                           sizeof(load_error));
+        if (!s->tokenizer) {
+            qzi_set_error_fmt(error, cap, "qwen21 tokenizer: %s", load_error);
+            return QZI_ERR_ENGINE;
+        }
+    }
+    s->resident = QZI_MODEL_QWEN21;
+    return QZI_OK;
+}
+
+static int encode_text(qzen_state *s, const char *prompt,
+                       float **rows, int *count, char *error, size_t cap)
+{
+    uint32_t *ids = NULL;
+    size_t tokens = 0;
+    if (!qzen_qwen21_text_encode(s->tokenizer, prompt, &ids, &tokens,
+                                 error, cap))
+        return 0;
+    if (!tokens || tokens > 4096) {
+        qzen_tokenizer_ids_free(ids);
+        qzi_set_error_fmt(error, cap,
+            "the prompt tokenises to %zu rows; qwen21 accepts 1..4096", tokens);
+        return 0;
+    }
+    float *hidden = (float *)malloc(tokens * QZEN_QWEN21_TEXT_DIM *
+                                    sizeof(float));
+    if (!hidden) {
+        qzen_tokenizer_ids_free(ids);
+        qzi_set_error(error, cap, "out of memory for text rows");
+        return 0;
+    }
+    if (!s->text) {
+        s->text = qzen_qwen21_text_open(s->q_text, 0, error, cap);
+        if (!s->text) {
+            qzen_tokenizer_ids_free(ids);
+            free(hidden);
+            return 0;
+        }
+    }
+    if (!qzen_qwen21_text_forward(s->text, ids, tokens, hidden, NULL,
+                                  error, cap)) {
+        qzen_tokenizer_ids_free(ids);
+        free(hidden);
+        return 0;
+    }
+    qzen_tokenizer_ids_free(ids);
+    *rows = hidden;
+    *count = (int)tokens;
+    return 1;
+}
+
+/* ------------------------------------------------- zimage pack resolution */
+
+static qzi_status resolve_zimage_pack(qzen_state *s, const char *checkpoint,
+                                      char *error, size_t cap)
+{
+    if (!*s->zimage_dir) {
+        qzi_set_error(error, cap,
+            "zimage_dir is not configured (see QwenZImage.config.json)");
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    if (!component_dir(s->zimage_dir, "dit", s->z_dit, sizeof(s->z_dit)) ||
+        !component_dir(s->zimage_dir, "vae", s->z_vae, sizeof(s->z_vae)) ||
+        !component_dir(s->zimage_dir, "text_encoder", s->z_text,
+                       sizeof(s->z_text))) {
+        qzi_set_error(error, cap, "the zimage pack path is too long");
+        return QZI_ERR_ENGINE;
+    }
+    char tokenizer_path[QZEN_PATH_CAP];
+    if (!join_path(tokenizer_path, sizeof(tokenizer_path), s->z_text,
+                   "tokenizer.json") || !is_regular(tokenizer_path)) {
+        qzi_set_error_fmt(error, cap, "zimage pack is missing %s/tokenizer.json",
+                          s->z_text);
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+
+    int bf16 = !checkpoint || !*checkpoint || !strcmp(checkpoint, "bf16");
+    s->z_pack_file[0] = '\0';
+    snprintf(s->z_pack_id, sizeof(s->z_pack_id), "%s",
+             bf16 ? "bf16" : "nunchaku");
+
+    if (bf16) return QZI_OK;
+
+    if (!*s->zimage_nunchaku_dir) {
+        qzi_set_error(error, cap, "zimage_nunchaku_dir is not configured "
+                                  "(see QwenZImage.config.json)");
+        return QZI_ERR_UNSUPPORTED;
+    }
+
+    /* Enumerate svdq-*.safetensors under zimage_nunchaku_dir. The checkpoint
+     * spelling is "nunchaku" (first int4 pack), "nunchaku-r<rank>" or
+     * "nunchaku-fp4-r<rank>"; a single .safetensors path is also accepted. */
+    char found[QZEN_PATH_CAP] = "";
+    char best_name[256] = "";
+    char rank[32] = "";
+    int want_fp4 = strncmp(checkpoint, "nunchaku-fp4-r", 14) == 0;
+    if (want_fp4) {
+        snprintf(rank, sizeof(rank), "%s", checkpoint + 13);
+    } else if (strncmp(checkpoint, "nunchaku-r", 10) == 0) {
+        snprintf(rank, sizeof(rank), "%s", checkpoint + 10);
+    }
+    char pattern[64];
+    if (*rank)
+        snprintf(pattern, sizeof(pattern), "_r%s-", rank);
+    else
+        snprintf(pattern, sizeof(pattern), "%s", "svdq-int4");
+
+    if (is_regular(s->zimage_nunchaku_dir) &&
+        strstr(s->zimage_nunchaku_dir, ".safetensors")) {
+        snprintf(found, sizeof(found), "%s", s->zimage_nunchaku_dir);
+    } else if (is_directory(s->zimage_nunchaku_dir)) {
+        DIR *stream = opendir(s->zimage_nunchaku_dir);
+        if (!stream) {
+            qzi_set_error_fmt(error, cap, "cannot list %s",
+                              s->zimage_nunchaku_dir);
+            return QZI_ERR_ENGINE;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(stream)) != NULL) {
+            const char *name = entry->d_name;
+            size_t length = strlen(name);
+            if (strncmp(name, "svdq-", 5) != 0) continue;
+            if (length < 14 || strcmp(name + length - 12, ".safetensors") != 0)
+                continue;
+            if (want_fp4 && strncmp(name, "svdq-fp4", 8) != 0) continue;
+            if (!want_fp4 && *rank && !strstr(name, pattern)) continue;
+            if (!want_fp4 && !*rank && strncmp(name, "svdq-int4", 9) != 0)
+                continue;
+            /* Deterministic choice: lexicographically first matching pack. */
+            if (!*best_name || strcmp(name, best_name) < 0)
+                snprintf(best_name, sizeof(best_name), "%s", name);
+        }
+        closedir(stream);
+        if (*best_name)
+            snprintf(found, sizeof(found), "%s/%s",
+                     s->zimage_nunchaku_dir, best_name);
+    }
+    if (!*found) {
+        qzi_set_error_fmt(error, cap,
+            "checkpoint \"%s\" is not available under %s",
+            checkpoint, s->zimage_nunchaku_dir);
+        return QZI_ERR_UNSUPPORTED;
+    }
+    copy_path(s->z_pack_file, sizeof(s->z_pack_file), found);
+    snprintf(s->z_pack_id, sizeof(s->z_pack_id), "%s", checkpoint);
+    return QZI_OK;
+}
+
+/* ------------------------------------------------------------ vtable: init */
+
+static qzi_status qzen_init(void **out_context,
+                            const qzi_engine_config *config,
+                            char *error, size_t error_cap)
+{
+    if (!out_context || !config) return QZI_ERR_INVALID_ARGUMENT;
+    *out_context = NULL;
+
+    qzen_config file;
+    char config_error[QZEN_ERR_CAP] = "";
+    int rc = qzen_config_load(NULL, &file, config_error, sizeof(config_error));
+    if (rc < 0) {
+        qzi_set_error_fmt(error, error_cap, "config: %s", config_error);
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+
+    qzen_state *s = (qzen_state *)calloc(1, sizeof(*s));
+    if (!s) {
+        qzi_set_error(error, error_cap, "out of memory creating backend state");
+        return QZI_ERR_OUT_OF_MEMORY;
+    }
+    const char *qwen = config->qwen21_dir && *config->qwen21_dir
+                           ? config->qwen21_dir
+                           : qzen_config_field(&file, "qwen21_dir");
+    const char *zimg = config->zimage_dir && *config->zimage_dir
+                           ? config->zimage_dir
+                           : qzen_config_field(&file, "zimage_dir");
+    const char *cache = config->cache_dir && *config->cache_dir
+                            ? config->cache_dir
+                            : qzen_config_field(&file, "text_cache_dir");
+    copy_path(s->qwen21_dir, sizeof(s->qwen21_dir), qwen);
+    copy_path(s->zimage_dir, sizeof(s->zimage_dir), zimg);
+    copy_path(s->text_cache_dir, sizeof(s->text_cache_dir), cache);
+    copy_path(s->qwen21_lora_dir, sizeof(s->qwen21_lora_dir),
+              qzen_config_field(&file, "qwen21_lora_dir"));
+    copy_path(s->zimage_nunchaku_dir, sizeof(s->zimage_nunchaku_dir),
+              qzen_config_field(&file, "zimage_nunchaku_dir"));
+    s->device_id = config->device_id;
+    s->tier_resident = -1;
+    s->started = qzi_now_seconds();
+
+    /* Respect an explicit device choice through the CUDA runtime's own
+     * visibility variable, and enable the GPU kernels before any load. */
+    if (s->device_id >= 0) {
+        char device[32];
+        snprintf(device, sizeof(device), "%d", s->device_id);
+        if (!getenv("CUDA_VISIBLE_DEVICES")) enable_env("CUDA_VISIBLE_DEVICES",
+                                                        device);
+    }
+    enable_gpu_switches();
+
+    *out_context = s;
+    return QZI_OK;
+}
+
+static void qzen_shutdown(void *context)
+{
+    qzen_state *s = (qzen_state *)context;
+    if (!s) return;
+    release_zimage(s);
+    release_qwen21(s);
+    free(s);
+}
+
+/* ---------------------------------------------------------- vtable: qwen21 */
+
+static qzi_status qzen_generate_qwen21(void *context,
+                                       const qzi_qwen21_request *request,
+                                       const qzi_callbacks *callbacks,
+                                       qzi_image *out_image,
+                                       char *error, size_t error_cap)
+{
+    qzen_state *s = (qzen_state *)context;
+    progress_bridge bridge = {callbacks, qzi_now_seconds(), 0};
+    char local[QZEN_ERR_CAP] = "";
+    const int turbo = !request->tier || !strcmp(request->tier, "turbo");
+    float *text = NULL, *negative = NULL;
+    int text_tokens = 0, negative_tokens = 0, negative_owned = 0;
+    float *latent = NULL;
+    uint8_t *rgb = NULL, *packed = NULL;
+    qzi_status status = QZI_ERR_ENGINE;
+
+    status = resolve_qwen21_pack(s, error, error_cap);
+    if (status != QZI_OK) return status;
+    if (s->resident == QZI_MODEL_ZIMAGE) release_zimage(s);
+    status = ensure_qwen21_dit(s, turbo, request->lora,
+                               request->lora_scale, &bridge,
+                               error, error_cap);
+    if (status != QZI_OK) return status;
+
+    bridge_emit(&bridge, "text", 0, 1);
+    if (!encode_text(s, request->prompt, &text, &text_tokens,
+                     local, sizeof(local))) {
+        qzi_set_error_fmt(error, error_cap, "text encode: %s", local);
+        status = QZI_ERR_ENGINE;
+        goto done;
+    }
+    if (!turbo) {
+        if (request->negative_prompt && *request->negative_prompt) {
+            if (!encode_text(s, request->negative_prompt, &negative,
+                             &negative_tokens, local, sizeof(local))) {
+                qzi_set_error_fmt(error, error_cap,
+                                  "negative prompt: %s", local);
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            negative_owned = 1;
+        } else if (s->uncond && s->uncond_tokens > 0) {
+            negative = s->uncond;
+            negative_tokens = s->uncond_tokens;
+        } else {
+            if (!encode_text(s, " ", &negative, &negative_tokens,
+                             local, sizeof(local))) {
+                qzi_set_error_fmt(error, error_cap,
+                                  "negative prompt: %s", local);
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            s->uncond = negative;
+            s->uncond_tokens = negative_tokens;
+            negative_owned = 0;
+        }
+    }
+    if (bridge.cancelled || qzi_cancelled(callbacks)) {
+        qzi_set_error(error, error_cap, "cancelled during text encoding");
+        status = QZI_ERR_CANCELLED;
+        goto done;
+    }
+
+    const int height = request->height / 16;
+    const int width = request->width / 16;
+    const size_t plane = (size_t)height * width;
+    latent = (float *)malloc(QZEN_QWEN21_VAE_CHANNELS * plane *
+                             sizeof(float));
+    rgb = (uint8_t *)malloc(plane * 256 * 3);
+    if (!latent || !rgb) {
+        qzi_set_error(error, error_cap, "out of memory for the latent/RGB buffers");
+        status = QZI_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    fill_noise(request->seed, latent, QZEN_QWEN21_VAE_CHANNELS * plane);
+
+    float sigmas[80];
+    int sigma_count = turbo
+        ? qzen_qwen21_sigmas_turbo(sigmas)
+        : qzen_qwen21_sigmas_base(request->steps, (int)plane, sigmas);
+    if (!sigma_count || sigma_count != request->steps + 1) {
+        qzi_set_error_fmt(error, error_cap,
+            "the qwen21 sigma schedule has %d entries for %d steps",
+            sigma_count, request->steps);
+        status = QZI_ERR_ENGINE;
+        goto done;
+    }
+
+    qzen_qwen21_sample sample = {
+        text, text_tokens, negative, negative_tokens, latent,
+        height, width, sigmas, request->steps, request->guidance,
+        NULL, 1.0f
+    };
+    local[0] = '\0';
+    if (!qzen_qwen21_pipeline_run_ex(s->dit, s->vae, &sample, rgb,
+                                     qwen21_progress, &bridge,
+                                     local, sizeof(local))) {
+        qzi_set_error_fmt(error, error_cap, "sample: %s", local);
+        status = QZI_ERR_ENGINE;
+        goto done;
+    }
+    if (bridge.cancelled || qzi_cancelled(callbacks)) {
+        qzi_set_error(error, error_cap, "cancelled during denoising");
+        status = QZI_ERR_CANCELLED;
+        goto done;
+    }
+
+    bridge_emit(&bridge, "encode", 0, 1);
+    packed = (uint8_t *)malloc(plane * 256 * 3);
+    if (!packed) {
+        qzi_set_error(error, error_cap, "out of memory for the PNG");
+        status = QZI_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    pack_planar_rgb8(rgb, (uint32_t)request->width,
+                     (uint32_t)request->height, packed);
+    status = emit_png(packed, (uint32_t)request->width,
+                      (uint32_t)request->height, out_image, error, error_cap);
+    if (status == QZI_OK) s->served++;
+
+done:
+    free(packed);
+    free(rgb);
+    free(latent);
+    if (negative_owned) free(negative);
+    free(text);
+    return status;
+}
+
+/* ---------------------------------------------------------- vtable: zimage */
+
+static qzi_status qzen_generate_zimage(void *context,
+                                       const qzi_zimage_request *request,
+                                       const qzi_callbacks *callbacks,
+                                       qzi_image *out_image,
+                                       char *error, size_t error_cap)
+{
+    qzen_state *s = (qzen_state *)context;
+    progress_bridge bridge = {callbacks, qzi_now_seconds(), 0};
+    char local[QZEN_ERR_CAP] = "";
+    float *cap = NULL, *latents = NULL, *pixels = NULL;
+    uint8_t *rgb = NULL;
+    qzen_zvae *vae = NULL;
+    uint32_t cap_len = 0;
+    qzi_status status = QZI_ERR_ENGINE;
+
+    char previous_id[64];
+    snprintf(previous_id, sizeof(previous_id), "%s", s->z_pack_id);
+    status = resolve_zimage_pack(s, request->checkpoint, error, error_cap);
+    if (status != QZI_OK) return status;
+    if (s->resident == QZI_MODEL_QWEN21) release_qwen21(s);
+
+    char dit_path[QZEN_PATH_CAP];
+    char pack_id[64];
+    snprintf(dit_path, sizeof(dit_path), "%s",
+             *s->z_pack_file ? s->z_pack_file : s->z_dit);
+    snprintf(pack_id, sizeof(pack_id), "%s", s->z_pack_id);
+    const int want_pack = *s->z_pack_file ? 1 : -1;
+    if (!s->zpipe || s->z_pack != want_pack ||
+        strcmp(previous_id, pack_id) != 0) {
+        release_zimage(s);
+        bridge_emit(&bridge, "model load", 0, 1);
+        local[0] = '\0';
+        s->zpipe = qzen_zpipe_load(dit_path, NULL, local, sizeof(local));
+        if (!s->zpipe) {
+            qzi_set_error_fmt(error, error_cap, "zimage DiT: %s", local);
+            return QZI_ERR_ENGINE;
+        }
+        s->z_pack = want_pack;
+        snprintf(s->z_pack_id, sizeof(s->z_pack_id), "%s", pack_id);
+    }
+    s->resident = QZI_MODEL_ZIMAGE;
+
+    bridge_emit(&bridge, "text", 0, 1);
+    if (!s->z_text_resident) {
+        local[0] = '\0';
+        if (!qzen_zpipe_attach_text(s->zpipe, s->z_text, local,
+                                    sizeof(local))) {
+            qzi_set_error_fmt(error, error_cap, "text encoder: %s", local);
+            status = QZI_ERR_ENGINE;
+            goto done;
+        }
+        s->z_text_resident = 1;
+    }
+    local[0] = '\0';
+    if (!qzen_zpipe_encode_text(s->zpipe, request->prompt, &cap, &cap_len,
+                                local, sizeof(local))) {
+        qzi_set_error_fmt(error, error_cap, "text encode: %s", local);
+        status = QZI_ERR_ENGINE;
+        goto done;
+    }
+    if (bridge.cancelled || qzi_cancelled(callbacks)) {
+        qzi_set_error(error, error_cap, "cancelled during text encoding");
+        status = QZI_ERR_CANCELLED;
+        goto done;
+    }
+
+    const uint32_t width = (uint32_t)request->width;
+    const uint32_t height = (uint32_t)request->height;
+    const uint32_t lh = height / 8, lw = width / 8;
+    latents = (float *)malloc((size_t)16 * lh * lw * sizeof(float));
+    if (!latents) {
+        qzi_set_error(error, error_cap, "out of memory for latents");
+        status = QZI_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    qzen_zpipe_init_latents(request->seed, 16, lh, lw, latents);
+
+    g_zimage_bridge = &bridge;
+    local[0] = '\0';
+    int denoised = qzen_zpipe_denoise(s->zpipe, cap, cap_len, latents,
+                                      lh, lw, zimage_progress,
+                                      local, sizeof(local));
+    g_zimage_bridge = NULL;
+    if (!denoised) {
+        qzi_set_error_fmt(error, error_cap, "denoise: %s", local);
+        status = QZI_ERR_ENGINE;
+        goto done;
+    }
+    if (bridge.cancelled || qzi_cancelled(callbacks)) {
+        qzi_set_error(error, error_cap, "cancelled during denoising");
+        status = QZI_ERR_CANCELLED;
+        goto done;
+    }
+
+    bridge_emit(&bridge, "vae", 0, 1);
+    local[0] = '\0';
+    vae = qzen_zvae_load(s->z_vae, NULL, local, sizeof(local));
+    if (!vae) {
+        qzi_set_error_fmt(error, error_cap, "vae: %s", local);
+        status = QZI_ERR_ENGINE;
+        goto done;
+    }
+    pixels = (float *)malloc((size_t)3 * width * height * sizeof(float));
+    if (!pixels) {
+        qzi_set_error(error, error_cap, "out of memory for decoded pixels");
+        status = QZI_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    local[0] = '\0';
+    if (!qzen_zvae_decode(vae, latents, lh, lw, pixels, local,
+                          sizeof(local))) {
+        qzi_set_error_fmt(error, error_cap, "decode: %s", local);
+        status = QZI_ERR_ENGINE;
+        goto done;
+    }
+    qzen_zvae_free(vae);
+    vae = NULL;
+
+    bridge_emit(&bridge, "encode", 0, 1);
+    rgb = (uint8_t *)malloc((size_t)3 * width * height);
+    if (!rgb) {
+        qzi_set_error(error, error_cap, "out of memory for the PNG");
+        status = QZI_ERR_OUT_OF_MEMORY;
+        goto done;
+    }
+    pack_pixels_f32(pixels, width, height, rgb);
+    status = emit_png(rgb, width, height, out_image, error, error_cap);
+    if (status == QZI_OK) { s->served++; s->resident = QZI_MODEL_ZIMAGE; }
+
+done:
+    if (vae) qzen_zvae_free(vae);
+    free(rgb);
+    free(pixels);
+    free(latents);
+    free(cap);
+    return status;
+}
+
+/* ------------------------------------------------- vtable: health / unload */
+
+static qzi_status qzen_health(void *context, qzi_health *out,
+                              char *error, size_t error_cap)
+{
+    (void)error; (void)error_cap;
+    qzen_state *s = (qzen_state *)context;
+    if (!s || !out) return QZI_ERR_INVALID_ARGUMENT;
+    out->device_id = s->device_id;
+    out->reference_backend = 0;
+    /* The ABI layer fills resident_model, served, busy and uptime. The
+     * backend only needs to declare that this is NOT the noise reference. */
+    return QZI_OK;
+}
+
+static qzi_status qzen_unload(void *context, char *error, size_t error_cap)
+{
+    (void)error; (void)error_cap;
+    qzen_state *s = (qzen_state *)context;
+    if (!s) return QZI_ERR_INVALID_ARGUMENT;
+    /* Release re-creatable state; never the DiT, which costs minutes. */
+    if (s->text) { qzen_qwen21_text_close(s->text); s->text = NULL; }
+    free(s->uncond);
+    s->uncond = NULL;
+    s->uncond_tokens = 0;
+    if (s->zpipe && s->z_text_resident) {
+        qzen_zpipe_release_text(s->zpipe);
+        s->z_text_resident = 0;
+    }
+    return QZI_OK;
+}
+
+static void qzen_release_image(void *context, qzi_image *image)
+{
+    (void)context;
+    if (!image || !image->data) return;
+    free((void *)image->data);
+    image->data = NULL;
+    image->size = 0;
+    image->token = 0;
+}
+
+static const qzi_backend qzen_vtable = {
+    QZI_ABI_VERSION,
+    "QwenZImageNative",
+    qzen_init,
+    qzen_shutdown,
+    qzen_generate_qwen21,
+    qzen_generate_zimage,
+    qzen_health,
+    qzen_unload,
+    qzen_release_image
+};
+
+const qzi_backend *qzi_real_backend(void)
+{
+    return &qzen_vtable;
+}

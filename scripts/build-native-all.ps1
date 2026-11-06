@@ -1,10 +1,10 @@
 # Build BOTH native platforms on a Windows host, then stage them for NuGet.
-#   1. qzi.dll     - native Windows build (CMake / Visual Studio or MinGW)
-#   2. libqzi.so   - native Linux build via WSL (Debian with gcc/cmake/ninja)
+#   1. QwenZImageNative.dll     - native Windows build (CMake / Visual Studio or MinGW)
+#   2. libQwenZImageNative.so   - native Linux build via WSL (Debian with gcc/cmake/ninja)
 # After this, `dotnet pack src/QwenZImage.NET/QwenZImage.NET.csproj` succeeds.
 #
 # On Linux hosts just run scripts/build-native.sh (which stages linux-x64) and
-# obtain qzi.dll from a Windows CI runner; CI does exactly that.
+# obtain QwenZImageNative.dll from a Windows CI runner; CI does exactly that.
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($wslScript)) {
 Write-Host '=== 3/3 stage both RIDs for NuGet ==='
 & (Join-Path $PSScriptRoot 'stage-native.ps1')
 
-$win = Join-Path $root 'artifacts/runtimes/win-x64/native/qzi.dll'
-$linux = Join-Path $root 'artifacts/runtimes/linux-x64/native/libqzi.so'
+$win = Join-Path $root 'artifacts/runtimes/win-x64/native/QwenZImageNative.dll'
+$linux = Join-Path $root 'artifacts/runtimes/linux-x64/native/libQwenZImageNative.so'
 Write-Host "win-x64  : $(if (Test-Path $win) { 'OK' } else { 'MISSING' })  $win"
 Write-Host "linux-x64: $(if (Test-Path $linux) { 'OK' } else { 'MISSING' })  $linux"

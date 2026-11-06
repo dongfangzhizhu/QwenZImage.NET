@@ -30,8 +30,8 @@ internal static class NativeTestLibrary
 
     private static string? Find()
     {
-        string name = OperatingSystem.IsWindows() ? "qzi.dll"
-                    : OperatingSystem.IsMacOS() ? "libqzi.dylib" : "libqzi.so";
+        string name = OperatingSystem.IsWindows() ? "QwenZImageNative.dll"
+                    : OperatingSystem.IsMacOS() ? "libQwenZImageNative.dylib" : "libQwenZImageNative.so";
         DirectoryInfo? dir = new(AppContext.BaseDirectory);
         for (int i = 0; i < 8 && dir is not null; i++, dir = dir.Parent)
         {
