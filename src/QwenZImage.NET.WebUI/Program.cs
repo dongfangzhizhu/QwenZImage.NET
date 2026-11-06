@@ -31,7 +31,7 @@ builder.Logging.AddSimpleConsole(options =>
 // Web assets still resolve from ContentRootPath/wwwroot, but user data (model
 // weights, cache, outputs) is relative to the directory the server was
 // launched from — that is what a manual-test operator expects.
-WebUiConfig config = WebUiConfig.FromEnvironment(launchDirectory);
+WebUiConfig config = WebUiConfig.FromEnvironment(launchDirectory, args);
 // An explicit --urls / ASPNETCORE_URLS always wins over the default.
 if (string.IsNullOrWhiteSpace(builder.Configuration["urls"]))
     builder.WebHost.UseUrls(config.Urls);
@@ -78,17 +78,18 @@ app.UseStaticFiles();
 app.MapGet("/api/health", (WebUiRuntime rt) =>
 {
     object? engine = null;
-    bool ok = rt.Client is not null && rt.Queue is not null;
+    bool ok = rt.Engine is not null && rt.Queue is not null;
     string? error = rt.InitError;
 
     if (ok)
     {
         try
         {
-            EngineHealth h = rt.Client!.GetHealth();
+            WebUiEngineHealth h = rt.Engine!.GetHealth();
             engine = new
             {
-                resident_model = h.ResidentModel.ToString().ToLowerInvariant(),
+                backend = h.Backend,
+                resident_model = h.ResidentModel,
                 busy = h.Busy,
                 queue_depth = h.QueueDepth,
                 device_id = h.DeviceId,
@@ -96,7 +97,7 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
                 total_vram_mib = h.TotalVramMib,
                 served = h.Served,
                 rejected = h.Rejected,
-                uptime_s = h.Uptime.TotalSeconds,
+                uptime_s = h.UptimeSeconds,
                 reference_backend = h.IsReferenceBackend
             };
         }
@@ -114,6 +115,8 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         error,
         out_dir = rt.Outputs.Root,
         model_dir = rt.Config.ModelDirectory,
+        transport = rt.Config.Transport,
+        engine_url = rt.Config.EngineUrl,
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
     });
@@ -216,10 +219,10 @@ app.MapPost("/api/jobs/{id:long}/retry", (long id, WebUiRuntime rt) =>
 
 IResult UnloadEngine(WebUiRuntime rt)
 {
-    if (rt.Client is null) return Unavailable(rt);
+    if (rt.Engine is null) return Unavailable(rt);
     try
     {
-        rt.Client.Unload();
+        rt.Engine.Unload();
         return Json(new { released = true });
     }
     catch (Exception ex)
@@ -313,7 +316,7 @@ app.MapGet("/api/events", async (HttpContext context, WebUiRuntime rt) =>
         if (rt.Queue is null)
         {
             events.Writer.TryWrite(new SseEvent("error", JsonSerializer.Serialize(
-                new ErrorResponse("native engine unavailable", rt.InitError), WebUiJson.Options)));
+                new ErrorResponse("generation engine unavailable", rt.InitError), WebUiJson.Options)));
             return; // keep the channel open so heartbeats still flow
         }
 
@@ -393,8 +396,16 @@ app.Lifetime.ApplicationStarted.Register(() =>
     app.Logger.LogInformation("QwenZImage.NET WebUI listening on {Urls}",
                               string.Join(", ", app.Urls));
     app.Logger.LogInformation("Output directory: {OutputDirectory}", runtime.Outputs.Root);
+    app.Logger.LogInformation("Engine transport: {Transport}{EngineUrl}",
+                              runtime.Config.Transport,
+                              runtime.Config.EngineUrl is null
+                                  ? "" : $" ({runtime.Config.EngineUrl})");
+    if (runtime.Config.Transport == "native-pinvoke")
+        app.Logger.LogWarning(
+            "Bundled native library is the deterministic REFERENCE backend: it emits noise. " +
+            "Set QZI_ENGINE_URL=http://127.0.0.1:8411 to use a real h3 serve engine.");
     if (runtime.InitError is not null)
-        app.Logger.LogWarning("Native engine unavailable: {Error}", runtime.InitError);
+        app.Logger.LogWarning("Engine unavailable: {Error}", runtime.InitError);
 });
 
 await app.RunAsync();
@@ -414,7 +425,7 @@ static IResult Conflict(string message)
     => Json(new ErrorResponse(message), StatusCodes.Status409Conflict);
 
 static IResult Unavailable(WebUiRuntime rt)
-    => Json(new ErrorResponse("native engine unavailable", rt.InitError),
+    => Json(new ErrorResponse("generation engine unavailable", rt.InitError),
             StatusCodes.Status503ServiceUnavailable);
 
 static async Task<List<string>?> ReadNamesAsync(HttpContext context)

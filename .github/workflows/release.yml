@@ -2,7 +2,7 @@ name: Release to NuGet
 
 # Publishing is intentionally opt-in: it only runs on an explicit v* tag
 # (or a manual dispatch). The repository owner must configure the
-# NUGET_API_KEY secret before the first release. See PLAN.md section 9.
+# NUGET_API_KEY secret before the first release. See PLAN.md section 5.
 on:
   push:
     tags: ['v*']

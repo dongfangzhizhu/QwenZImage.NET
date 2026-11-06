@@ -45,10 +45,16 @@ async function refreshHealth() {
     const pill = $("health-pill");
     if (h.ok) {
       const reference = h.engine?.reference_backend === true;
-      const backend = reference ? "reference backend (noise)" : "engine backend";
+      const backend = reference ? "reference backend (noise)" : (h.engine?.backend || "engine backend");
       pill.className = reference ? "pill pill-wait" : "pill pill-ok";
       pill.textContent = `● ${backend} · ${h.engine?.resident_model || "no model"}`;
-      pill.title = `out_dir: ${h.out_dir}\nmodel_dir: ${h.model_dir}\nserved: ${h.engine?.served ?? 0}`;
+      pill.title = [
+        `transport: ${h.transport}`,
+        `engine_url: ${h.engine_url || "(in-process native)"}`,
+        `out_dir: ${h.out_dir}`,
+        `model_dir: ${h.model_dir}`,
+        `served: ${h.engine?.served ?? 0}`,
+      ].join("\n");
       $("backend-banner").hidden = !reference;
     } else {
       $("backend-banner").hidden = true;

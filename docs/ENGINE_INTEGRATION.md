@@ -1,8 +1,23 @@
 # 接入真实 C / CUDA 引擎
 
-本仓库提供的是**契约 + 托管封装 + 参考实现**，不含真实的扩散推理引擎。要让 `QwenZImage.NET` 产出真实图像，需要一个实现 `qzi` ABI 的 native 库。有三种路径，按工作量从大到小：
+本仓库提供的是**契约 + 托管封装 + 参考实现**，不含真实的扩散推理引擎。要让 `QwenZImage.NET` **库本身**产出真实图像，需要一个实现 `qzi` ABI 的 native 库。下面路径 A / B 讲的就是这件事。
 
-> NuGet 包默认已捆绑 `runtimes/win-x64/native/qzi.dll` 与 `runtimes/linux-x64/native/libqzi.so`（确定性参考后端），因此安装即可跑通。下面三种路径的产物通过 `QZI_NATIVE_LIBRARY` / `QziClientOptions.NativeLibraryPath` 覆盖默认探测，或直接替换应用输出目录里的同名文件；托管程序集与调用代码无需改动。
+> NuGet 包默认已捆绑 `runtimes/win-x64/native/qzi.dll` 与 `runtimes/linux-x64/native/libqzi.so`（确定性参考后端），因此安装即可跑通。路径 A / B 的产物通过 `QZI_NATIVE_LIBRARY` / `QziClientOptions.NativeLibraryPath` 覆盖默认探测，或直接替换应用输出目录里的同名文件；托管程序集与调用代码无需改动。
+
+## 为什么所有输出都是噪点图（根因）
+
+`native/src/qzi_stub.c` 的 `make_rgb()` 直接往 RGB 缓冲写伪随机字节，`run_phases()` 的 `dit` 循环只是：
+
+```c
+for (i = 0; i < steps; i++) {
+    qzi_emit_progress(callbacks, "dit", i, steps, start);
+    if (qzi_cancelled(callbacks)) { ... }
+}
+```
+
+**没有 DiT 前向、没有去噪、没有 VAE、没有文本编码**。`steps`、`guidance`、`seed` 只影响进度循环长度和哈希 tag，不影响像素语义。原 Go WebUI 出图正常，是因为它把请求转发给了 `h3 serve`——真正的 C/CUDA 引擎加上 `h3-models/` 里数十 GB 权重；那部分代码与权重从未进入本仓库。因此「和原版用同样的 steps 却全是噪点」不是参数问题，而是后端根本不是图像模型。
+
+**只想马上看到真图**：不必改库。给 WebUI 设置 `QZI_ENGINE_URL=http://127.0.0.1:8411`（或 `--engine`）即可连本机 `h3 serve`，用现成引擎和权重出图。该适配器 `H3ServeExecutor` 只存在于手动测试控制台、不进 NuGet 包、不含 Go 代码；详见 [WEBUI.md](WEBUI.md)。下面 A / B 才是让 `QziClient` 直接出真图的长期方案。
 
 ## 路径 A：引擎自己导出 `qzi_*`（完全替换）
 

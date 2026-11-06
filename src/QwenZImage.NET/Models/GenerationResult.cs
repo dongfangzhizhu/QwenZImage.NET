@@ -25,6 +25,29 @@ public sealed class GenerationResult : IDisposable
         Elapsed = elapsed;
     }
 
+    private static ReadOnlySpan<byte> PngSignature =>
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// <summary>
+    /// Wraps PNG bytes obtained outside this library (a remote engine, an
+    /// alternative backend, a replayed result) in the same pooled result type
+    /// that <see cref="QziClient"/> returns. This lets a custom
+    /// <see cref="IQziExecutor"/> feed <see cref="QziGenerationQueue"/> without
+    /// touching the P/Invoke layer.
+    /// </summary>
+    /// <exception cref="ArgumentException">The bytes do not start with a PNG signature.</exception>
+    public static GenerationResult FromPng(ReadOnlySpan<byte> png, int width, int height,
+                                           ulong seed, GenerationModel model, TimeSpan elapsed)
+    {
+        if (png.Length < PngSignature.Length ||
+            !png[..PngSignature.Length].SequenceEqual(PngSignature))
+            throw new ArgumentException("Expected a byte stream with a PNG signature.", nameof(png));
+
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(png.Length);
+        png.CopyTo(buffer);
+        return new GenerationResult(buffer, png.Length, width, height, seed, model, elapsed);
+    }
+
     /// <summary>Byte length of the PNG.</summary>
     public int Length => _length;
 

@@ -3,11 +3,13 @@
 > **High-performance .NET 10 wrapper over a stable C ABI for Qwen-Image 2.1 and Z-Image text-to-image generation.**
 > Pure C at the bottom, source-generated P/Invoke at the top: no Go, no HTTP hop to a sidecar, no JSON marshalling in the hot path.
 
-> ⚠️ **本项目自带的 native 库不生成真实图像。** 包内 `qzi.dll` / `libqzi.so` 是 deterministic **reference backend**：输出由 prompt / seed / 尺寸哈希出来的**噪点图**，`steps`、`guidance`、`seed` 只驱动进度条，不做任何扩散推理。原 Go WebUI 能出正常图像，是因为它连的是 `h3 serve`（真正的 C/CUDA 引擎 + 模型权重）；**那个引擎没有被搬进本仓库**。要出真实图，必须按 [docs/ENGINE_INTEGRATION.md](docs/ENGINE_INTEGRATION.md) 接入真实引擎，或让 WebUI 连到本机 `h3 serve`。WebUI 在检测到参考后端时会显示醒目的黄色横幅。
+> ⚠️ **本项目自带的 native 库不生成真实图像。** 包内 `qzi.dll` / `libqzi.so` 是 deterministic **reference backend**：输出由 prompt / seed / 尺寸哈希出来的**噪点图**，`steps`、`guidance`、`seed` 只驱动进度条，不做任何扩散推理。原 Go WebUI 能出正常图像，是因为它连的是 `h3 serve`（真正的 C/CUDA 引擎 + 模型权重）；**那个引擎没有被搬进本仓库**。所以「同样的 steps 却是噪点」不是参数问题，而是后端根本不是图像模型。
+>
+> **最快的真图路径**：启动 `h3 serve --port 8411`，再用 `QZI_ENGINE_URL=http://127.0.0.1:8411` 启动本仓库的 WebUI（详见 [出真实图像](#出真实图像三条路径)）。库本身要出真图，仍需按 [docs/ENGINE_INTEGRATION.md](docs/ENGINE_INTEGRATION.md) 接入真实 `qzi_backend`。WebUI 检测到参考后端时会显示黄色横幅。
 
 一个把 **Qwen-Image 2.1（turbo / base / LoRA）** 与 **Z-Image（bf16 / Nunchaku int4）** 两个文生图能力封装成 `.NET 10` 可调用包的独立项目。底层是 C 语言定义的稳定 ABI（C/CUDA 引擎可实现它），上层是 `.NET 10` 的高性能源生成 P/Invoke 封装。原 Go WebUI 的队列、进度、取消、重试、预设等功能全部用纯 `.NET` 重写，**仓库中不含任何 Go 代码、库调用链上不依赖 HTTP 服务**。
 
-仓库另附一个**可选的跨平台 WebUI 手动测试控制台**（`src/QwenZImage.NET.WebUI`，ASP.NET Core Minimal API，Windows / Linux 均可运行），把原本 Go WebUI 的交互面用纯 `.NET` 复刻出来；它只是浏览器到库的本地前端，不参与 NuGet 包，也不是 SDK 的一部分。详见 [docs/WEBUI.md](docs/WEBUI.md)。
+仓库另附一个**可选的跨平台 WebUI 手动测试控制台**（`src/QwenZImage.NET.WebUI`，ASP.NET Core Minimal API，Windows / Linux 均可运行），把原本 Go WebUI 的交互面用纯 `.NET` 复刻出来。它默认走进程内 native，也可以用 `QZI_ENGINE_URL` **可选地**连本机 `h3 serve` 以产出真实图像——该 HTTP 适配器只存在于 WebUI 测试工具中，不进 NuGet 包、不改变库的 P/Invoke 契约，也没有任何 Go 代码。详见 [docs/WEBUI.md](docs/WEBUI.md)。
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -28,15 +30,30 @@
 
 | 项 | 状态 |
 | --- | --- |
-| C ABI v1、`qzi` 共享库、`.NET 10` 封装、队列、预设、31 个 xUnit 测试、native smoke test | ✅ 已完成并通过 |
+| C ABI v1、`qzi` 共享库、`.NET 10` 封装、队列、预设、47 个 xUnit 测试、native smoke test | ✅ 已完成并通过 |
 | **跨平台 WebUI 手动测试控制台**（health / presets / jobs / SSE / gallery / trash / unload） | ✅ 已完成，Windows + Linux 均可运行 |
+| **WebUI 可选接入真实 `h3 serve`**（`QZI_ENGINE_URL` / `--engine`），产出真实图像 | ✅ 已完成，16 个协议单测 + 端到端 HTTP 冒烟已验证 |
 | **单个 NuGet 包同时包含 .NET 程序集 + win-x64 + linux-x64 native** | ✅ 已完成，`QziEnsureNativeRuntimes` 会在缺平台时拒绝打包 |
 | 本地 `git` 仓库与首次提交 | ✅ 已完成 |
 | 推送 GitHub / 发布 NuGet | ⏸ **按约定暂缓**，命令与 CI 工作流已备好，见 [PLAN.md](PLAN.md) |
-| 真实 CUDA 推理引擎 | ❌ **本仓库不含**。需由外部引擎实现 `qzi_backend` 并注册，或替换同名 `qzi` 库 |
+| 真实 CUDA 推理引擎 | ❌ **本仓库不含**。库要靠外部 `qzi_backend`；WebUI 可直接连本机已有的 `h3 serve` |
 | 模型权重 | ❌ 不含。NuGet 包只有程序集与参考 native 库，不捆绑多 GB 权重 |
 
 **NuGet 包里捆绑的 `qzi.dll` / `libqzi.so` 是确定性参考实现（reference backend）**：它按相同的 ABI、相同的 progress 阶段、相同的缓冲区所有权返回一张由 prompt / seed / 尺寸决定的 PNG，**不做真实扩散推理，不需要 GPU 或权重**。它的用途是让包开箱即用、让 CI 与单测在无 GPU 环境下验证 ABI 与内存契约。要生成真实图像，请把 `QZI_NATIVE_LIBRARY` 指向实现了同一 ABI 的引擎构建，并按 [docs/ENGINE_INTEGRATION.md](docs/ENGINE_INTEGRATION.md) 注册后端——托管程序集不需要改动。
+
+## 出真实图像：三条路径
+
+噪点图的根因是 `native/src/qzi_stub.c`：`make_rgb()` 直接写伪随机 RGB，`run_phases()` 的 `dit` 循环只上报进度，**没有任何去噪、DiT、VAE 计算**。`steps` 只决定进度条跑几格，因此调参与原 Go 版保持一致也不会改变结果。三条路径按代价从低到高：
+
+| 路径 | 做法 | 适用范围 | 代价 |
+|---|---|---|---|
+| **A. WebUI 连 `h3 serve`（最快）** | 启动 `h3 serve --port 8411`，再 `QZI_ENGINE_URL=http://127.0.0.1:8411 dotnet run --project src/QwenZImage.NET.WebUI -c Release` | 仅 WebUI / 手动测试 | 零编译，直接用你已有的 `h3.exe` 与 `h3-models/` 权重；WebUI 的队列、SSE、画廊全部保留 |
+| **B. 替换 native 库** | 自己构建同名 `qzi.dll` / `libqzi.so`，实现 `qzi_backend` vtable 并注册真实 C/CUDA 引擎，用 `QZI_NATIVE_LIBRARY` 覆盖 | 所有 .NET 调用方 | 需把 `h3_serve.c` 的编排搬进 native 库，要 CUDA Toolkit 与权重 |
+| **C. 直接导出 `qzi_*`** | 另写一个实现 `native/include/qzi.h` 全部导出的库，不用本仓库的 `qzi.c` 控制层 | 所有 .NET 调用方 | 工作量最大，需自行实现单飞锁、校验、进度、buffer 所有权 |
+
+路径 A 的适配器是 `H3ServeExecutor`：把强类型请求转成 `h3 serve` 的 `POST /generate` JSON（qwen21 turbo 强制 `steps=8` / `guidance=1.0` 且不发 `negative_prompt`；zimage 不发 `steps`/`guidance`/`frames`/`pdd8`），把返回的 PNG 字节用 `GenerationResult.FromPng(...)` 包回队列，轮询 `GET /progress` 转成 SSE 进度，并把 `/health`、`/unload` 映射到 WebUI 端点。B/C 的细节见 [docs/ENGINE_INTEGRATION.md](docs/ENGINE_INTEGRATION.md)。
+
+> 路径 A **只在 WebUI 里**，NuGet 包依旧是纯 Native P/Invoke；`QZI_ENGINE_URL` 不设置时行为与之前完全一致（仍是参考后端 + 黄色告警横幅）。
 
 ## 环境要求
 
@@ -61,7 +78,12 @@ dotnet test  QwenZImage.NET.sln -c Release
 dotnet run --project samples/QwenZImage.NET.Sample -c Release
 
 # 4) 启动手动测试 WebUI，浏览器打开 http://127.0.0.1:7860/
-dotnet run --project src/QwenZImage.NET.WebUI -c Release
+dotnet run --project src/QwenZImage.NET.WebUI -c Release     # 参考后端，输出噪点
+
+# 4b) 想看真实图像：先起真实引擎，再把 WebUI 指过去
+# h3 serve --port 8411 --qwen21-dir /path/to/qwen21 --zimage-dir /path/to/zimage
+QZI_ENGINE_URL=http://127.0.0.1:8411 dotnet run --project src/QwenZImage.NET.WebUI -c Release
+# 等价：dotnet run --project src/QwenZImage.NET.WebUI -c Release -- --engine http://127.0.0.1:8411
 ```
 
 一键脚本（都会自动 stage 成 NuGet 的 RID 布局）：
@@ -151,11 +173,14 @@ QziJob? retry = queue.Retry(job.Id);     // 复用完全相同的 request 重跑
 dotnet run --project src/QwenZImage.NET.WebUI -c Release
 # 浏览器打开 http://127.0.0.1:7860/
 QZI_WEBUI_URLS=http://127.0.0.1:51234 dotnet run --project src/QwenZImage.NET.WebUI -c Release  # 换端口
+
+# 真实图像：连本机 h3 serve（原生 Windows / WSL / Linux 均可）
+QZI_ENGINE_URL=http://127.0.0.1:8411 dotnet run --project src/QwenZImage.NET.WebUI -c Release
 ```
 
-主要端点：`GET /api/health`、`GET /api/presets`、`POST|GET /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel|/retry`、`GET /api/events`（SSE）、`GET|DELETE /api/outputs`、`POST /api/outputs/restore`、`GET /api/unload`。可用环境变量：`QZI_WEBUI_URLS`、`QZI_WEBUI_OUTPUT`、`QZI_MODEL_DIR`、`QZI_MODEL_CACHE`、`QZI_NATIVE_LIBRARY`、`QZI_DEVICE_ID`。完整说明见 [docs/WEBUI.md](docs/WEBUI.md)。
+主要端点：`GET /api/health`、`GET /api/presets`、`POST|GET /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel|/retry`、`GET /api/events`（SSE）、`GET|DELETE /api/outputs`、`POST /api/outputs/restore`、`GET|POST /api/unload`。可用环境变量：`QZI_ENGINE_URL`、`--engine`、`QZI_ENGINE_TIMEOUT_MIN`、`QZI_ENGINE_PROGRESS_MS`、`QZI_WEBUI_URLS`、`QZI_WEBUI_OUTPUT`、`QZI_MODEL_DIR`、`QZI_MODEL_CACHE`、`QZI_NATIVE_LIBRARY`、`QZI_DEVICE_ID`。完整说明见 [docs/WEBUI.md](docs/WEBUI.md)。
 
-> WebUI 是**手动测试工具**，不打进 NuGet 包。即使 native 库缺失，服务仍会启动并在 `/api/health` 明确报错，方便排查环境问题。
+> WebUI 是**手动测试工具**，不打进 NuGet 包。设置 `QZI_ENGINE_URL` 时完全不加载 bundled native 库，`/api/health` 会返回 `transport: "h3-serve-http"`、`reference_backend: false`；未设置时显示黄色噪点告警横幅。即使 native 库缺失，服务仍会启动并在 `/api/health` 明确报错，方便排查环境问题。
 
 ## API 速查
 
@@ -163,7 +188,7 @@ QZI_WEBUI_URLS=http://127.0.0.1:51234 dotnet run --project src/QwenZImage.NET.We
 | --- | --- |
 | `QziClient` | 拥有的一个 native engine。同步 `Generate*` / `WriteTo`，异步 `Generate*Async` / `WriteToAsync`，`GetHealth()`、`Unload()`、`Dispose()` |
 | `QwenImageOptions` / `ZImageOptions` | 强类型请求（继承 `GenerationOptions`），`required Prompt`、宽高、Seed |
-| `GenerationResult` | PNG 结果：`Png` / `PngSpan`（零拷贝）、`CopyTo(Async)`、`SaveAsync`、`Dispose()` 归还池化缓冲区 |
+| `GenerationResult` | PNG 结果：`Png` / `PngSpan`（零拷贝）、`CopyTo(Async)`、`SaveAsync`、`Dispose()` 归还池化缓冲区；`FromPng(...)` 把外部来源的 PNG 包成同一类型，供自定义 `IQziExecutor` 接入队列 |
 | `GenerationProgress` | `Phase`（`ModelLoad / Text / Dit / Vae / Encode`）、`Completed`、`Total`、`Elapsed` |
 | `EngineHealth` | 常驻模型、Busy、队列深度、显存、Served/Rejected、运行时长、`IsReferenceBackend` |
 | `QziGenerationQueue` | 串行队列、取消、重试、事件流、输出 sink |
@@ -236,10 +261,13 @@ native/tests/                  C ABI smoke test（ctest）
 src/QwenZImage.NET/            .NET 10 库（NuGet 包体）
 src/QwenZImage.NET.WebUI/      跨平台手动测试 WebUI（ASP.NET Core，不打包）
   wwwroot/                     纯静态前端：index.html / app.js / style.css
-tests/QwenZImage.NET.Tests/    31 个 xUnit 测试
+  H3ServeExecutor.cs          可选的真实 h3 serve HTTP 适配器（仅 WebUI）
+tests/QwenZImage.NET.Tests/          31 个库 xUnit 测试
+tests/QwenZImage.NET.WebUI.Tests/    16 个 h3 serve 协议单测（stub handler，无网络/GPU）
 samples/                       端到端示例
 integration/                   真实引擎后端模板
 scripts/                       Windows / Linux / WSL native 构建与 RID staging
+                               + mock-h3-serve.py（协议冒烟用假引擎）
 artifacts/runtimes/<rid>/     打包前 stage 的 win-x64 / linux-x64 native
 docs/                          ABI / 参数 / 引擎接入 / WebUI 文档
 .github/workflows/             CI 与 NuGet 发布工作流（双平台 native 校验）
@@ -250,16 +278,16 @@ PLAN.md                        计划、决策记录与发布清单
 
 ```bash
 ctest --test-dir native/build --output-on-failure   # C ABI 契约
-dotnet test QwenZImage.NET.sln -c Release           # 31 个托管测试
+dotnet test QwenZImage.NET.sln -c Release           # 47 个托管测试（31 库 + 16 WebUI 协议）
 ```
 
-托管测试包含：参数校验、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流。全部针对参考后端，因此**无需 GPU、无需权重、无需网络**。
+托管测试包含：参数校验、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流；WebUI 协议测试覆盖 qwen21 turbo/base 与 zimage 的 `/generate` 请求体、错误码映射、`/health`、`/unload`、非 PNG 拒绝。全部不需要 GPU、权重或网络监听。
 
-WebUI 在 CI 中另有 Linux 运行时冒烟测试：启动 Kestrel → 验证 `/api/health` 的 `ok=true` 与 `reference_backend` → 检查 presets → 提交一个 zimage job → 轮询到 `done` → 确认输出文件出现在 `/api/outputs`。Windows 侧由解决方案构建覆盖。
+WebUI 在 CI 中另有 Linux 运行时冒烟测试：启动 Kestrel → 验证 `/api/health` 的 `ok=true` 与 `reference_backend` → 检查 presets → 提交一个 zimage job → 轮询到 `done` → 确认输出文件出现在 `/api/outputs`。此外用 `scripts/mock-h3-serve.py` 起一个假 `h3 serve`，验证 `QZI_ENGINE_URL` 通道：health 显示 `h3-serve` 且 `reference_backend=false`，提交任务后引擎返回的 PNG **字节原样**落盘到画廊。Windows 侧由解决方案构建覆盖。
 
 ## 路线与发布
 
-见 [PLAN.md](PLAN.md)：阶段 0–6（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包）已完成；推送 GitHub 并发布 `QwenZImage.NET` 到 NuGet 按用户决定**暂缓**，所需工作流与命令已就绪。
+见 [PLAN.md](PLAN.md)：阶段 0–11（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查与 WebUI 真实引擎通道）已完成；推送 GitHub 并发布 `QwenZImage.NET` 到 NuGet 按用户决定**暂缓**，所需工作流与命令已就绪。
 
 ## 许可与声明
 
