@@ -48,7 +48,7 @@
 | native 产物统一命名 `QwenZImageNative.dll` / `libQwenZImageNative.so` | ✅ 已完成，无 `h3` 命名产物 |
 | 单个 NuGet 包含 .NET 程序集 + win-x64 + linux-x64 native | ✅ 已完成，`QziEnsureNativeRuntimes` 缺平台即拒绝打包 |
 | 本地 git 仓库与提交 | ✅ 已完成 |
-| 推送 GitHub / 发布 NuGet | ⏸ **按约定暂缓**，命令与 CI 工作流已备好，见 [PLAN.md](PLAN.md) |
+| 推送 GitHub / 发布 NuGet | ✅ 仓库 `dongfangzhizhu/QwenZImage.NET`；发布走 **NuGet Trusted Publishing**（GitHub Actions OIDC 换短期密钥，仓库不存长期 secret），由 `v*` tag 触发，见 [PLAN.md](PLAN.md) |
 | 模型权重 | ❌ 不含，需使用方自备并在配置文件里指向它们 |
 
 ## 配置文件：`QwenZImage.config.json`
@@ -321,7 +321,16 @@ bash scripts/run-real-image-regression.sh --out artifacts/regress/full
 
 ## 路线与发布
 
-见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）、阶段 12c（**LoRA / 参数全链路一致性**）与阶段 12d（**真图回归矩阵 10/10**，覆盖 LoRA、base、1024×1024、Z-Image bf16 与 Nunchaku r32/r256）与阶段 12e（**POSIX ICU 双路径检查接入 CTest**）亦已完成；按用户要求不做 macOS 适配；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
+仓库：`https://github.com/dongfangzhizhu/QwenZImage.NET`。
+
+见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）、阶段 12c（**LoRA / 参数全链路一致性**）、阶段 12d（**真图回归矩阵 10/10**，覆盖 LoRA、base、1024×1024、Z-Image bf16 与 Nunchaku r32/r256）、阶段 12e（**POSIX ICU 双路径检查接入 CTest**）与阶段 12f（**消除 `QZI_*` 进程级环境变量串扰**）亦已完成；按用户要求不做 macOS 适配。
+
+**发布采用 NuGet Trusted Publishing**：`.github/workflows/release.yml` 在 `v*` tag 上触发，`publish` job 以 `permissions.id-token: write` 申请 GitHub OIDC token，`NuGet/login@v1` 用它换取有效期 1 小时的短期 API key，随后发布 `.nupkg` / `.snupkg`；仓库**不保存长期 `NUGET_API_KEY`**。首次发布前需完成两项外部配置：
+
+1. 在 **nuget.org** 为包所有者账号创建 Trusted Publishing policy：Repository Owner `dongfangzhizhu`、Repository `QwenZImage.NET`、Workflow File `release.yml`（只填文件名）、Environment 留空。
+2. 在 **GitHub 仓库**设置 repository secret `NUGET_USER` = nuget.org 的 **profile 用户名（不是邮箱）**，须与 policy owner 一致。
+
+完整清单与 tag 发布命令见 [PLAN.md](PLAN.md) 第 5 节。
 
 ## 许可与声明
 

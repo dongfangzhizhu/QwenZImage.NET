@@ -11,7 +11,7 @@
     <!-- NuGet identity -->
     <PackageId>QwenZImage.NET</PackageId>
     <Version>0.1.0</Version>
-    <Authors>alexhegit</Authors>
+    <Authors>dongfangzhizhu</Authors>
     <Company>QwenZImage.NET contributors</Company>
     <Product>QwenZImage.NET</Product>
     <Title>QwenZImage.NET - .NET 10 wrapper for Qwen-Image 2.1 and Z-Image</Title>
@@ -20,8 +20,8 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>image-generation;qwen-image;z-image;diffusion;cuda;pinvoke;native;dotnet10;ai</PackageTags>
-    <PackageProjectUrl>https://github.com/alexhegit/QwenZImage.NET</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/alexhegit/QwenZImage.NET.git</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/dongfangzhizhu/QwenZImage.NET</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/dongfangzhizhu/QwenZImage.NET.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <IncludeSymbols>true</IncludeSymbols>

@@ -1,8 +1,10 @@
 name: Release to NuGet
 
 # Publishing is intentionally opt-in: it only runs on an explicit v* tag
-# (or a manual dispatch). The repository owner must configure the
-# NUGET_API_KEY secret before the first release. See PLAN.md section 5.
+# (or a manual dispatch). NuGet packages are published with Trusted
+# Publishing: NuGet/login@v1 exchanges the GitHub OIDC token for a short-lived
+# NuGet API key, so NO long-lived NUGET_API_KEY secret is stored in this repo.
+# One-time setup on nuget.org + GitHub is documented in PLAN.md section 5.
 #
 # The shipped natives are the GPU-free REFERENCE backend (deterministic noise):
 # a real CUDA build is tied to a specific SM architecture and to model weights
@@ -18,8 +20,11 @@ on:
         required: false
         type: string
 
+# The native jobs only need to read the checkout. The publish job elevates its
+# own permissions: `contents: write` for the GitHub release and `id-token: write`
+# so GitHub can mint the OIDC token that NuGet/login exchanges for an API key.
 permissions:
-  contents: write   # needed to create the GitHub release
+  contents: read
 
 jobs:
   # A single NuGet package ships the managed assembly plus BOTH native RIDs.
@@ -63,6 +68,9 @@ jobs:
     name: Pack and publish QwenZImage.NET
     needs: native
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub release
+      id-token: write   # mint the GitHub OIDC token for NuGet Trusted Publishing
 
     steps:
       - name: Checkout (full history for SourceLink)
@@ -135,13 +143,34 @@ jobs:
             Write-Host "== $($package.Name) contains all $($required.Count) required entries"
           } finally { $zip.Dispose() }
 
+      # Trusted Publishing: no long-lived secret. NuGet/login@v1 exchanges this
+      # run's GitHub OIDC token for a NuGet API key valid for 1 hour. One OIDC
+      # token yields exactly one key, so log in ONCE, immediately before the
+      # push, and reuse that key for both .nupkg and .snupkg.
+      - name: Verify Trusted Publishing configuration
+        env:
+          NUGET_USER: ${{ secrets.NUGET_USER }}
+        shell: bash
+        run: |
+          if [ -z "$NUGET_USER" ]; then
+            echo "::error::NUGET_USER secret is missing. Set it to the nuget.org profile name (not an email address) that owns the Trusted Publishing policy. See PLAN.md section 5."
+            exit 1
+          fi
+
+      - name: NuGet login (OIDC -> short-lived API key)
+        id: nuget_login
+        uses: NuGet/login@v1
+        with:
+          # nuget.org profile name (NOT email); must match the policy owner.
+          user: ${{ secrets.NUGET_USER }}
+
       - name: Push to nuget.org
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget_login.outputs.NUGET_API_KEY }}
         shell: bash
         run: |
           if [ -z "$NUGET_API_KEY" ]; then
-            echo "::error::NUGET_API_KEY secret is not configured"; exit 1
+            echo "::error::NuGet/login did not return a temporary API key"; exit 1
           fi
           dotnet nuget push artifacts/packages/QwenZImage.NET.${{ steps.version.outputs.value }}.nupkg \
             --api-key "$NUGET_API_KEY" \

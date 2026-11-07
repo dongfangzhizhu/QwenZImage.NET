@@ -9,13 +9,14 @@
 | D1 | **新建独立目录** `D:/AI/convert/QwenZImage.NET`，不改动原工程 | 用户 |
 | D2 | **底层 C，.NET 10 封装，追求高性能**；**不要 Go 部分**，原 Go WebUI 的队列 / 进度 / 取消 / 重试 / 预设功能用纯 `.NET` 实现 | 用户明确指示 |
 | D3 | **只做 Native P/Invoke**：不做 HTTP 客户端、不做双 transport、不引入 Go WebUI | 用户对封装方式的二选一 |
-| D4 | 项目名 / NuGet 包 ID = **`QwenZImage.NET`**，仓库 = `alexhegit/QwenZImage.NET` | 用户 |
+| D4 | 项目名 / NuGet 包 ID = **`QwenZImage.NET`**，仓库 = `dongfangzhizhu/QwenZImage.NET` | 用户 |
 | D5 | 启用 `git` 版本控制、写入本计划文件、准备 CI 与 NuGet 发布工作流 | 用户 |
-| D6 | **先本地完成**：本次不 push GitHub、不 publish NuGet | 用户在确认发布节奏时选择「先本地完成（推荐）」 |
+| D6 | **先本地完成**：本次不 push GitHub、不 publish NuGet（**阶段 13 已被后续 D11 覆盖**） | 用户在确认发布节奏时选择「先本地完成（推荐）」 |
 | D7 | 增加一个**跟原版 Go WebUI 类似的 WebUI 项目用于手动测试**，跨平台支持 Windows 与 Linux；仍遵守 D2，用纯 `.NET` / ASP.NET Core 实现 | 用户 |
 | D8 | **发布的 NuGet 包要同时包含 .NET 包与 Windows、Linux 两个平台的 native 包** | 用户 |
 | D9 | 用户反馈「所有模型输出都是噪点图，steps 与原版相同却不正常」。排查确认是 bundled reference backend 不做扩散推理，而非参数问题。曾实现 WebUI 专用 `QZI_ENGINE_URL` HTTP 适配器连上游服务，**后被用户判定方向错误并完全删除**（见 D10） | 用户反馈 + 排查结论 |
 | D10 | **库必须直接绑定 native 后端运行**：用与 `h3.config.json` 相似的配置文件指定模型路径；编译出的 native 后端改用新名称、抛弃 `h3` 命名。用户确认：真实引擎源码**复制进仓库并改名**、命名为 **`QwenZImageNative` + `QwenZImage.config.json`**、上一轮 WebUI HTTP 通道**完全删除** | 用户明确纠正 + 三项选择 |
+| D11 | **开源发布**：整理仓库（只保留源码/文档/配置/脚本/CI，不提交任何构建产物），远程改到 `dongfangzhizhu/QwenZImage.NET` 并推送；NuGet 改用 **Trusted Publishing**（GitHub Actions OIDC → 1 小时短期 API key），不再保存长期 `NUGET_API_KEY` | 用户在阶段 13 前明确指示 |
 
 技术调研结论（决定 D2/D3/D10 的关键事实）：
 
@@ -66,7 +67,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12f 后为 69 项）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
 | 6 | 开源文档：README / LICENSE / THIRD_PARTY_NOTICES / NATIVE_ABI / PARAMETERS / ENGINE_INTEGRATION / WEBUI / 本计划 / 后端模板 | ✅ |
 | 7 | CI 与发布工作流：`ci.yml`、`release.yml`、`scripts/build-native.*` | ✅ |
-| 8 | `git init` + 本地提交 | ✅（不 push） |
+| 8 | `git init` + 本地提交 | ✅（按 D6 当时只做本地，后续由 D11 推送） |
 | 9 | **跨平台 WebUI**（D7）：Minimal API、SSE、`wwwroot` 静态前端、CI 运行时冒烟 | ✅ |
 | 10 | **单包双平台 native**（D8）：RID staging、`csproj` 打包 + 缺失校验、`NativeLibraryLoader` 支持 `NATIVE_DLL_SEARCH_DIRECTORIES` | ✅ |
 | 11 | **噪点根因排查**（D9）：定位到 `qzi_stub.c` 伪随机 RGB + 空转 `dit`；README / WebUI 黄色告警 | ✅；其中 HTTP 适配器方案在 D10 被删除 |
@@ -76,7 +77,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 12d | **真图回归矩阵**（用户指定开发节奏第 1 项）：新增独立 `tools/RealImageRegression` harness（刻意不进 sln / CI，检测并拒绝参考后端），`cases.json` 覆盖 qwen21 turbo/base、LoRA scale 1.0 / 0.6、512 / 1024，以及 Z-Image bf16 与 Nunchaku r32 / r256；逐用例输出 PNG + SHA-256 + phase trace，报告增量落盘；Windows / Linux 运行脚本；10/10 真图通过并人工抽查确认非噪点 | ✅ |
 | 12e | **POSIX ICU 双路径检查接进 CTest**（用户指定节奏第 2 项）：把一次性 `.scratch` 脚本整理成 `native/tests/qzi_posix_unicode_check.c`，CMake 仅在 POSIX 且链接器支持 `--wrap=dlopen` 时构建 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两个可执行，不支持时优雅跳过；宿主无 ICU 时 CTest 记 SKIP；顺带清理真图回归审计发现的 `qzi_engine_backend.c` fp4 不可达死代码与 `checkpoint + 13` 偏移错误 | ✅ |
 | 12f | **消除 `QZI_*` 进程级环境变量多实例串扰**（用户指定节奏第 3 项）：`NativeConfigScope` 只在 `qzi_engine_create()` 期间发布 6 个变量并逆序还原（含构造失败回滚），`QziClient` 用静态锁串行化构造；`QziConfig` 补齐变量名常量；参考后端把 create 时配置指纹混入确定性 PNG；新增 8 项 xUnit（作用域发布/精确还原/未设选项/仅托管变量/失败回滚/双 engine 快照/并发构造隔离/Dispose 幂等）。**审计发现 Windows CRT `getenv()` 看不到 .NET 设置的环境变量**，新增内部 `qzi_getenv()`（Win32 `GetEnvironmentVariableA` / POSIX `getenv`），`qzen_config.c`、`qzi_stub.c` 与 C smoke 统一改用它，修复真实后端与参考后端的配置读取；文档与 PLAN 同步 | ✅ |
-| 13 | **推送 GitHub 开源 + 发布 NuGet** | ⏸ **按 D6 暂缓**，命令见第 5 节 |
+| 13 | **推送 GitHub 开源 + NuGet Trusted Publishing**（D11） | ✅ 仓库整理、地址同步、OIDC 发布工作流已就绪；命令与一次性前置条件见第 5 节 |
 
 本机验证结果（D10 完成度）：
 
@@ -104,7 +105,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 - `dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误；`dotnet test` **54 + 7 = 61** 全绿（原 46 → 新增 15 项：LoRA 名称 / 长度 / finite scale / 双 tier、base guidance finite、配置覆盖链、WebUI 双 tier 映射等）。`QziConfigTests` 关闭并行以免环境变量测试互相干扰。
 - `dotnet pack` 产出 `.nupkg` + `.snupkg`，包内含 `lib/net10.0/*.dll`、两个 RID native、4 份 docs、`engine/LICENSE`；打包前已把 RID staging 从 CUDA flavour 恢复为参考后端（win 106,067 B / linux 34,152 B）。
 - 文档一致性：`PARAMETERS.md`（LoRA 契约、ABI sentinel 归一化表、DiT 重载）、`NATIVE_ABI.md`（`QZI_LORA_NAME_MAX`、归一化与 LoRA 契约）、`ENGINE_INTEGRATION.md`（配置覆盖优先级、真实后端 LoRA 状态机、进程级 `QZI_*` 边界）、`WEBUI.md`（双 tier LoRA、环境变量语义）、README、本计划全部同步。
-- 用户明确「不需要适配 macOS」，阶段 12c 及后续节奏均不含 macOS 平台工作。阶段 13（push / publish）仍按 D6 暂缓。
+- 用户明确「不需要适配 macOS」，阶段 12c 及后续节奏均不含 macOS 平台工作。阶段 13（push / publish）当时仍按 D6 暂缓，后续由 D11 改为执行。
 
 阶段 12d 本机验证结果（本轮新增）：
 
@@ -163,8 +164,8 @@ QwenZImage.NET/
 ├─ tools/RealImageRegression/     真图回归 harness（需 GPU + 权重，不进 sln / CI）
 ├─ docs/                          ABI / 参数 / 引擎接入 / WebUI 文档
 ├─ scripts/                       参考与 CUDA 构建、RID staging、真图回归运行入口
-├─ .github/workflows/             CI（双平台 native + WebUI 冒烟）+ NuGet 发布
-└─ artifacts/                     本地构建产物（git 忽略）
+├─ .github/workflows/             CI（双平台 native + WebUI 冒烟）+ NuGet Trusted Publishing
+└─ artifacts/                     本地构建产物（git 忽略，仅 .gitkeep 空目录占位被跟踪）
     └─ runtimes/<rid>/native/     打包前 stage 的两个 RID native
 ```
 
@@ -180,46 +181,59 @@ README.md / LICENSE / THIRD_PARTY_NOTICES.md / engine/LICENSE / docs/*.md
 
 **NuGet 包默认捆绑参考后端的 Windows / Linux native 库**，不捆绑模型权重。真实 CUDA 构建需按显卡 SM 架构由使用方生成同名库并通过 `QZI_NATIVE_LIBRARY` 覆盖；刻意不把多 GB 权重与特定 GPU 架构塞进包里。
 
-## 5. 阶段 13 发布清单（暂缓执行，供后续一次性完成）
+## 5. 阶段 13 发布清单（D11：Trusted Publishing）
 
-前置条件（当前本机**均不满足**）：已安装并登录 `gh` **或** 配好 git 凭据；`NUGET_API_KEY` 可用；GitHub 上 `alexhegit/QwenZImage.NET` 仓库已创建且有推送权限。
+**仓库**：`https://github.com/dongfangzhizhu/QwenZImage.NET`。`origin` 已从 `alexhegit/...` 切换为此地址；`csproj` 的 `Authors` / `PackageProjectUrl` / `RepositoryUrl`、WebUI 页脚链接、README 与本计划均已同步，SourceLink 因此能生成正确的源码映射。
 
-> 本地仓库**已配置** `origin = https://github.com/alexhegit/QwenZImage.NET.git`（仅配置远程，未推送），这样 SourceLink 能生成正确的源码映射。若目标仓库不同，用 `git remote set-url origin <url>` 修改。
+**发布方式**：NuGet.org **Trusted Publishing**（OIDC 联邦凭据）。`release.yml` 的 `publish` job 以 `permissions.id-token: write` 向 GitHub 申请 OIDC token，`NuGet/login@v1` 用它换取**有效期 1 小时**的短期 API key，再由 `dotnet nuget push` 发布 `.nupkg` / `.snupkg`。一个 OIDC token 只能换一个 key，所以工作流**只登录一次**、紧贴 push 之前，并让两个包共用该 key。仓库**不保存任何长期 `NUGET_API_KEY`**。
+
+一次性前置条件（需在本仓库之外完成，代码无法代替）：
+
+1. **nuget.org** → 登录包所有者账号 → *Trusted Publishing* → 新建 policy（大小写不敏感）：
+   - Repository Owner：`dongfangzhizhu`
+   - Repository：`QwenZImage.NET`
+   - Workflow File：`release.yml`（只填文件名，**不要**带 `.github/workflows/` 前缀）
+   - Environment：留空（本工作流未使用 GitHub Environments）
+   - 私有仓库的 policy 初始有 7 天临时激活期，首次成功发布后转永久。
+2. **GitHub 仓库** → Settings → Secrets and variables → Actions → repository secret `NUGET_USER` = **nuget.org 的 profile 用户名（不是邮箱）**，必须与 policy owner 一致。
+3. 本机已配置 git 推送凭据（或已登录 `gh`），且 GitHub 上目标仓库已创建、有推送权限。
+4. 确认 NuGet.org 上 `QwenZImage.NET` 这个 package ID 可用，policy owner 有权发布它。
+
+> **本地无需 API key**：Trusted Publishing 只能在 GitHub Actions 运行环境里凭 OIDC token 换 key。若确需从本机手动发布，只能另用个人 API key；**推荐一律走 tag 自动发布**，避免密钥散落。
 
 ```bash
-# 13.1 建仓并推送（示例，需自行确认仓库归属）
+# 13.1 切换远程并推送（origin 已存在，必须用 set-url，不能用 remote add）
 cd D:/AI/convert/QwenZImage.NET
+git remote set-url origin https://github.com/dongfangzhizhu/QwenZImage.NET.git
 git remote -v
 git branch -M main
 git push -u origin main
 
 # 13.2 确认 CI 全绿：native job 分别在 Windows / Ubuntu 构建并上传 RID 产物，
 #      verify job 下载两者后 build/test/pack 并校验包内三个运行体，
-#      Linux 还会跑 WebUI 运行时冒烟。release.yml 在 v* tag 上触发，
-#      需要仓库 secret: NUGET_API_KEY。
+#      Linux 还会跑 WebUI 运行时冒烟。CI 不需要 GPU（跑的是参考后端）。
 
-# 13.3 打 tag 触发自动发布
+# 13.3 打 tag 触发自动发布（release.yml 只在 v* tag / 手动 dispatch 上运行）
 git tag -a v0.1.0 -m "QwenZImage.NET 0.1.0"
 git push origin v0.1.0
-
-# 13.4 或者手动发布（先确保两个 RID native 已 stage）
-powershell -File scripts/build-native-all.ps1
-dotnet pack src/QwenZImage.NET/QwenZImage.NET.csproj -c Release -o artifacts/packages
-dotnet nuget push artifacts/packages/QwenZImage.NET.0.1.0.nupkg \
-  --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+#      publish job：pack → 校验包内容 → 校验 NUGET_USER → NuGet/login@v1(OIDC)
+#      → push .nupkg / .snupkg → 创建 GitHub Release 并上传包
 ```
 
 发布前检查：
 
-- [ ] `src/QwenZImage.NET/QwenZImage.NET.csproj` 的 `Version`、`Authors`、`RepositoryUrl` 正确
-- [ ] README 中「当前状态」表格更新为已发布、已推送
+- [ ] `src/QwenZImage.NET/QwenZImage.NET.csproj` 的 `Version`、`Authors`、`RepositoryUrl`、`PackageProjectUrl` 均指向 `dongfangzhizhu/QwenZImage.NET`
+- [ ] README「当前状态」表与「路线与发布」段落已按 Trusted Publishing 更新，无 `alexhegit` 残留
+- [ ] NuGet.org Trusted Publishing policy 的 owner / repo / workflow file / environment 与 `dongfangzhizhu/QwenZImage.NET` + `release.yml` 精确一致
+- [ ] GitHub repository secret `NUGET_USER` 已配置为 nuget.org profile 名；仓库内无 `secrets.NUGET_API_KEY` 依赖
+- [ ] `release.yml` 的 `publish` job 具备 `id-token: write`，且只调用一次 `NuGet/login`（一个 OIDC token 只换一个 key）
+- [ ] `artifacts/` 下所有产物均被 `.gitignore` 忽略；待推送的 tree 只含源码、文档、配置、脚本与 CI 定义
 - [ ] `docs/NATIVE_ABI.md` 与 `AbiGuard` 的版本号一致（v1；`QZI_LORA_NAME_MAX` 只是输入校验常量，不升版本）
 - [ ] LoRA 契约在 `qzi.h` / `qzi.c` / `RequestValidator.cs` / `docs/PARAMETERS.md` / WebUI 五处一致：两个 tier 均可用、≤ 255 字节裸文件名、`lora_scale == 0.0f` sentinel、scale finite 且 `0.05..4`
 - [ ] `QZI_*` 作用域契约在 `NativeConfigScope.Variables` / `qzen_config.c:env_overrides[]` / `qzi_stub.c:config_fingerprint()` 三处变量表一致；native 配置读取统一用 `qzi_getenv()`，不出现裸 `getenv("QZI_...")`
 - [ ] `dotnet pack` 包内包含 `README.md` / `LICENSE` / `THIRD_PARTY_NOTICES.md` / `engine/LICENSE` / `docs/*.md`
 - [ ] 包内同时包含 `lib/net10.0/QwenZImage.NET.dll`、`runtimes/win-x64/native/QwenZImageNative.dll`、`runtimes/linux-x64/native/libQwenZImageNative.so`
 - [ ] `.snupkg` 符号包可上传、SourceLink 指向公开仓库
-- [ ] 仓库 secret `NUGET_API_KEY` 已配置；CI 不需要 GPU（跑的是参考后端）
 - [ ] README 中「默认捆绑 reference native、真实 CUDA 为 fat binary 且由使用方自行构建 / 替换」的说明保持准确
 - [ ] `engine/LICENSE` 与 `THIRD_PARTY_NOTICES.md` 中上游 MIT 版权声明完整
 
@@ -233,3 +247,4 @@ dotnet nuget push artifacts/packages/QwenZImage.NET.0.1.0.nupkg \
 6. **异步语义**：native 调用本质同步长任务，`Generate*Async` 是 `Task.Run` 外壳；高并发行走 `QziGenerationQueue`，不要用多个 `QziClient` 抢同一张 GPU。
 7. **配置通道的平台差异**：`QZI_*` 仍靠进程级环境变量传递（ABI v1 没有这些字段），但已通过作用域发布 + create 时快照消除串扰。Windows 上 **CRT 的 `getenv()` 读不到 .NET 之后设置的值**，所有 native 配置读取必须走 `qzi_getenv()`；自定义 backend 若直接 `getenv("QZI_*")`，在 Windows 上会静默失效。Windows 路径字节沿用进程 ANSI 代码页（与 `fopen` 一致），含非 ASCII 的路径建议写进配置文件。
 8. **进程级 GPU 资源仍未隔离**：`CUDA_VISIBLE_DEVICES`、CUDA 上下文与常驻权重是进程/设备级资源；作用域配置不能让两个 `QziClient` 安全共享同一张卡，仍须按 #6 串行化。彻底的 per-client GPU 隔离需要独立进程，当前不在范围内。
+9. **Trusted Publishing 依赖外部配置**：OIDC 换 key 依赖 nuget.org 上的 policy 与 GitHub 仓库 secret `NUGET_USER`；policy 的 owner / repo / workflow file / environment 必须与 `dongfangzhizhu/QwenZImage.NET` 和 `release.yml` 精确一致，改仓库归属或工作流文件名都要同步更新 policy，否则发布会在 login 步骤失败。仓库内不保存长期密钥，因此本机手动 push 需要另备个人 API key。
