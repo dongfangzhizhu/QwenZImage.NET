@@ -64,7 +64,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 2 | C ABI v1：`qzi.h` / `qzi_backend.h`、`qzi.c` 控制层、参考后端、无依赖 PNG 编码器、CMake、C smoke test | ✅ |
 | 3 | `.NET 10` 封装：Native 层 + 公开模型 / 校验 / 结果 / 客户端；同步 + 异步 + 零拷贝 `WriteTo` | ✅ |
 | 4 | 纯 `.NET` 队列与预设：`Channels` 串行分发、取消、重试、事件流、9 个预设 | ✅ |
-| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12f 后为 69 项）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
+| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12f 后 69 项，阶段 14 后 73 项）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
 | 6 | 开源文档：README / LICENSE / THIRD_PARTY_NOTICES / NATIVE_ABI / PARAMETERS / ENGINE_INTEGRATION / WEBUI / 本计划 / 后端模板 | ✅ |
 | 7 | CI 与发布工作流：`ci.yml`、`release.yml`、`scripts/build-native.*` | ✅ |
 | 8 | `git init` + 本地提交 | ✅（按 D6 当时只做本地，后续由 D11 推送） |
@@ -78,6 +78,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 12e | **POSIX ICU 双路径检查接进 CTest**（用户指定节奏第 2 项）：把一次性 `.scratch` 脚本整理成 `native/tests/qzi_posix_unicode_check.c`，CMake 仅在 POSIX 且链接器支持 `--wrap=dlopen` 时构建 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两个可执行，不支持时优雅跳过；宿主无 ICU 时 CTest 记 SKIP；顺带清理真图回归审计发现的 `qzi_engine_backend.c` fp4 不可达死代码与 `checkpoint + 13` 偏移错误 | ✅ |
 | 12f | **消除 `QZI_*` 进程级环境变量多实例串扰**（用户指定节奏第 3 项）：`NativeConfigScope` 只在 `qzi_engine_create()` 期间发布 6 个变量并逆序还原（含构造失败回滚），`QziClient` 用静态锁串行化构造；`QziConfig` 补齐变量名常量；参考后端把 create 时配置指纹混入确定性 PNG；新增 8 项 xUnit（作用域发布/精确还原/未设选项/仅托管变量/失败回滚/双 engine 快照/并发构造隔离/Dispose 幂等）。**审计发现 Windows CRT `getenv()` 看不到 .NET 设置的环境变量**，新增内部 `qzi_getenv()`（Win32 `GetEnvironmentVariableA` / POSIX `getenv`），`qzen_config.c`、`qzi_stub.c` 与 C smoke 统一改用它，修复真实后端与参考后端的配置读取；文档与 PLAN 同步 | ✅ |
 | 13 | **推送 GitHub 开源 + NuGet Trusted Publishing**（D11） | ✅ 仓库整理、地址同步、OIDC 发布工作流已就绪；命令与一次性前置条件见第 5 节 |
+| 14 | **WebUI 不再默认产出噪点图**（用户反馈「生成图像依然是没有加载模型的无意义图像」）：`NativeLibraryLoader` 显式路径改为 fail-fast（不再静默回退到参考后端）；`WebUiConfig` 自动探测本机 `-cuda` 产物并支持 `QZI_WEBUI_NATIVE=reference` 与 `QZI_REQUIRE_REAL_BACKEND=1`（后者让 WebUI 拒绝生成而不是交付噪点图）；`/api/health` 暴露 `native_library` / `native_library_source`；新增 `start-webui-cuda.ps1` / `.sh` 一键启动；修正页面横幅与 README / WEBUI.md 的误导性指引；新增 4 项选择逻辑测试 | ✅ |
 
 本机验证结果（D10 完成度）：
 
@@ -142,6 +143,14 @@ Your app (.NET 10)                     Browser (manual testing only)
 - **本机验证**：`git diff --check` 干净；`dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误（5 项目）；`dotnet test` **62 + 7 = 69** 全绿；Windows 参考后端 `ctest` **1/1**；`dotnet pack` 产出 16 项 `.nupkg` 与 5 项 `.snupkg`，nuspec 的 `<authors>` / `<projectUrl>` / `<repository url>` 均已指向 `dongfangzhizhu/QwenZImage.NET`；`release.yml` 经 YAML 解析确认权限块与 login 步骤正确。
 - **尚未执行 tag 发布**：首次实际发布仍需用户在 nuget.org 建 Trusted Publishing policy、在 GitHub 设 `NUGET_USER` secret（见第 5 节），之后推 `v*` tag 触发；刻意不在策略缺失时打 tag，避免触发必然失败的发布工作流。
 
+阶段 14 本机验证结果（本轮新增）：
+
+- **根因定位**：本机 RTX 4090（SM 8.9 / 24 GB）与 22,184,960 B 的 CUDA fat binary 均可用，模型权重目录齐全。`artifacts/runtimes/win-x64/native/QwenZImageNative.dll` 却是 106,637 B 的参考后端——阶段 12f 与阶段 13 为跑无 GPU 测试 / 保持 NuGet 默认包而执行 `stage-native` 时把 CUDA 产物换回去了；WebUI 的 csproj 正是从该目录复制 native。三个叠加原因：构建 CUDA 只是产出到 `artifacts/native/*-cuda/` 而**未选中**、staging 被后续流程**覆盖回参考库**、显式路径加载失败时 loader **静默回退**到 stub。页面横幅与 README 当时只说「构建 CUDA 后端」，没说必须选中，导致反复复发。
+- **修复后默认启动实测**：不带 `QZI_NATIVE_LIBRARY` / `QZI_WEBUI_NATIVE` / `QZI_CONFIG` 直接 `dotnet run`，`/api/health` 返回 `ok=true`、`native_library` = `artifacts/native/Windows-AMD64-cuda/QwenZImageNative.dll`、`native_library_source` = `local CUDA build (auto-detected)`、`engine.reference_backend` = **false**。提交 qwen21 turbo / 512² / seed 42，phase 为 `ModelLoad → Text → Dit → Vae → Encode`，116.4 s 后产出 **787,072 B** PNG（与显式设置 `QZI_NATIVE_LIBRARY` 时字节级一致），目视确认为清晰雪地红狐，无噪点。
+- **fail-fast 实测**：`QZI_NATIVE_LIBRARY` 指向不存在的路径时，`/api/health` 为 `ok=false` 且错误为 `DllNotFoundException`（含完整路径与「未替换参考后端」说明），`POST /api/jobs` 返回 **503**，不再生成噪点图。
+- **拒绝噪点实测**：`QZI_WEBUI_NATIVE=reference` + `QZI_REQUIRE_REAL_BACKEND=1` 时 health 为 `ok=false` 并说明原因，`POST /api/jobs` 同样 **503**。
+- `git diff --check` 干净；`dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误（5 项目）；`dotnet test` **62 + 11 = 73** 全绿（新增 4 项：自动探测 / 显式优先 / 强制 reference / 拒绝噪点开关）。RID staging 仍保持参考后端，NuGet 包内容与 CI 的 GPU-free 假设未被改动。
+
 ## 4. 交付物清单
 
 ```
@@ -166,12 +175,12 @@ QwenZImage.NET/
 │   ├─ Configuration/QziConfig.cs         配置文件加载器
 │   └─ Configuration/NativeConfigScope.cs  QZI_* 作用域发布 / 还原
 ├─ src/QwenZImage.NET.WebUI/      跨平台手动测试 WebUI（不打包）
-├─ tests/                         69 个 xUnit 测试（62 库 + 7 WebUI）
+├─ tests/                         73 个 xUnit 测试（62 库 + 11 WebUI）
 ├─ samples/                       端到端示例
 ├─ integration/                   自定义 qzi_backend 模板
 ├─ tools/RealImageRegression/     真图回归 harness（需 GPU + 权重，不进 sln / CI）
 ├─ docs/                          ABI / 参数 / 引擎接入 / WebUI 文档
-├─ scripts/                       参考与 CUDA 构建、RID staging、真图回归运行入口
+├─ scripts/                       参考与 CUDA 构建、RID staging、真图回归、一键真后端 WebUI 启动
 ├─ .github/workflows/             CI（双平台 native + WebUI 冒烟）+ NuGet Trusted Publishing
 └─ artifacts/                     本地构建产物（git 忽略，仅 .gitkeep 空目录占位被跟踪）
     └─ runtimes/<rid>/native/     打包前 stage 的两个 RID native

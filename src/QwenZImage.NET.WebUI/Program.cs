@@ -117,6 +117,8 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         model_dir = rt.Config.ModelDirectory,
         transport = "native-pinvoke",
         config_path = rt.Config.ConfigPath,
+        native_library = rt.Engine?.NativeLibraryPath,
+        native_library_source = rt.Config.NativeLibrarySource,
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
     });

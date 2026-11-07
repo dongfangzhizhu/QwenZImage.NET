@@ -22,6 +22,16 @@ public sealed class WebUiConfig
     /// <summary>Primary model pack directory, for the health endpoint.</summary>
     public string ModelDirectory => ClientOptions.Qwen21Directory ?? "";
 
+    /// <summary>How the native backend was selected, surfaced by /api/health.</summary>
+    public string NativeLibrarySource { get; init; } = "bundled reference runtime";
+
+    /// <summary>
+    /// When true, the app refuses to serve generation jobs with the
+    /// deterministic noise backend instead of silently returning meaningless
+    /// images. Set by the one-click CUDA launcher scripts.
+    /// </summary>
+    public bool RequireRealBackend { get; init; }
+
     public static WebUiConfig FromEnvironment(string contentRoot, string[] args)
     {
         string output = Environment.GetEnvironmentVariable("QZI_WEBUI_OUTPUT") ?? "";
@@ -29,6 +39,10 @@ public sealed class WebUiConfig
         string? model = NullIfBlank(Environment.GetEnvironmentVariable("QZI_MODEL_DIR"));
         string? cache = NullIfBlank(Environment.GetEnvironmentVariable("QZI_MODEL_CACHE"));
         string? native = NullIfBlank(Environment.GetEnvironmentVariable("QZI_NATIVE_LIBRARY"));
+        string? nativePreference = NullIfBlank(Environment.GetEnvironmentVariable("QZI_WEBUI_NATIVE"));
+        bool requireReal = string.Equals(
+            NullIfBlank(Environment.GetEnvironmentVariable("QZI_REQUIRE_REAL_BACKEND")),
+            "1", StringComparison.Ordinal);
         string? configPath = NullIfBlank(Environment.GetEnvironmentVariable(QziConfig.EnvironmentVariable));
 
         int? device = null;
@@ -43,6 +57,37 @@ public sealed class WebUiConfig
                 configPath = args[i + 1];
             else if (string.Equals(args[i], "--models", StringComparison.Ordinal))
                 model = args[i + 1];
+        }
+
+        // Resolve the native backend. Priority:
+        //   1. QZI_NATIVE_LIBRARY (explicit; NativeLibraryLoader fails fast)
+        //   2. QZI_WEBUI_NATIVE=<path>, or "reference" to force the stub
+        //   3. a locally built -cuda artefact (development checkout only)
+        //   4. the bundled reference runtime (CI / NuGet / GPU-free hosts)
+        // Step 3 is what makes `dotnet run` produce real images on a machine
+        // that has built the CUDA engine, regardless of which flavour was most
+        // recently staged into artifacts/runtimes/<rid>/native for packaging.
+        string nativeSource;
+        if (!string.IsNullOrWhiteSpace(native))
+        {
+            nativeSource = "QZI_NATIVE_LIBRARY";
+        }
+        else if (string.Equals(nativePreference, "reference", StringComparison.OrdinalIgnoreCase))
+        {
+            nativeSource = "bundled reference runtime (QZI_WEBUI_NATIVE=reference)";
+        }
+        else if (!string.IsNullOrWhiteSpace(nativePreference) &&
+                 !string.Equals(nativePreference, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            native = nativePreference;
+            nativeSource = "QZI_WEBUI_NATIVE";
+        }
+        else
+        {
+            native = FindCudaNative(contentRoot);
+            nativeSource = native is null
+                ? "bundled reference runtime (no local CUDA build found)"
+                : "local CUDA build (auto-detected)";
         }
 
         QziClientOptions baseline = QziClientOptions.FromConfig(configPath);
@@ -64,8 +109,39 @@ public sealed class WebUiConfig
             Urls = string.IsNullOrWhiteSpace(urls) ? "http://127.0.0.1:7860" : urls,
             OutputDirectory = string.IsNullOrWhiteSpace(output)
                 ? Path.Combine(contentRoot, "outputs") : output,
-            ClientOptions = options
+            ClientOptions = options,
+            NativeLibrarySource = nativeSource,
+            RequireRealBackend = requireReal
         };
+    }
+
+    /// <summary>
+    /// Looks for a real `-cuda` build in the development checkout. The NuGet
+    /// package and CI never contain such a directory, so those hosts keep the
+    /// bundled reference backend unchanged. Searching up from the WebUI's
+    /// content root (rather than AppContext.BaseDirectory) keeps unit tests
+    /// running from a temp directory out of this path entirely.
+    /// </summary>
+    private static string? FindCudaNative(string contentRoot)
+    {
+        string name = OperatingSystem.IsWindows() ? "QwenZImageNative.dll"
+                    : OperatingSystem.IsMacOS() ? "libQwenZImageNative.dylib"
+                    : "libQwenZImageNative.so";
+
+        DirectoryInfo? dir = new(Path.GetFullPath(contentRoot));
+        for (int i = 0; i < 8 && dir is not null; i++, dir = dir.Parent)
+        {
+            string tree = Path.Combine(dir.FullName, "artifacts", "native");
+            if (!Directory.Exists(tree)) continue;
+            foreach (string platform in Directory.EnumerateDirectories(tree))
+            {
+                if (!Path.GetFileName(platform).EndsWith("-cuda",
+                        StringComparison.OrdinalIgnoreCase)) continue;
+                string candidate = Path.Combine(platform, name);
+                if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+            }
+        }
+        return null;
     }
 
     private static string? NullIfBlank(string? value)
@@ -90,12 +166,28 @@ public sealed class WebUiRuntime : IDisposable
 
         try
         {
-            Engine = new WebUiEngine(config.ClientOptions);
-            Queue = new QziGenerationQueue(Engine, async (job, result, token) =>
+            WebUiEngine engine = new(config.ClientOptions);
+            if (config.RequireRealBackend && engine.GetHealth().IsReferenceBackend)
             {
-                string name = await Outputs.SaveAsync(job.Id, result, token);
-                _outputNames[job.Id] = name;
-            });
+                // Never let a caller who explicitly asked for real inference
+                // receive deterministic noise. /api/health reports ok=false and
+                // /api/jobs returns 503 until the backend is fixed.
+                engine.Dispose();
+                InitError =
+                    "QZI_REQUIRE_REAL_BACKEND=1 but the deterministic reference " +
+                    "backend is loaded: it emits noise, not model output. Point " +
+                    "QZI_NATIVE_LIBRARY at a -cuda build (or run " +
+                    "scripts/start-webui-cuda.ps1 / .sh).";
+            }
+            else
+            {
+                Engine = engine;
+                Queue = new QziGenerationQueue(Engine, async (job, result, token) =>
+                {
+                    string name = await Outputs.SaveAsync(job.Id, result, token);
+                    _outputNames[job.Id] = name;
+                });
+            }
         }
         catch (Exception ex)
         {

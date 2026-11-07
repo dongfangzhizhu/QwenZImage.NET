@@ -34,6 +34,9 @@ public sealed class WebUiEngine : IQziExecutor, IDisposable
 
     public WebUiEngine(QziClientOptions options) => _client = new QziClient(options);
 
+    /// <summary>Native library actually loaded, for /api/health diagnostics.</summary>
+    public string? NativeLibraryPath => _client.NativeLibraryPath;
+
     public GenerationResult Generate(GenerationOptions options,
                                      IProgress<GenerationProgress>? progress = null,
                                      CancellationToken cancellationToken = default)

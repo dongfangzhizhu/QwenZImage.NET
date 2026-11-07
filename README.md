@@ -112,7 +112,20 @@ dotnet run --project samples/QwenZImage.NET.Sample -c Release
 dotnet run --project src/QwenZImage.NET.WebUI -c Release
 ```
 
-想让库 / WebUI 用真实后端，把 native 库指向真实构建即可（**托管程序集与 API 完全不用改**）：
+> ⚠️ **上面第 4 步默认是噪点后端**（GPU-free 的参考实现，不加载模型）。要生成真实图像，必须构建并**选中** CUDA 后端——只构建是不够的：两者同名但落在不同的 `artifacts/native` 子目录，且为跑无 GPU 测试 / 打包而执行的 `stage-native.ps1` 会把 `artifacts/runtimes/<rid>/native/` 换回参考库。
+
+```powershell
+scripts\build-native-cuda.bat 89       # 只需构建一次（89 = RTX 4090）
+.\scripts\start-webui-cuda.ps1          # 以后每次启动用这个
+```
+```bash
+bash scripts/build-native-cuda.sh 89
+bash scripts/start-webui-cuda.sh
+```
+
+启动脚本会设 `QZI_NATIVE_LIBRARY` 指向 `-cuda` 产物，并开启 `QZI_REQUIRE_REAL_BACKEND=1`：若加载到的仍是参考后端，WebUI 直接拒绝生成任务（HTTP 503），不会再用噪点图冒充结果。在开发检出目录里只要存在 `artifacts/native/*-cuda/` 产物，直接 `dotnet run` 也会自动选中它；`QZI_WEBUI_NATIVE=reference` 可强制回参考后端做无 GPU 冒烟。`/api/health` 的 `native_library` / `native_library_source` 会显示实际加载的文件与选择依据。详见 [docs/WEBUI.md](docs/WEBUI.md)。
+
+手动指定也可以（托管程序集与 API 完全不用改）；显式路径现在是权威的，加载失败会直接报错而**不会**静默退回噪点后端：
 
 ```bash
 export QZI_NATIVE_LIBRARY=/path/to/artifacts/native/Linux-x86_64-cuda/libQwenZImageNative.so
@@ -130,7 +143,7 @@ scripts/build-native-cuda.bat                # Windows 真实后端（默认 fat
 bash scripts/build-native-cuda.sh            # Linux 真实后端（同上）
 ```
 
-> 参考构建与 CUDA 构建输出到不同的 `artifacts/native` 子目录，避免互相覆盖；`QZI_STAGE_CUDA=1` 才把 CUDA 产物 stage 进 `artifacts/runtimes/<rid>/native/`。
+> 参考构建与 CUDA 构建输出到不同的 `artifacts/native` 子目录，避免互相覆盖；`QZI_STAGE_CUDA=1` 才把 CUDA 产物 stage 进 `artifacts/runtimes/<rid>/native/`。**stage 只影响 NuGet 包内容，不影响运行时选择**：默认打包形态必须保持 GPU-free，所以运行真图请用 `start-webui-cuda.*` 或 `QZI_NATIVE_LIBRARY`。
 
 ## 在 .NET 项目里使用
 
@@ -201,7 +214,7 @@ QZI_WEBUI_URLS=http://127.0.0.1:51234 dotnet run --project src/QwenZImage.NET.We
 dotnet run --project src/QwenZImage.NET.WebUI -c Release -- --config /path/to/QwenZImage.config.json
 ```
 
-主要端点：`GET /api/health`、`GET /api/presets`、`POST|GET /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel|/retry`、`GET /api/events`（SSE）、`GET|DELETE /api/outputs`、`POST /api/outputs/restore`、`GET|POST /api/unload`。可用环境变量：`QZI_CONFIG`、`QZI_WEBUI_URLS`、`QZI_WEBUI_OUTPUT`、`QZI_MODEL_DIR`、`QZI_MODEL_CACHE`、`QZI_NATIVE_LIBRARY`、`QZI_DEVICE_ID`。完整说明见 [docs/WEBUI.md](docs/WEBUI.md)。
+主要端点：`GET /api/health`、`GET /api/presets`、`POST|GET /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel|/retry`、`GET /api/events`（SSE）、`GET|DELETE /api/outputs`、`POST /api/outputs/restore`、`GET|POST /api/unload`。可用环境变量：`QZI_CONFIG`、`QZI_WEBUI_URLS`、`QZI_WEBUI_OUTPUT`、`QZI_MODEL_DIR`、`QZI_MODEL_CACHE`、`QZI_NATIVE_LIBRARY`、`QZI_WEBUI_NATIVE`、`QZI_REQUIRE_REAL_BACKEND`、`QZI_DEVICE_ID`。完整说明见 [docs/WEBUI.md](docs/WEBUI.md)。
 
 > WebUI 是**手动测试工具**，不打进 NuGet 包。`/api/health` 的 `transport` 恒为 `native-pinvoke`，并返回 `config_path` 与 `engine.reference_backend`。当加载到参考后端时页面显示黄色噪点告警横幅；换成 CUDA 构建后横幅消失。
 
@@ -305,7 +318,7 @@ dotnet test QwenZImage.NET.sln -c Release               # 托管测试
 
 Linux 上 `ctest` 另有 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两项，验证 POSIX ICU 兼容层的两条运行时路径：前者 `dlopen` 命中宿主 ICU 并把 `e + U+0301` 组合成 `é`，后者用 `-Wl,--wrap=dlopen` 强制「无 ICU」走内置回退（恒等 NFC）。二者共同覆盖字符分类、空白判断、含 4 字节代理对的 UTF-8 ↔ UTF-16 round-trip 与非法 UTF-8 报错。因为 `qzen_posix_unicode.c` 用 `pthread_once` 只解析一次 ICU，两条路径由两个独立可执行分担；链接器不支持 `--wrap` 时 configure 会优雅跳过该变体，宿主无 ICU 时对应测试记为 SKIP。这两项**不需要 CUDA**，GPU-less 的 Linux CI 在 reference 构建里就会跑。
 
-托管测试共 **69 项**（62 库 + 7 WebUI）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射，以及 `QZI_*` 作用域发布 / 还原、构造失败回滚、多 engine 配置快照与并发构造隔离。全部不需要 GPU、权重或网络监听。
+托管测试共 **73 项**（62 库 + 11 WebUI）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射、`QZI_*` 作用域发布 / 还原、构造失败回滚、多 engine 配置快照与并发构造隔离，以及 native 后端选择（自动探测 CUDA / 显式路径优先 / 强制 reference / 拒绝噪点开关）。全部不需要 GPU、权重或网络监听。
 
 CI 另做 WebUI Linux 运行时冒烟：启动 Kestrel → 验证 `/api/health` 的 `ok=true` / `transport=native-pinvoke` / `config_path` → 检查 presets → 提交 zimage job → 轮询到完成 → 确认输出出现在 `/api/outputs`。
 

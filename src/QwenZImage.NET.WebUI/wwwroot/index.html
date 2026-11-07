@@ -23,13 +23,20 @@
 
 <div id="backend-banner" class="banner" hidden>
   <strong>Reference backend — not real inference.</strong>
-  The bundled <code>QwenZImageNative.dll</code> / <code>libQwenZImageNative.so</code> is a deterministic
-  test implementation: it emits pseudo-random pixels (noise), and steps / seed /
-  guidance only drive the progress bar — no diffusion happens at all.
-  <strong>To get real images:</strong> build the native backend with
-  <code>-DQZI_WITH_CUDA_ENGINE=ON</code> and point <code>QwenZImage.config.json</code>
-  at your model packs. The managed library P/Invokes that backend directly;
-  there is no separate server to start. See
+  The loaded native library is the deterministic test implementation: it emits
+  pseudo-random pixels (noise). Steps / seed / guidance only drive the progress
+  bar — no model is loaded and no diffusion happens.
+  <strong>To get real images you must do two things:</strong>
+  (1) build the CUDA engine with <code>scripts\build-native-cuda.bat</code> /
+  <code>scripts/build-native-cuda.sh</code>, and (2) <em>select</em> that build —
+  building alone is not enough, because the app loads the bundled reference
+  library by default. Set
+  <code>QZI_NATIVE_LIBRARY=&lt;repo&gt;/artifacts/native/Windows-AMD64-cuda/QwenZImageNative.dll</code>
+  (Linux: <code>Linux-x86_64-cuda/libQwenZImageNative.so</code>) and point
+  <code>QwenZImage.config.json</code> at your model packs.
+  <strong>Easiest:</strong> run <code>scripts/start-webui-cuda.ps1</code> /
+  <code>scripts/start-webui-cuda.sh</code> — it selects the CUDA build and
+  refuses to serve generation jobs if the noise backend is still loaded. See
   <a href="https://github.com/dongfangzhizhu/QwenZImage.NET" target="_blank" rel="noopener">docs/WEBUI.md</a>.
 </div>
 

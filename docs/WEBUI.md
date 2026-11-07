@@ -37,6 +37,11 @@ Prerequisites: .NET 10 SDK and a built native library (see the root README).
 On Windows the library is `QwenZImageNative.dll`, on Linux
 `libQwenZImageNative.so`.
 
+> **The commands below start the noise backend.** They are for GPU-free UI and
+> API testing only. To generate real images, see
+> [Real images: select the CUDA backend](#real-images-select-the-cuda-backend)
+> — a CUDA build has to be *selected*, not just built.
+
 ```bash
 # Windows (PowerShell) — reference backend, no GPU needed
 .\scripts\build-native.ps1
@@ -76,18 +81,65 @@ do.
 > Binding to a non-loopback address exposes the console to your network. It is
 > intended for local manual testing; there is no authentication.
 
-## Real images: build the real native backend
+## Real images: select the CUDA backend
 
 The **default** native build (`QZI_WITH_CUDA_ENGINE=OFF`) links
 `native/src/qzi_stub.c`, a deterministic reference backend: its `make_rgb()`
 writes pseudo-random pixels and its `dit` loop only advances a progress bar.
 **Matching the `steps` of the original Go version cannot fix that** — no
-diffusion happens at all. The yellow banner in the UI says so explicitly, and
-the health pill reads `reference backend (noise)`.
+diffusion happens at all. The yellow banner in the UI says so explicitly, the
+health pill reads `reference backend (noise)`, and `/api/health` returns
+`engine.reference_backend: true`.
 
-To get real images, rebuild the **same library name** with the vendored C/CUDA
-engine linked in. The managed assembly, the WebUI and every API call stay
-unchanged:
+### One command (recommended)
+
+```powershell
+.\scripts\start-webui-cuda.ps1          # Windows
+```
+```bash
+bash scripts/start-webui-cuda.sh        # Linux
+```
+
+The script points `QZI_NATIVE_LIBRARY` at the `-cuda` artefact and sets
+`QZI_REQUIRE_REAL_BACKEND=1`, so the WebUI reports `ok=false` / returns HTTP
+503 instead of ever serving a noise image. It deliberately does **not** write
+into `artifacts/runtimes/<rid>/native/` — that tree is what `dotnet pack` puts
+into the NuGet package and must stay GPU-free.
+
+### Why a CUDA build alone is not enough
+
+Three separate things can leave you looking at noise on a machine that already
+has a perfectly working CUDA build:
+
+1. **Not selected.** The real build lands in
+   `artifacts/native/Windows-AMD64-cuda/` (Linux: `Linux-x86_64-cuda/`), while
+   the app loads the bundled `QwenZImageNative.dll` by default. Building is
+   step 1; selecting with `QZI_NATIVE_LIBRARY` is step 2.
+2. **Staging was reverted.** `scripts/build-native-cuda.bat` stages the CUDA
+   library into `artifacts/runtimes/<rid>/native/`, but running
+   `scripts/stage-native.ps1` / `.sh` afterwards — which the GPU-free test and
+   `dotnet pack` workflow does — restores the ~100 KB reference library there.
+   The WebUI project copies native libraries from that directory, so plain
+   `dotnet run` silently goes back to noise. This is exactly why the launcher
+   sets `QZI_NATIVE_LIBRARY` rather than relying on staging.
+3. **Load failed silently.** Previously a missing dependency (cuBLAS / cudart /
+   OpenMP) made the loader fall through to the bundled stub. An explicitly
+   selected library is now authoritative: a missing or unloadable file throws
+   `DllNotFoundException` naming the path and the dependency hint. No image is
+   produced at all instead of a plausible-looking noise image.
+
+The WebUI also **auto-detects** a local `-cuda` build when
+`QZI_NATIVE_LIBRARY` is unset, so plain
+`dotnet run --project src/QwenZImage.NET.WebUI -c Release` on a development
+checkout that has built the CUDA engine now produces real images. CI and NuGet
+consumers have no `artifacts/native/*-cuda/` tree and keep the reference
+backend. Set `QZI_WEBUI_NATIVE=reference` to force the stub for a GPU-free
+smoke test.
+
+### Build and select manually
+
+Rebuild the **same library name** with the vendored C/CUDA engine linked in.
+The managed assembly, the WebUI and every API call stay unchanged:
 
 ```bash
 # Windows — script loads vcvars64 automatically; argument is the CUDA SM arch
@@ -120,14 +172,18 @@ weights. See [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md) for the full
 configuration contract and the real backend's call chain.
 
 `/api/health` then reports `transport: "native-pinvoke"`,
-`engine.backend: "QwenZImageNative"` and `engine.reference_backend: false`;
-the yellow banner disappears. Every other feature (presets, serial queue,
-cancel, retry, SSE progress, gallery, trash, unload) is unchanged.
+`engine.backend: "QwenZImageNative"`, `engine.reference_backend: false`, plus
+`native_library` (the exact file loaded) and `native_library_source` (how it
+was chosen). The yellow banner disappears. Every other feature (presets,
+serial queue, cancel, retry, SSE progress, gallery, trash, unload) is
+unchanged.
 
-> The reference and CUDA builds produce **the same file name** into different
-> `artifacts/native` subdirectories (`...-cuda` for the real one). If the UI
-> still shows noise after a CUDA build, check that `QZI_NATIVE_LIBRARY` points
-> at the `-cuda` artefact (or that `QZI_STAGE_CUDA=1` staged it).
+> **Still seeing noise?** Check `/api/health` first. If
+> `engine.reference_backend: true`, read `native_library_source`: it tells you
+> whether the stub was chosen because no `-cuda` build was found, because it
+> was explicitly forced, or because staging reverted. `QZI_STAGE_CUDA=1` is
+> only about what gets packed into the NuGet package — it does not select the
+> backend at runtime.
 
 ### Environment variables and switches
 
@@ -142,7 +198,9 @@ cancel, retry, SSE progress, gallery, trash, unload) is unchanged.
 | `QZI_QWEN21_DIR` / `QZI_ZIMAGE_DIR` | from config | Per-model directory overrides |
 | `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_QWEN21_LORA_DIR` | from config | Pack directories for LoRA / Nunchaku weights. Read by both `QziConfig` and the native config loader; code-level `QziClientOptions` values are scoped through these variables during engine creation so the engine sees them |
 | `QZI_MODEL_CACHE` | from config | Text-encoder cache directory |
-| `QZI_NATIVE_LIBRARY` | auto-probe | Full path to `QwenZImageNative.dll` / `libQwenZImageNative.so` |
+| `QZI_NATIVE_LIBRARY` | auto-probe | Full path to `QwenZImageNative.dll` / `libQwenZImageNative.so`. When set, it is authoritative — a missing/unloadable file is an error, never a silent fallback to the reference build |
+| `QZI_WEBUI_NATIVE` | `auto` | `auto` (detect a local `-cuda` build), `reference` (force the bundled stub), or an explicit library path |
+| `QZI_REQUIRE_REAL_BACKEND` | unset | `1` makes the WebUI refuse generation jobs (HTTP 503, `ok=false`) when the reference backend is loaded; set by the one-click launcher scripts |
 | `QZI_DEVICE_ID` | `-1` | CUDA device selector passed to the native backend |
 | `device_id` / `thread_count` (config keys) | `-1` / `0` | Auto device / thread count; only in the config file, no env override |
 

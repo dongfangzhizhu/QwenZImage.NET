@@ -104,4 +104,98 @@ public class WebUiConfigTests : IDisposable
         Assert.Equal("unknown", health.Backend);
         Assert.False(health.IsReferenceBackend);
     }
+
+    // ------------------------------------------------ native backend selection
+
+    [Fact]
+    public void Auto_Detects_A_Local_Cuda_Build()
+    {
+        string expected = MakeFakeCudaBuild();
+        using EnvSnapshot env = new("QZI_NATIVE_LIBRARY", "QZI_WEBUI_NATIVE",
+                                    "QZI_REQUIRE_REAL_BACKEND");
+        env.Clear();
+
+        WebUiConfig config = WebUiConfig.FromEnvironment(_dir, ["--config", _configPath]);
+
+        Assert.Equal(Path.GetFullPath(expected), config.ClientOptions.NativeLibraryPath);
+        Assert.Contains("CUDA", config.NativeLibrarySource);
+        Assert.False(config.RequireRealBackend);
+    }
+
+    [Fact]
+    public void Explicit_Native_Library_Wins_Over_Auto_Detection()
+    {
+        MakeFakeCudaBuild();
+        using EnvSnapshot env = new("QZI_NATIVE_LIBRARY", "QZI_WEBUI_NATIVE",
+                                    "QZI_REQUIRE_REAL_BACKEND");
+        env.Clear();
+        Environment.SetEnvironmentVariable("QZI_NATIVE_LIBRARY", "/explicit/QwenZImageNative.dll");
+
+        WebUiConfig config = WebUiConfig.FromEnvironment(_dir, ["--config", _configPath]);
+
+        Assert.Equal("/explicit/QwenZImageNative.dll", config.ClientOptions.NativeLibraryPath);
+        Assert.Equal("QZI_NATIVE_LIBRARY", config.NativeLibrarySource);
+    }
+
+    [Fact]
+    public void Reference_Preference_Forces_The_Bundled_Stub()
+    {
+        MakeFakeCudaBuild();
+        using EnvSnapshot env = new("QZI_NATIVE_LIBRARY", "QZI_WEBUI_NATIVE",
+                                    "QZI_REQUIRE_REAL_BACKEND");
+        env.Clear();
+        Environment.SetEnvironmentVariable("QZI_WEBUI_NATIVE", "reference");
+
+        WebUiConfig config = WebUiConfig.FromEnvironment(_dir, ["--config", _configPath]);
+
+        Assert.Null(config.ClientOptions.NativeLibraryPath);
+        Assert.Contains("reference", config.NativeLibrarySource);
+    }
+
+    [Fact]
+    public void Require_Real_Backend_Is_Read_From_The_Environment()
+    {
+        using EnvSnapshot env = new("QZI_NATIVE_LIBRARY", "QZI_WEBUI_NATIVE",
+                                    "QZI_REQUIRE_REAL_BACKEND");
+        env.Clear();
+        Environment.SetEnvironmentVariable("QZI_REQUIRE_REAL_BACKEND", "1");
+
+        WebUiConfig config = WebUiConfig.FromEnvironment(_dir, ["--config", _configPath]);
+
+        Assert.True(config.RequireRealBackend);
+    }
+
+    private string MakeFakeCudaBuild()
+    {
+        string name = OperatingSystem.IsWindows() ? "QwenZImageNative.dll"
+                    : OperatingSystem.IsMacOS() ? "libQwenZImageNative.dylib"
+                    : "libQwenZImageNative.so";
+        string directory = Path.Combine(_dir, "artifacts", "native", "Test-AMD64-cuda");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, name);
+        File.WriteAllText(path, "");
+        return path;
+    }
+
+    /// <summary>Restores process-level variables the config resolver reads.</summary>
+    private sealed class EnvSnapshot : IDisposable
+    {
+        private readonly Dictionary<string, string?> _saved = [];
+
+        public EnvSnapshot(params string[] names)
+        {
+            foreach (string name in names) _saved[name] = Environment.GetEnvironmentVariable(name);
+        }
+
+        public void Clear()
+        {
+            foreach (string name in _saved.Keys) Environment.SetEnvironmentVariable(name, null);
+        }
+
+        public void Dispose()
+        {
+            foreach ((string name, string? value) in _saved)
+                Environment.SetEnvironmentVariable(name, value);
+        }
+    }
 }

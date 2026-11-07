@@ -53,6 +53,8 @@ async function refreshHealth() {
         `config: ${h.config_path || "(defaults)"}`,
         `out_dir: ${h.out_dir}`,
         `model_dir: ${h.model_dir}`,
+        `native: ${h.native_library || "(runtime default probe)"}`,
+        `native_source: ${h.native_library_source || "unknown"}`,
         `served: ${h.engine?.served ?? 0}`,
       ].join("\n");
       $("backend-banner").hidden = !reference;

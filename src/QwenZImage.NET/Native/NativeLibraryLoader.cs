@@ -8,7 +8,12 @@ namespace QwenZImage.NET.Native;
 /// native backend implementing the qzi C ABI. The NuGet package bundles the
 /// reference build for win-x64 and linux-x64; a CUDA build of the same ABI is
 /// selected by <c>QZI_NATIVE_LIBRARY</c> or by replacing the bundled file.
-/// Resolution order:
+/// When a caller explicitly selects a library via
+/// <c>QziClientOptions.NativeLibraryPath</c> / <c>QZI_NATIVE_LIBRARY</c>, that
+/// path is authoritative: a missing or unloadable library raises
+/// <see cref="DllNotFoundException"/> instead of silently falling back to the
+/// bundled reference backend (which would emit noise while appearing healthy).
+/// Otherwise the resolution order is:
 /// <list type="number">
 ///   <item><c>QziClientOptions.NativeLibraryPath</c> / <c>QZI_NATIVE_LIBRARY</c></item>
 ///   <item>next to the managed assembly, including <c>runtimes/&lt;rid&gt;/native/</c></item>
@@ -47,6 +52,40 @@ internal static class NativeLibraryLoader
         if (!string.Equals(libraryName, NativeMethods.LibraryName, StringComparison.Ordinal))
             return IntPtr.Zero;
 
+        // An explicitly requested backend must NEVER fall back to the bundled
+        // reference build. Falling back is silent from the caller's point of
+        // view: the process looks healthy, but every generated image is noise
+        // because no model was ever loaded. Fail loudly instead.
+        string? explicitPath = _explicitPath;
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+        {
+            string full = Path.GetFullPath(explicitPath);
+            if (!File.Exists(full))
+            {
+                throw new DllNotFoundException(
+                    $"The explicitly selected native library does not exist: {full}. " +
+                    "Check QZI_NATIVE_LIBRARY / QziClientOptions.NativeLibraryPath. " +
+                    "The reference backend was NOT substituted, because that would " +
+                    "silently produce noise instead of real images.");
+            }
+
+            try
+            {
+                IntPtr handle = NativeLibrary.Load(full);
+                _resolvedPath = full;
+                return handle;
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or BadImageFormatException)
+            {
+                throw new DllNotFoundException(
+                    $"Could not load the explicitly selected native library '{full}': " +
+                    $"{ex.Message} Verify the CUDA runtime (cublas / cudart / OpenMP) is on " +
+                    "PATH and that the library matches this OS and architecture. " +
+                    "The reference backend was NOT substituted, because that would " +
+                    "silently produce noise instead of real images.", ex);
+            }
+        }
+
         foreach (string candidate in Candidates())
         {
             if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out IntPtr handle))
@@ -60,9 +99,6 @@ internal static class NativeLibraryLoader
 
     private static IEnumerable<string> Candidates()
     {
-        if (!string.IsNullOrWhiteSpace(_explicitPath))
-            yield return _explicitPath!;
-
         string name = OperatingSystem.IsWindows() ? "QwenZImageNative.dll"
                     : OperatingSystem.IsMacOS() ? "libQwenZImageNative.dylib"
                     : "libQwenZImageNative.so";
