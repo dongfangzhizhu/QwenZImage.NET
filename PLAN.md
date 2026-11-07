@@ -73,6 +73,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 12 | **D10 直接绑定真实 native 后端**：删除 `H3ServeExecutor` / `IWebUiEngine` / `NativeEngineAdapter` 与 `QZI_ENGINE_URL`；统一 native 名 `QwenZImageNative`；新增 `QwenZImage.config.json` + `QziConfig` + `qzen_config.c`；复制并改名 64 个引擎文件；写 `qzi_engine_backend.c` 真实适配器；`qzi.c` 编译期选择 backend；`build-native-cuda.bat/.sh`；C smoke 按后端分支；合规文件；收尾补齐文档一致性、`engine/LICENSE` 入包、`QziConfig` 向上查找配置、CUDA 脚本的 MSVC/SDK 环境兜底 | ✅ |
 | 12b | **真实后端跨 GPU / 跨发行版可分发**（阶段 12 之后的收尾）：默认 fat binary 覆盖 11 个 SM + CMake 按 nvcc 能力过滤；Linux 运行时 `dlopen` ICU、产物无版本化 `libicuuc.so.NN` 依赖；OpenMP 显式链接；修复 `stage-native.sh` 的 `-cuda` 路径匹配 | ✅ |
 | 12c | **LoRA / 参数全链路一致性**（用户要求「确保功能完整性和一致性，包括 LoRA 支持」；不做 macOS 适配）：统一 ABI 契约与两侧校验（裸文件名 + 255 字节 + `QZI_LORA_NAME_MAX`、scale finite / `0.05..4`、fp4 大小写不敏感、默认值归一化）；打通 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` 配置覆盖链并让 native 读环境变量；修复真实后端 DiT/LoRA 状态机（提前校验、0 与 1.0 等价、合并失败清场）；参考后端把 tier / LoRA / scale / steps / guidance / negative prompt 纳入确定性哈希并跟踪重载 phase；WebUI 在 turbo / base 都开放 LoRA；补测试与文档 | ✅ |
+| 12d | **真图回归矩阵**（用户指定开发节奏第 1 项）：新增独立 `tools/RealImageRegression` harness（刻意不进 sln / CI，检测并拒绝参考后端），`cases.json` 覆盖 qwen21 turbo/base、LoRA scale 1.0 / 0.6、512 / 1024，以及 Z-Image bf16 与 Nunchaku r32 / r256；逐用例输出 PNG + SHA-256 + phase trace，报告增量落盘；Windows / Linux 运行脚本；10/10 真图通过并人工抽查确认非噪点 | ✅ |
 | 13 | **推送 GitHub 开源 + 发布 NuGet** | ⏸ **按 D6 暂缓**，命令见第 5 节 |
 
 本机验证结果（D10 完成度）：
@@ -103,6 +104,16 @@ Your app (.NET 10)                     Browser (manual testing only)
 - 文档一致性：`PARAMETERS.md`（LoRA 契约、ABI sentinel 归一化表、DiT 重载）、`NATIVE_ABI.md`（`QZI_LORA_NAME_MAX`、归一化与 LoRA 契约）、`ENGINE_INTEGRATION.md`（配置覆盖优先级、真实后端 LoRA 状态机、进程级 `QZI_*` 边界）、`WEBUI.md`（双 tier LoRA、环境变量语义）、README、本计划全部同步。
 - 用户明确「不需要适配 macOS」，阶段 12c 及后续节奏均不含 macOS 平台工作。阶段 13（push / publish）仍按 D6 暂缓。
 
+阶段 12d 本机验证结果（本轮新增）：
+
+- RTX 4090 24GB + Windows CUDA fat binary `QwenZImageNative.dll`（SM 80..121）跑完整 10-case 矩阵，**10/10 PASS**，`engine counters: served=10 rejected=0`。报告在 `artifacts/real-image-regression/full/`（git 忽略），含 `report.md` / `report.json` 与 10 张 PNG。
+- **Qwen21**：`turbo 512` 787,072 B / 126.9 s；同参数重复请求 SHA-256 完全相同（`compare_with` = `identical`），真实引擎确定性成立。LoRA `qwen_image_2.1_DMD2-2steps.safetensors` 的 scale 1.0 / 0.6 各产出不同 SHA（无 LoRA `622f020b…`、1.0 `34c82cad…`、0.6 `cd04e575…`），引擎日志显示 adapter 合并进 `128/128 projections`；`1024×1024` 3,147,060 B / 122.8 s；`base` + `negative_prompt` 192.5 s（text encoder 跑条件 / 非条件两遍）。
+- **Z-Image**：`bf16 512` 118.2 s、`bf16 1024` 10.2 s（权重常驻后）、`nunchaku-r32` 85.7 s、`nunchaku-r256` 61.9 s，四者 SHA 互不相同；checkpoint 切换都触发 `ModelLoad`。
+- phase trace 与阶段 12c 的状态机一致：首个用例及每次换 tier / LoRA / scale / checkpoint 均为 `ModelLoad → Text → Dit → Vae → Encode`；只有「参数完全相同的重复请求」和「bf16 512 → 1024」复用常驻权重、不出现 `ModelLoad`。
+- 人工抽查 6 张（qwen21 基线 / LoRA / 1024、Z-Image Nunchaku r32 / r256、Z-Image bf16 1024）均为清晰的雪地红狐照片，无噪点、无平铺或截断。512 PNG 字节数一律 787,072 是 native 编码器行 filter 全 0、固定开销所致，与图像内容无关。
+- 审计顺带发现：`qzi_engine_backend.c` 里 `nunchaku-fp4-r<rank>` 分支的 `checkpoint + 13` 偏移错误（应为 `+14`），且该分支因 ABI 已拒绝所有含 `fp4` 的 checkpoint 而**不可达**；留待下一阶段与 CTest 改造一并清理，不影响本次矩阵结果。
+- 工具自身改动：报告改为**逐用例增量落盘**（避免中途 CUDA 致命失败丢结果），并把每个用例的 phase 序列写进 `report.json` / `report.md`。新工具与脚本编译 0 警告 0 错误，仍不加入 `QwenZImage.NET.sln`。
+
 ## 4. 交付物清单
 
 ```
@@ -126,8 +137,9 @@ QwenZImage.NET/
 ├─ tests/                         61 个 xUnit 测试（54 库 + 7 WebUI）
 ├─ samples/                       端到端示例
 ├─ integration/                   自定义 qzi_backend 模板
+├─ tools/RealImageRegression/     真图回归 harness（需 GPU + 权重，不进 sln / CI）
 ├─ docs/                          ABI / 参数 / 引擎接入 / WebUI 文档
-├─ scripts/                       参考与 CUDA 两套构建脚本 + RID staging
+├─ scripts/                       参考与 CUDA 构建、RID staging、真图回归运行入口
 ├─ .github/workflows/             CI（双平台 native + WebUI 冒烟）+ NuGet 发布
 └─ artifacts/                     本地构建产物（git 忽略）
     └─ runtimes/<rid>/native/     打包前 stage 的两个 RID native
@@ -190,7 +202,7 @@ dotnet nuget push artifacts/packages/QwenZImage.NET.0.1.0.nupkg \
 ## 6. 已知边界 / 后续工作
 
 1. **参考后端不是图像模型**：默认包里的 native 输出确定性合成 PNG，只用于验证 ABI、内存所有权、进度与队列；真实生成请用 `-DQZI_WITH_CUDA_ENGINE=ON` 构建。
-2. **真实引擎已实现**：`native/src/qzi_engine_backend.c` 完整实现 `qzi_backend`，编排参考上游 `serve_execute_qwen21()` / `serve_execute_zimage()`，PNG 直接在内存里编码而非临时文件。仍需针对更多 checkpoint（Z-Image Nunchaku / LoRA）与更大分辨率做回归。
+2. **真实引擎已实现**：`native/src/qzi_engine_backend.c` 完整实现 `qzi_backend`，编排参考上游 `serve_execute_qwen21()` / `serve_execute_zimage()`，PNG 直接在内存里编码而非临时文件。多 checkpoint（Z-Image bf16 / Nunchaku r32 / r256）、LoRA scale 变化、base tier 与 1024×1024 已在阶段 12d 用 `tools/RealImageRegression` 10-case 矩阵回归通过；该工具需要 GPU + 权重，**不进 CI**，CI 仍只跑参考后端。
 3. **平台**：参考库 Windows / Linux 均已构建、`ctest` 通过；真实 CUDA 后端也已在 Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL Debian 12 / GCC 12.2 + CUDA 13.0）双平台实测，默认 fat binary 各 11 个 SM、`ctest` 1/1。WSL 自带 CUDA 13.0，但 `nvcc` 不在默认 PATH，构建前需 `export PATH=/usr/local/cuda/bin:$PATH`。Linux 产物不再依赖版本化 ICU。**按用户明确要求「不需要适配 macOS」，macOS 不在开发范围内**（POSIX 兼容层虽可探测 `libicuuc.N.dylib`，但 CMake 仍链接 `stdc++`，若将来启用需换成 `c++`）。
 4. **CI 不含 GPU**：CI 只构建参考后端；真实后端由使用方或带 GPU 的自托管 runner 构建。
 5. **ABI 演进**：任何结构体/签名/所有权变化都必须升 `QZI_ABI_VERSION`，并同步 `NativeStructs.cs` 与 `AbiGuard`。

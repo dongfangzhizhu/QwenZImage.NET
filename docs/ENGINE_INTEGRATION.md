@@ -160,6 +160,27 @@ curl -s http://127.0.0.1:7860/api/health | python3 -m json.tool   # reference_ba
 # 在 WebUI 提交一个 qwen21 turbo 任务，检查 outputs/ 里的 PNG
 ```
 
+## 真图回归矩阵
+
+`ctest` 里的 `qzi_abi_smoke` 在真实构建下**不加载权重**，只能验证 ABI 与参数校验。要验证真实引擎在多个 checkpoint、LoRA 和更大分辨率下都能出图，用独立工具 `tools/RealImageRegression`。它刻意**不加入 `QwenZImage.NET.sln`**：每个用例都需要 GPU 和多 GB 权重，单次运行以分钟计，不适合无 GPU 的 CI。
+
+前置条件：已构建 `-DQZI_WITH_CUDA_ENGINE=ON` 的产物、`QwenZImage.config.json` 指向真实权重目录（含 `qwen21_lora_dir` 与 `zimage_nunchaku_dir`）。工具会读取 `health.reference_backend`，**如果加载的是参考后端就直接拒绝运行**，避免把确定性噪点图记成「真图通过」。
+
+```bash
+# Windows
+.\scripts\run-real-image-regression.ps1 --list
+.\scripts\run-real-image-regression.ps1 --only qwen21-turbo-512 --out artifacts\regress\smoke
+.\scripts\run-real-image-regression.ps1 --out artifacts\regress\full --timeout-minutes 40
+
+# Linux / WSL
+bash scripts/run-real-image-regression.sh --list
+bash scripts/run-real-image-regression.sh --out artifacts/regress/full
+```
+
+用例矩阵在 `tools/RealImageRegression/cases.json`：qwen21 turbo 512 / 重复请求（确定性对照）/ LoRA scale 1.0 与 0.6 / 1024×1024 / base tier，以及 Z-Image bf16 512 与 1024、Nunchaku `r32` 与 `r256`。新增用例只需加一条 JSON；`--only <id>` 可重复用于挑选子集。
+
+每个用例产出一个 PNG，外加 `report.md` / `report.json`，记录分辨率（从 PNG IHDR 读取并与请求比对）、字节数、SHA-256、耗时、phase 序列和引擎计数器。报告在**每个用例结束后增量落盘**，因此中途某个 CUDA 用例致命失败也不会丢掉已完成的结果。`compare_with` 用字节级 SHA-256 对照验证真实引擎的确定性；phase trace 里的 `ModelLoad` 用来实证 LoRA / tier / checkpoint 切换确实触发了权重重载。单用例超时由 `--timeout-minutes` 控制，默认 30 分钟。
+
 ## 接入其它引擎（可选）
 
 ABI 是可替换的，`engine/` 只是本仓库提供的默认真实实现。

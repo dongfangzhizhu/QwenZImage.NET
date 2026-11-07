@@ -43,6 +43,7 @@
 | **真实 C/CUDA 引擎直接绑定**（`engine/` + `qzi_engine_backend.c`，无 HTTP） | ✅ Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL GCC 12 + CUDA 13.0）双平台构建 + `ctest` 通过；默认 fat binary 覆盖 11 个 SM；Linux 产物无版本化 ICU 依赖 |
 | `QwenZImage.config.json` 配置模型路径，`.NET` / native 双侧加载 | ✅ 已完成；LoRA / Nunchaku 目录支持配置文件、`QziConfig.With`、代码级 options、纯环境变量四种等价入口 |
 | **LoRA 全链路一致性**（ABI / 托管校验 / native / 真实引擎 / 参考后端 / WebUI / 文档） | ✅ 两个 tier 均可用，裸文件名与 scale 统一校验，切换 adapter 或 scale 正确重载 DiT |
+| **真图回归矩阵**（`tools/RealImageRegression`，需 GPU + 权重） | ✅ Windows CUDA 10/10 通过：turbo / base、LoRA scale 1.0 与 0.6、512 与 1024、Z-Image bf16 与 Nunchaku r32/r256；重复请求字节级确定性一致 |
 | native 产物统一命名 `QwenZImageNative.dll` / `libQwenZImageNative.so` | ✅ 已完成，无 `h3` 命名产物 |
 | 单个 NuGet 包含 .NET 程序集 + win-x64 + linux-x64 native | ✅ 已完成，`QziEnsureNativeRuntimes` 缺平台即拒绝打包 |
 | 本地 git 仓库与提交 | ✅ 已完成 |
@@ -284,7 +285,8 @@ src/QwenZImage.NET.WebUI/       跨平台手动测试 WebUI（不打包）
 tests/                          xUnit 托管测试
 samples/                        端到端示例
 integration/                    自定义 qzi_backend 模板
-scripts/                        Windows / Linux / WSL native 构建与 RID staging
+tools/RealImageRegression/      真图回归 harness（需 GPU + 权重，刻意不进 sln / CI）
+scripts/                        native 构建、RID staging 与真图回归运行入口
 docs/                           ABI / 参数 / 引擎接入 / WebUI 文档
 .github/workflows/              CI 与 NuGet 发布工作流
 PLAN.md                         计划、决策记录与发布清单
@@ -302,9 +304,19 @@ dotnet test QwenZImage.NET.sln -c Release               # 托管测试
 
 CI 另做 WebUI Linux 运行时冒烟：启动 Kestrel → 验证 `/api/health` 的 `ok=true` / `transport=native-pinvoke` / `config_path` → 检查 presets → 提交 zimage job → 轮询到完成 → 确认输出出现在 `/api/outputs`。
 
+**真图回归**（不属于 CI，需要 CUDA 构建 + 多 GB 权重）用 `tools/RealImageRegression`：
+
+```bash
+.\scripts\run-real-image-regression.ps1 --list
+.\scripts\run-real-image-regression.ps1 --out artifacts\regress\full
+bash scripts/run-real-image-regression.sh --out artifacts/regress/full
+```
+
+`cases.json` 覆盖 qwen21 turbo/base、LoRA 及 scale 变化、1024×1024，以及 Z-Image bf16 与 Nunchaku r32/r256 checkpoint；每个用例输出 PNG、SHA-256、phase 序列与 `report.md` / `report.json`，并用 `compare_with` 做字节级确定性对照。工具检测到参考后端会直接拒绝运行。详见 [docs/ENGINE_INTEGRATION.md](docs/ENGINE_INTEGRATION.md) 的「真图回归矩阵」。
+
 ## 路线与发布
 
-见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）与阶段 12c（**LoRA / 参数全链路一致性**）亦已完成；按用户要求不做 macOS 适配；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
+见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）、阶段 12c（**LoRA / 参数全链路一致性**）与阶段 12d（**真图回归矩阵 10/10**，覆盖 LoRA、base、1024×1024、Z-Image bf16 与 Nunchaku r32/r256）亦已完成；按用户要求不做 macOS 适配；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
 
 ## 许可与声明
 

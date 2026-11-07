@@ -1,0 +1,100 @@
+[
+  {
+    "id": "qwen21-turbo-512",
+    "model": "qwen21",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "tier": "turbo"
+  },
+  {
+    "id": "qwen21-turbo-512-repeat",
+    "model": "qwen21",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "tier": "turbo",
+    "compare_with": "qwen21-turbo-512"
+  },
+  {
+    "id": "qwen21-turbo-lora-512",
+    "model": "qwen21",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "tier": "turbo",
+    "lora": "qwen_image_2.1_DMD2-2steps.safetensors",
+    "lora_scale": 1.0
+  },
+  {
+    "id": "qwen21-turbo-lora-scale-512",
+    "model": "qwen21",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "tier": "turbo",
+    "lora": "qwen_image_2.1_DMD2-2steps.safetensors",
+    "lora_scale": 0.6
+  },
+  {
+    "id": "qwen21-turbo-1024",
+    "model": "qwen21",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 1024,
+    "height": 1024,
+    "seed": 42,
+    "tier": "turbo"
+  },
+  {
+    "id": "qwen21-base-512",
+    "model": "qwen21",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "tier": "base",
+    "steps": 8,
+    "guidance": 4.0,
+    "negative_prompt": "blurry, low quality, distorted"
+  },
+  {
+    "id": "zimage-bf16-512",
+    "model": "zimage",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "checkpoint": "bf16"
+  },
+  {
+    "id": "zimage-bf16-1024",
+    "model": "zimage",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 1024,
+    "height": 1024,
+    "seed": 42,
+    "checkpoint": "bf16"
+  },
+  {
+    "id": "zimage-nunchaku-r32-512",
+    "model": "zimage",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "checkpoint": "nunchaku-r32"
+  },
+  {
+    "id": "zimage-nunchaku-r256-512",
+    "model": "zimage",
+    "prompt": "A red fox walks through fresh snow at dawn, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "checkpoint": "nunchaku-r256"
+  }
+]
