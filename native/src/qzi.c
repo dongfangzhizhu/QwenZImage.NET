@@ -155,10 +155,29 @@ static int valid_prompt(const char *prompt)
     return n > 0 && n <= QZI_MAX_PROMPT_BYTES;
 }
 
+/* Case-insensitive "fp4" test; the managed validator uses
+ * StringComparison.OrdinalIgnoreCase, so native must match it exactly. */
+static int contains_fp4(const char *text)
+{
+    if (!text) return 0;
+    for (; *text; text++) {
+        if ((*text == 'f' || *text == 'F') &&
+            (text[1] == 'p' || text[1] == 'P') && text[2] == '4') return 1;
+    }
+    return 0;
+}
+
 static int no_path_separators(const char *name)
 {
-    if (strchr(name, '/') || strchr(name, '\\')) return 0;
+    size_t length;
+    const unsigned char *p;
+    if (!name || !*name) return 0;
+    length = strlen(name);
+    if (length > QZI_LORA_NAME_MAX) return 0;
+    if (strchr(name, '/') || strchr(name, '\\') || strchr(name, ':')) return 0;
     if (strstr(name, "..")) return 0;
+    for (p = (const unsigned char *)name; *p; p++)
+        if (*p < 0x20u || *p == 0x7fu) return 0;
     return 1;
 }
 
@@ -228,26 +247,58 @@ qzi_status qzi_validate_qwen21(const qzi_qwen21_request *request,
             qzi_set_error(error, error_cap, "base tier steps must be 1..50");
             return QZI_ERR_INVALID_ARGUMENT;
         }
-        if (request->guidance < 0.0f ||
-            (request->guidance > 0.0f &&
-             (request->guidance < 1.0f || request->guidance > 20.0f))) {
-            qzi_set_error(error, error_cap, "base tier guidance must be 1..20");
+        /* NaN/Inf fail the closed interval below and are rejected, not
+         * handed to the CFG branch. 0.0f is the "tier default" sentinel. */
+        if (request->guidance != 0.0f &&
+            !(request->guidance >= 1.0f && request->guidance <= 20.0f)) {
+            qzi_set_error(error, error_cap,
+                          "base tier guidance must be finite and in 1..20");
             return QZI_ERR_INVALID_ARGUMENT;
         }
     }
-    if (request->lora && *request->lora) {
-        if (!no_path_separators(request->lora)) {
-            qzi_set_error(error, error_cap,
-                          "lora must be a bare file name without path separators");
+    {
+        int has_lora = request->lora && *request->lora;
+        float scale = request->lora_scale;
+        if (has_lora && !no_path_separators(request->lora)) {
+            qzi_set_error_fmt(error, error_cap,
+                "lora must be a bare file name of at most %u bytes "
+                "(no path separators, ':', '..' or control characters)",
+                (unsigned)QZI_LORA_NAME_MAX);
             return QZI_ERR_INVALID_ARGUMENT;
         }
-        if (request->lora_scale > 0.0f &&
-            (request->lora_scale < 0.05f || request->lora_scale > 4.0f)) {
-            qzi_set_error(error, error_cap, "lora_scale must be 0.05..4");
-            return QZI_ERR_INVALID_ARGUMENT;
+        /* NaN/Inf fail both comparisons below, so they are rejected too.
+         * 0.0f is the ABI's "engine default" sentinel, not a strength. */
+        if (scale != 0.0f) {
+            if (!has_lora) {
+                qzi_set_error(error, error_cap,
+                    "lora_scale requires lora; otherwise it would be silently dropped");
+                return QZI_ERR_INVALID_ARGUMENT;
+            }
+            if (!(scale >= 0.05f && scale <= 4.0f)) {
+                qzi_set_error(error, error_cap,
+                    "lora_scale must be finite and in 0.05..4 (or 0 for the default 1.0)");
+                return QZI_ERR_INVALID_ARGUMENT;
+            }
         }
     }
     return QZI_OK;
+}
+
+/* Resolves the ABI's zero-valued "tier default" sentinels once, before any
+ * backend sees the request. Without this, a C caller leaving steps/guidance
+ * zeroed would get a different schedule from a .NET caller using the same
+ * defaults, and 0/1.0 lora_scale would look like an adapter change. */
+static void qzi_normalize_qwen21(const qzi_qwen21_request *request,
+                                 qzi_qwen21_request *out)
+{
+    int turbo = !(request->tier && *request->tier &&
+                  strcmp(request->tier, "base") == 0);
+    *out = *request;
+    if (!out->tier || !*out->tier) out->tier = "turbo";
+    if (out->steps == 0) out->steps = turbo ? 8 : 40;
+    if (out->guidance == 0.0f) out->guidance = turbo ? 1.0f : 4.0f;
+    if (out->lora && *out->lora && out->lora_scale == 0.0f)
+        out->lora_scale = 1.0f;
 }
 
 qzi_status qzi_validate_zimage(const qzi_zimage_request *request,
@@ -277,7 +328,7 @@ qzi_status qzi_validate_zimage(const qzi_zimage_request *request,
                               "unknown zimage checkpoint \"%s\"", c);
             return QZI_ERR_UNSUPPORTED;
         }
-        if (strstr(c, "fp4") != NULL) {
+        if (contains_fp4(c)) {
             qzi_set_error(error, error_cap,
                           "svdq-fp4 packs are not supported (int4 only)");
             return QZI_ERR_UNSUPPORTED;
@@ -510,6 +561,7 @@ QZI_API qzi_status qzi_generate_qwen21(qzi_engine *engine,
                                        char *error, size_t error_cap)
 {
     qzi_status status;
+    qzi_qwen21_request normalized;
     if (!engine || !out_image || !error || error_cap == 0) {
         qzi_set_error(error, error_cap,
                       "engine, out_image and error buffer are required");
@@ -519,9 +571,11 @@ QZI_API qzi_status qzi_generate_qwen21(qzi_engine *engine,
     error[0] = '\0';
     status = qzi_validate_qwen21(request, error, error_cap);
     if (status != QZI_OK) { engine->rejected++; return status; }
+    qzi_normalize_qwen21(request, &normalized);
     if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
-    status = engine->backend.generate_qwen21(engine->context, request, callbacks,
-                                             out_image, error, error_cap);
+    status = engine->backend.generate_qwen21(engine->context, &normalized,
+                                             callbacks, out_image, error,
+                                             error_cap);
     return generation_leave(engine, status, out_image, QZI_MODEL_QWEN21,
                             error, error_cap);
 }

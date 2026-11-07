@@ -20,10 +20,23 @@ public sealed class QziClientOptions
     public string? CacheDirectory { get; init; }
 
     /// <summary>
+    /// Directory holding Qwen-Image 2.1 LoRA adapters. The C ABI has no field
+    /// for it, so the client publishes <c>QZI_QWEN21_LORA_DIR</c> for the
+    /// native backend. Code-level values win over the config file.
+    /// </summary>
+    public string? Qwen21LoraDirectory { get; init; }
+
+    /// <summary>
+    /// Directory holding Z-Image Nunchaku / SVDQuant int4 repacks. Published as
+    /// <c>QZI_ZIMAGE_NUNCHAKU_DIR</c> for the native backend.
+    /// </summary>
+    public string? ZImageNunchakuDirectory { get; init; }
+
+    /// <summary>
     /// Path to <c>QwenZImage.config.json</c>. When set, it is published as the
     /// <c>QZI_CONFIG</c> environment variable so the native backend reads the
-    /// very same file (including the fields this managed options object does
-    /// not carry, such as the Nunchaku and LoRA directories).
+    /// very same file (including the platform overrides and any fields that
+    /// were not explicitly set here).
     /// </summary>
     public string? ConfigPath { get; init; }
 

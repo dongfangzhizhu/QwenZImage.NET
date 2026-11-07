@@ -1,5 +1,9 @@
 using Xunit;
 
+// Some tests below mutate process-wide QZI_* environment variables. Run this
+// assembly serially so a config test can never observe another test's override.
+[assembly: CollectionBehavior(DisableTestParallelization = true)]
+
 namespace QwenZImage.NET.Tests;
 
 /// <summary>
@@ -116,6 +120,51 @@ public class QziConfigTests : IDisposable
         Assert.Equal("/cache", options.CacheDirectory);
         Assert.Equal("/native/lib.so", options.NativeLibraryPath);
         Assert.Equal(_path, options.ConfigPath);
+    }
+
+    [Fact]
+    public void ToClientOptions_Carries_Lora_And_Nunchaku_Directories()
+    {
+        QziConfig config = Write("""
+            { "qwen21_lora_dir": "/packs/loras",
+              "zimage_nunchaku_dir": "/packs/svdq" }
+            """);
+
+        QziClientOptions options = config.ToClientOptions();
+        Assert.Equal("/packs/loras", options.Qwen21LoraDirectory);
+        Assert.Equal("/packs/svdq", options.ZImageNunchakuDirectory);
+    }
+
+    [Fact]
+    public void With_Overrides_Reach_Client_Options()
+    {
+        // QziConfig.With() used to change only the managed object; the native
+        // backend reads these two keys through the environment, so the values
+        // must survive all the way into QziClientOptions.
+        QziConfig config = new QziConfig()
+            .With("qwen21_lora_dir", "/overridden/loras")
+            .With("zimage_nunchaku_dir", "/overridden/svdq");
+
+        QziClientOptions options = config.ToClientOptions();
+        Assert.Equal("/overridden/loras", options.Qwen21LoraDirectory);
+        Assert.Equal("/overridden/svdq", options.ZImageNunchakuDirectory);
+    }
+
+    [Fact]
+    public void Environment_Override_Wins_Over_The_File()
+    {
+        Write("""{ "qwen21_lora_dir": "/from-file/loras" }""");
+        string? original = Environment.GetEnvironmentVariable(QziConfig.LoraDirectoryVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable(QziConfig.LoraDirectoryVariable, "/from-env/loras");
+            QziClientOptions options = QziClientOptions.FromConfig(_path);
+            Assert.Equal("/from-env/loras", options.Qwen21LoraDirectory);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(QziConfig.LoraDirectoryVariable, original);
+        }
     }
 
     [Fact]

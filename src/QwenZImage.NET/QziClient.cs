@@ -49,6 +49,15 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             Environment.SetEnvironmentVariable(QziConfig.EnvironmentVariable,
                                                options.ConfigPath);
 
+        // Those two directories have no ABI field. Publishing the resolved
+        // values closes the gap for QziConfig.With(...) / code-level options
+        // *and* for a container that only sets QZI_* without a config file.
+        // A null option deliberately leaves any existing env value intact.
+        PublishNativeOverride(QziConfig.LoraDirectoryVariable,
+                              options.Qwen21LoraDirectory);
+        PublishNativeOverride(QziConfig.NunchakuDirectoryVariable,
+                              options.ZImageNunchakuDirectory);
+
         NativeLibraryLoader.Configure(options.NativeLibraryPath);
         AbiGuard.Verify();
 
@@ -248,6 +257,12 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
 
     // --------------------------------------------------------------- private
 
+    private static void PublishNativeOverride(string name, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+            Environment.SetEnvironmentVariable(name, value);
+    }
+
     private QziImage CallQwen21(QwenImageOptions options,
                                 IProgress<GenerationProgress>? progress,
                                 CancellationToken cancellationToken,
@@ -274,7 +289,10 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             Height = options.Height,
             Steps = options.EffectiveSteps,
             Guidance = options.EffectiveGuidance,
-            LoraScale = options.EffectiveLoraScale,
+            // 0.0f is the ABI sentinel for "no adapter, default strength".
+            // Sending 1.0f without a lora would be rejected as a silently
+            // dropped parameter by qzi_validate_qwen21().
+            LoraScale = string.IsNullOrEmpty(options.Lora) ? 0.0f : options.EffectiveLoraScale,
             Seed = options.Seed,
             Flags = 0
         };

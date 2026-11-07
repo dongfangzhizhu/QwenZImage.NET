@@ -7,6 +7,8 @@
 
 两者不一致时以 `native/include/qzi.h` 的注释和本文件为准，并应视为缺陷修复。
 
+`qzi_generate_qwen21()` 在校验通过后、调用 backend 之前，还会把 ABI 的「默认值 sentinel」统一归一化（见下节）。因此参考后端与真实 CUDA 后端看到的是**同一组有效参数**，无 GPU 的 C smoke 测试可以用确定性输出反推参数是否真正贯通。
+
 ## 通用规则
 
 | 字段 | 规则 |
@@ -24,12 +26,30 @@
 | `Width` / `Height` | 1024 / 1024 | **32 的倍数**，正数，`≤ 2048`，面积 `≤ 2048×2048` |
 | `Tier` | `Turbo` | `Turbo` 或 `Base`；native 字符串为 `"turbo"` / `"base"`，`NULL` 等同 `"turbo"` |
 | `Steps` | `null` → turbo `8`，base `40` | **Turbo 必须恰好 8**（传入其它值报错，不静默忽略）；Base `1..50` |
-| `Guidance` | `null` → turbo `1.0`，base `4.0` | **Turbo 必须恰好 `1.0`**；Base `1..20` |
+| `Guidance` | `null` → turbo `1.0`，base `4.0` | **Turbo 必须恰好 `1.0`**；Base `1..20`，且必须有限（非 NaN / Inf） |
 | `NegativePrompt` | `null` | 仅 Base 可用；Turbo 无 CFG 分支，非空即报错 |
-| `Lora` | `null` | 必须是**裸文件名**：禁止 `/`、`\`、`..`；由引擎在自己的 LoRA 目录中解析 |
-| `LoraScale` | `null` → `1.0` | `0.05..4`；设置了 `LoraScale` 却没有 `Lora` 会报错（否则会被引擎静默丢弃） |
+| `Lora` | `null` | **裸文件名**，UTF-8 字节数 ≤ **255**（`QZI_LORA_NAME_MAX`）；禁止 `/`、`\`、`:`、`..` 与控制字符（`< 0x20`、`0x7f`）；在 `qwen21_lora_dir` 中解析。**turbo / base 两个 tier 都可用** |
+| `LoraScale` | `null` → `1.0` | 必须有限（非 NaN / Inf）且在 `0.05..4`；**没有 `Lora` 却设置 `LoraScale` 会报错**（否则会被引擎静默丢弃）。托管侧在没有 LoRA 时向 native 发送 `0.0f` sentinel，而不是 `1.0f` |
 
 对应 native 结构体 `qzi_qwen21_request`。校验失败返回 `QZI_ERR_INVALID_ARGUMENT`；未知 tier 同样返回该状态；不支持的 LoRA / 特性返回 `QZI_ERR_UNSUPPORTED`。
+
+### 默认值归一化与 ABI sentinel（C 调用方必读）
+
+`qzi_generate_qwen21()` 校验之后会复制一份请求并归一化，再把**归一化后的副本**交给 backend；调用方传入的结构体不会被修改。这样两个后端都不必各自猜默认值。
+
+| 字段 | 输入 sentinel | 归一化结果 |
+| --- | --- | --- |
+| `tier` | `NULL` / `""` | `"turbo"` |
+| `steps` | `0` | turbo `8`，base `40` |
+| `guidance` | `0.0f` | turbo `1.0f`，base `4.0f` |
+| `lora_scale`（有 `lora`） | `0.0f` | `1.0f` |
+| `lora_scale`（无 `lora`） | 必须恰好 `0.0f` | 保持 `0.0f`（表示「无 adapter / 默认强度」） |
+
+也就是说：**没有 LoRA 时唯一合法的 `lora_scale` 是 `0.0f`**；带 LoRA 时 `0.0f` 与 `1.0f` 等价，真实后端也把它们视作同一种 adapter 状态，不会触发多 GB 的 DiT 重载。非法值（负数、NaN、Inf、`> 4`、`< 0.05`、无 LoRA 却非零）一律**拒绝**，绝不静默 coerce。
+
+### LoRA 与 DiT 重载
+
+`qzen_qwen21_apply_lora()` 会把 adapter 就地合并进 INT8 权重。因此**切换 adapter、改变 scale、或去掉 LoRA 都需要重新加载 DiT**（分钟级），并上报一次 `"model load"` phase。真实后端在加载多 GB 权重**之前**先校验裸文件名与 `qwen21_lora_dir`；合并失败会关闭并清空 DiT，避免半合并权重被下一个无 LoRA 请求复用。参考后端同样跟踪 tier / adapter / scale 变化，让无 GPU 的测试也能验证这条状态机。
 
 ## Z-Image（`ZImageOptions`）
 
@@ -37,7 +57,7 @@
 | --- | --- | --- |
 | `Width` / `Height` | 1024 / 1024 | **16 的倍数**，正数，`≤ 2048`，面积 `≤ 2048×2048` |
 | `Checkpoint` | `"bf16"` | `null` / `""` / `"bf16"`（默认）、`"nunchaku"`，或以 `"nunchaku-"` 开头的 pack id（如 `"nunchaku-r256"`） |
-| 不支持的 checkpoint | — | 任何含 `fp4` 的 id（如 `svdq-fp4-r256`）以及未知值 → 托管侧 `ArgumentException`，native 侧 `QZI_ERR_UNSUPPORTED`（引擎只解码 int4） |
+| 不支持的 checkpoint | — | 任何含 `fp4` 的 id（**大小写不敏感**，如 `svdq-fp4-r256`、`SVDQ-FP4-r256`）以及未知值 → 托管侧 `ArgumentException`，native 侧 `QZI_ERR_UNSUPPORTED`（引擎只解码 int4）。两侧用同一套大小写无关判定 |
 
 Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**没有** `steps`、`guidance`、`negative_prompt` 字段——这不是遗漏，而是模型本身的约束。对应 native 结构体 `qzi_zimage_request`。
 
@@ -72,5 +92,7 @@ native 侧通过 `qzi_progress_fn` 上报的 `phase` 是**静态字面量**，�
 | `"dit"` | `Dit` | 去噪步数（Turbo 为 8 步） |
 | `"vae"` | `Vae` | VAE 解码 |
 | `"encode"` | `Encode` | PNG 编码 |
+
+切换模型、tier、LoRA adapter 或 LoRA scale 都会触发一次 `"model load"`；参考后端也模拟这一行为，因此无 GPU 的测试能验证参数与重载的贯通。
 
 取消通过 `qzi_cancel_fn` 在阶段/去噪步之间轮询；返回非零 ⇒ `QZI_ERR_CANCELLED`，`.NET` 侧转换成 `OperationCanceledException`。

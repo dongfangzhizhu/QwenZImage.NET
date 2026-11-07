@@ -41,7 +41,8 @@
 | 稳定 C ABI v1、`.NET 10` 源生成 P/Invoke、队列、预设、托管 + native 测试 | ✅ 已完成并通过 |
 | 跨平台 WebUI（health / presets / jobs / SSE / gallery / trash / unload） | ✅ 已完成，Windows + Linux |
 | **真实 C/CUDA 引擎直接绑定**（`engine/` + `qzi_engine_backend.c`，无 HTTP） | ✅ Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL GCC 12 + CUDA 13.0）双平台构建 + `ctest` 通过；默认 fat binary 覆盖 11 个 SM；Linux 产物无版本化 ICU 依赖 |
-| `QwenZImage.config.json` 配置模型路径，`.NET` / native 双侧加载 | ✅ 已完成 |
+| `QwenZImage.config.json` 配置模型路径，`.NET` / native 双侧加载 | ✅ 已完成；LoRA / Nunchaku 目录支持配置文件、`QziConfig.With`、代码级 options、纯环境变量四种等价入口 |
+| **LoRA 全链路一致性**（ABI / 托管校验 / native / 真实引擎 / 参考后端 / WebUI / 文档） | ✅ 两个 tier 均可用，裸文件名与 scale 统一校验，切换 adapter 或 scale 正确重载 DiT |
 | native 产物统一命名 `QwenZImageNative.dll` / `libQwenZImageNative.so` | ✅ 已完成，无 `h3` 命名产物 |
 | 单个 NuGet 包含 .NET 程序集 + win-x64 + linux-x64 native | ✅ 已完成，`QziEnsureNativeRuntimes` 缺平台即拒绝打包 |
 | 本地 git 仓库与提交 | ✅ 已完成 |
@@ -68,7 +69,7 @@
 }
 ```
 
-查找顺序：显式 `QZI_CONFIG` / `--config <path>` → 程序目录 → 当前工作目录 → 从这两个目录**向上最多 8 级**（`dotnet run` 会把工作目录设为项目目录，解决方案根目录的配置因此也能找到）→ `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量（如 `QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_DEVICE_ID`）优先于文件；代码中显式传入的 `QziClientOptions` 优先于二者。`QziClient` 会把解析出的路径发布为 `QZI_CONFIG`，让 native backend 读取 ABI 里没有的 `qwen21_lora_dir` / `zimage_nunchaku_dir` 等字段。
+查找顺序：显式 `QZI_CONFIG` / `--config <path>` → 程序目录 → 当前工作目录 → 从这两个目录**向上最多 8 级**（`dotnet run` 会把工作目录设为项目目录，解决方案根目录的配置因此也能找到）→ `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量（`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_MODEL_CACHE`、`QZI_DEVICE_ID` 等）优先于文件；代码中显式传入的 `QziClientOptions` 优先于二者。`QziClient` 会把解析出的路径发布为 `QZI_CONFIG`，并把 `Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 发布成 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`；native 侧的 `qzen_config_apply_environment()` 在 `qzen_config_load()` 之后应用同一组覆盖。因此**配置文件、`QziConfig.With(...)`、代码级 options、纯环境变量**这四种方式都能作用到引擎——ABI 里装不下的字段不再静默丢失。
 
 仓库根目录的 `QwenZImage.config.json` 是开发机示例，路径指向本机已有的权重目录；部署时改成自己的路径即可。权重文件本身不在仓库里。
 
@@ -205,7 +206,7 @@ dotnet run --project src/QwenZImage.NET.WebUI -c Release -- --config /path/to/Qw
 | 类型 | 说明 |
 | --- | --- |
 | `QziClient` | 拥有的一个 native engine。同步 `Generate*` / `WriteTo`，异步 `Generate*Async` / `WriteToAsync`，`GetHealth()`、`Unload()`、`Dispose()` |
-| `QziClientOptions` | 模型目录、缓存、设备、native 路径、`ConfigPath`；`FromConfig(path?)` 从配置文件构造 |
+| `QziClientOptions` | 模型目录、缓存、设备、native 路径、`ConfigPath`、`Qwen21LoraDirectory` / `ZImageNunchakuDirectory`；`FromConfig(path?)` 从配置文件构造 |
 | `QziConfig` | 配置文件加载器（平台覆盖、`~` 展开、未知键报错、搜索路径） |
 | `QwenImageOptions` / `ZImageOptions` | 强类型请求（继承 `GenerationOptions`），`required Prompt`、宽高、Seed |
 | `GenerationResult` | PNG 结果：`Png` / `PngSpan`（零拷贝）、`CopyTo(Async)`、`SaveAsync`、`Dispose()` 归还池化缓冲区 |
@@ -220,8 +221,9 @@ dotnet run --project src/QwenZImage.NET.WebUI -c Release -- --config /path/to/Qw
 
 规则在 `.NET` 与 native 两层重复执行，避免把明显非法的请求送进分钟级模型加载。完整表格见 [docs/PARAMETERS.md](docs/PARAMETERS.md)。要点：
 
-- **Qwen21**：宽高为 **32 的倍数**、`32..2048`、面积 ≤ `2048×2048`；`turbo` 强制 `steps=8`、`guidance=1.0`、不支持 `negative_prompt`；`base` 为 `steps 1..50`、`guidance 1..20`；`lora` 必须是**裸文件名**（禁止路径分隔符与 `..`）、`lora_scale 0.05..4`。
-- **ZImage**：宽高为 **16 的倍数**、`16..2048`、面积 ≤ `2048×2048`；`checkpoint` 支持 `bf16`、`nunchaku`、`nunchaku-<pack>`；**`fp4` / `svdq-fp4` 不被支持**（引擎只解码 int4）；无 steps/guidance/negative prompt（Turbo 固定 8 步、无 CFG 分支）。
+- **Qwen21**：宽高为 **32 的倍数**、`32..2048`、面积 ≤ `2048×2048`；`turbo` 强制 `steps=8`、`guidance=1.0`、不支持 `negative_prompt`；`base` 为 `steps 1..50`、`guidance 1..20`；`lora` 必须是**裸文件名**（≤ 255 UTF-8 字节，禁止 `/`、`\`、`:`、`..` 与控制字符），`lora_scale` 必须有限且在 `0.05..4`。**LoRA 在 turbo / base 两个 tier 都可用**，切换 adapter 或 scale 会重载 DiT。
+- **ZImage**：宽高为 **16 的倍数**、`16..2048`、面积 ≤ `2048×2048`；`checkpoint` 支持 `bf16`、`nunchaku`、`nunchaku-<pack>`；**`fp4` / `svdq-fp4`（大小写不敏感）不被支持**（引擎只解码 int4）；无 steps/guidance/negative prompt（Turbo 固定 8 步、无 CFG 分支）。
+- **默认值**：native ABI 用 `steps=0` / `guidance=0` / `lora_scale=0` 表示「用 tier 默认值 / 无 adapter」；`qzi_generate_qwen21()` 在 backend 之前统一归一化，两个后端看到同一组有效值，非法值一律拒绝而不静默改写。详见 [docs/PARAMETERS.md](docs/PARAMETERS.md)。
 - 两者：prompt 非空且 ≤ **16384 UTF-8 字节**，保留字段 `flags` 必须为 0。
 
 ## 性能设计
@@ -296,13 +298,13 @@ ctest --test-dir native/build-cuda --output-on-failure  # 真实后端 ABI + 校
 dotnet test QwenZImage.NET.sln -c Release               # 托管测试
 ```
 
-托管测试覆盖：配置文件加载与平台覆盖、参数校验、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置。全部不需要 GPU、权重或网络监听。
+托管测试共 **61 项**（54 库 + 7 WebUI）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射。全部不需要 GPU、权重或网络监听。
 
 CI 另做 WebUI Linux 运行时冒烟：启动 Kestrel → 验证 `/api/health` 的 `ok=true` / `transport=native-pinvoke` / `config_path` → 检查 presets → 提交 zimage job → 轮询到完成 → 确认输出出现在 `/api/outputs`。
 
 ## 路线与发布
 
-见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）亦已完成；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
+见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）与阶段 12c（**LoRA / 参数全链路一致性**）亦已完成；按用户要求不做 macOS 适配；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
 
 ## 许可与声明
 

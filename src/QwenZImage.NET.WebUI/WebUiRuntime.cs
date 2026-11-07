@@ -52,6 +52,8 @@ public sealed class WebUiConfig
             Qwen21Directory = model ?? baseline.Qwen21Directory,
             ZImageDirectory = model ?? baseline.ZImageDirectory,
             CacheDirectory = cache ?? baseline.CacheDirectory,
+            Qwen21LoraDirectory = baseline.Qwen21LoraDirectory,
+            ZImageNunchakuDirectory = baseline.ZImageNunchakuDirectory,
             DeviceId = device ?? baseline.DeviceId,
             ThreadCount = baseline.ThreadCount,
             ConfigPath = baseline.ConfigPath

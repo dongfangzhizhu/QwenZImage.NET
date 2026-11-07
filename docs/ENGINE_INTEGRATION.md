@@ -64,7 +64,7 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 | 键 | 用途 |
 | --- | --- |
 | `qwen21_dir` | Qwen-Image 2.1 权重包（turbo / base DiT、VAE、text tower、tokenizer） |
-| `qwen21_lora_dir` | base tier 的 LoRA 目录；`lora` 参数必须是裸文件名，会在此目录下解析 |
+| `qwen21_lora_dir` | LoRA 目录（**turbo / base 两个 tier 共用**）；`lora` 参数必须是裸文件名，会在此目录下解析 |
 | `zimage_dir` | Z-Image bf16 权重包 |
 | `zimage_nunchaku_dir` | Nunchaku / SVDQ int4 checkpoint 目录，`nunchaku-r<rank>` 在此枚举 |
 | `text_cache_dir` | 文本编码缓存 |
@@ -73,16 +73,25 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 
 两侧都要读这个文件，原因是 **C ABI 装不下全部字段**：
 
-- `.NET` 侧 `QziConfig.Load()` → `QziClientOptions.FromConfig()`：完整解析、平台覆盖、`~` 展开、严格校验未知键；`qwen21_dir` / `zimage_dir` / `text_cache_dir` / `device_id` / `thread_count` 通过 `qzi_engine_config` 传给 native。
-- native 侧 `engine/src/qzen_config.c` 的 `qzen_config_load(NULL, ...)`：在 `qzen_init()` 里读取，**补齐** `qwen21_lora_dir` / `zimage_nunchaku_dir` 等 ABI 未携带的字段。`QziClient` 会把最终采用的配置文件路径发布为 `QZI_CONFIG`，保证两侧读的是同一份文件。
+- `.NET` 侧 `QziConfig.Load()` → `QziConfig.ToClientOptions()`：完整解析、平台覆盖、`~` 展开、严格校验未知键；`qwen21_dir` / `zimage_dir` / `text_cache_dir` / `device_id` / `thread_count` 通过 `qzi_engine_config` 传给 native。`Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 则走下面的环境变量通道。
+- native 侧 `engine/src/qzen_config.c`：在 `qzen_init()` 里先 `qzen_config_load()` 读文件，**补齐** `qwen21_lora_dir` / `zimage_nunchaku_dir` 等 ABI 未携带的字段，再调用 `qzen_config_apply_environment()` 应用同一组 `QZI_*` 覆盖（含 `~` 展开）。`QziClient` 会把最终采用的配置文件路径发布为 `QZI_CONFIG`，保证两侧读的是同一份文件。
 
 查找顺序：显式 `QZI_CONFIG` / `--config <path>` → 程序目录 → 当前工作目录 → 从这两个目录向上最多 8 级（覆盖 `dotnet run` 从项目目录启动的情况）→ `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量覆盖文件；代码里显式传入的 `QziClientOptions` 优先于二者。**权重文件本身不含在仓库 / NuGet 包里**。
+
+`qzen_config_apply_environment()` 的变量表与托管侧 `QziConfig.ApplyEnvironmentOverrides()` 一一对应：`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_MODEL_CACHE`。`QziClient` 构造函数把 `QziClientOptions.Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 发布为后两个变量，因此下面四种写法对引擎**等价生效**：
+
+1. `QwenZImage.config.json` 里的 `qwen21_lora_dir` / `zimage_nunchaku_dir`；
+2. `QziConfig.With("qwen21_lora_dir", ...)` 或 `ToClientOptions()` 带出的代码级值；
+3. 直接构造 `QziClientOptions` 并赋值两个目录；
+4. 进程里直接设置 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`（没有配置文件也可以）。
+
+优先级为 **显式代码值 / `QZI_*` 环境变量 > 配置文件**；native 侧不会把已覆盖的值再改回去。
 
 ## `qzi_engine_backend.c` 做了什么
 
 它实现 `native/include/qzi_backend.h` 的 9 个回调，把上游 resident service 的 `serve_execute_qwen21()` / `serve_execute_zimage()` 编排逻辑移植成**进程内调用**（去掉 HTTP 状态）：
 
-- `qzen_init()`：`qzen_config_load()` 读配置，合并 ABI 传入的目录；`device_id >= 0` 时设置 `CUDA_VISIBLE_DEVICES`；`enable_gpu_switches()` 打开 `QWEN21_GPU` / `QWEN21_VAE_GPU` / `QWEN21_TEXT_GPU` / `ZIMAGE_GPU` / `ZIMAGE_VAE_GPU`（已由用户设置则不覆盖）。**不在这里 mmap 多 GB 权重**，DiT 首次 generate 时懒加载并常驻。
+- `qzen_init()`：`qzen_config_load()` 读配置、`qzen_config_apply_environment()` 应用 `QZI_*` 覆盖（含 `qwen21_lora_dir` / `zimage_nunchaku_dir`、`~` 展开），再合并 ABI 传入的目录；`device_id >= 0` 时设置 `CUDA_VISIBLE_DEVICES`；`enable_gpu_switches()` 打开 `QWEN21_GPU` / `QWEN21_VAE_GPU` / `QWEN21_TEXT_GPU` / `ZIMAGE_GPU` / `ZIMAGE_VAE_GPU`（已由用户设置则不覆盖）。**不在这里 mmap 多 GB 权重**，DiT 首次 generate 时懒加载并常驻。
 - Qwen-Image 2.1：`qzen_qwen21_open` → `qzen_qwen21_vae_open` → `qzen_tokenizer_load` → `qzen_qwen21_text_encode` / `qzen_qwen21_text_forward` → `qzen_qwen21_sigmas_turbo` 或 `qzen_qwen21_sigmas_base` → `qzen_qwen21_pipeline_run_ex` → `qzi_png_encode_rgb8`。
 - Z-Image：`qzen_zpipe_load` → `qzen_zpipe_attach_text` → `qzen_zpipe_encode_text` → `qzen_zpipe_init_latents` → `qzen_zpipe_denoise` → `qzen_zvae_load` / `qzen_zvae_decode` → `qzi_png_encode_rgb8`。
 - 噪点采样用与上游一致的 splitmix64 + Box-Muller，保证同一 seed 复现同样的图像。
@@ -91,6 +100,18 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 - `unload` 只释放文本塔与缓存，**不卸载 DiT**（重载要几分钟）；`health` 把 `reference_backend` 置 0，其余计数由 `qzi.c` 填。
 
 参数校验、单飞、取消、错误缓冲与 image 所有权仍全部由 `qzi.c` 负责，backend 不重复实现。
+
+## LoRA 与 DiT 常驻状态机
+
+Qwen-Image 2.1 的 LoRA 在 **turbo / base 两个 tier 都可用**，不是 base 专属。`qzen_qwen21_apply_lora()` 把 adapter **就地合并进 INT8 权重**，所以 DiT 一旦合并就带着该 adapter：换 adapter、改 scale、或去掉 LoRA，都必须重新加载 DiT。`ensure_qwen21_dit()` 的规则：
+
+1. **先校验再加载**：打开多 GB 权重之前先检查 `lora` 是裸文件名（≤ `QZI_LORA_NAME_MAX`，无 `/`、`\`、`:`、`..` 与控制字符）、`qwen21_lora_dir` 已配置、拼接后的路径未超长。非法请求立即返回，不做无谓加载——这是 `qzi.c` 之后的第二道防线。
+2. **0 与 1.0 等价**：`lora_scale == 0.0f` 是 ABI 默认值 sentinel，`qzi.c` 已归一化成 `1.0f`，backend 仍按 `> 0 ? scale : 1.0f` 兜底，避免把同一 adapter 误判成状态变化而触发重载。
+3. **切换即清场**：`need_reload` 时先 `forget_qwen21_dit()` 关闭 DiT 并清空 tier / adapter / scale 记录，再打开 checkpoint 并重新合并；这个顺序保证「打开失败」也不会残留「adapter 已常驻」的假状态。
+4. **失败不留脏权重**：`qzen_qwen21_apply_lora()` 失败时同样调用 `forget_qwen21_dit()`。否则半合并的 DiT 会被下一个无 LoRA 请求复用，静默产出错误结果。
+5. **文本塔 / VAE 仍常驻**：`forget_qwen21_dit()` 只关 DiT，不重置 `s->resident`；`qzi_engine_unload()` 的语义保持不变。
+
+`lora_resident` 容量是 `QZI_LORA_NAME_MAX + 1`，与 ABI 的 255 字节上限一致，不再出现长名字被 128 字节缓冲截断的问题。参考后端 `qzi_stub.c` 用同样的 tier / adapter / scale 变化条件上报 `"model load"`，并把这些字段连同 steps / guidance / negative_prompt 纳入确定性 PNG 哈希，使无 GPU 的 C smoke 也能验证参数贯通。
 
 ## 构建与验证真实后端
 
@@ -118,7 +139,7 @@ Windows 需要 MSVC + CUDA Toolkit 13+（nvcc / cudart / cuBLAS / cuBLASLt），
 
 `build-native-cuda.bat` 会：如果当前 shell 已经有完整的 `cl` / `rc` / `nvcc` 环境就直接复用（不调用 `vcvars64.bat`）；否则自动 `call vcvars64.bat`；若注册表查询不可用导致 Windows SDK 的 `rc.exe` / `mt.exe` 没进 PATH，则**从文件系统**枚举 `%ProgramFiles(x86)%\Windows Kits\10\Include` 补齐 SDK 的 `PATH` / `INCLUDE` / `LIB`，避免 CMake 的 MSVC 编译检查失败。脚本最后用 `QZI_STAGE_CUDA=1` 把产物 stage 进 `artifacts/runtimes/win-x64/native/`。
 
-`ctest` 的 `qzi_abi_smoke` 会按 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release），真实构建只跑 ABI 布局与参数校验，**不加载多 GB 权重**。
+`ctest` 的 `qzi_abi_smoke` 会按 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release、LoRA 参数引起的字节差异、`"model load"` phase），两种构建都跑 ABI 布局、LoRA 裸文件名 / 长度 / scale 边界与 fp4 大小写校验，真实构建**不加载多 GB 权重**。
 
 把应用指向真实产物即可，托管程序集与 API 一行都不用改：
 
@@ -157,5 +178,8 @@ ABI 是可替换的，`engine/` 只是本仓库提供的默认真实实现。
 - **符号导出**：产物名固定 `QwenZImageNative.dll` / `libQwenZImageNative.so`；Windows 只导出 `QZI_API` 函数，不要带 `lib` 前缀。
 - **SM 架构**：默认列表覆盖 sm_80 → sm_121，设备不在其中时 native 初始化会打印明确的 rebuild 提示，而不是让所有 kernel 静默失败；本地可用脚本第一个参数（分号分隔的 SM 列表，如 `89`）只编一个架构加速。CUDA 12.x 不认识 Blackwell 架构时 CMake 会自动剔除，全部不支持才报错。
 - **reference / CUDA 产物混用**：两者同名但内容不同，务必用 `-cuda` 目录或 `QZI_STAGE_CUDA` 区分，否则「明明跑了 build 却还是噪点」。
-- **不要静默忽略非法参数**：Turbo 非 8 步、`svdq-fp4` checkpoint、带路径的 LoRA 都必须明确失败。
+- **不要静默忽略非法参数**：Turbo 非 8 步、含 `fp4`（大小写不敏感）的 checkpoint、带路径 / `:` / 控制字符 / 超 255 字节的 LoRA、没有 LoRA 却带非 0 `lora_scale`，都必须明确失败；`steps` / `guidance` / `lora_scale` 的 `0` 是**默认值 sentinel**，不是「非法但被改成默认值」。
+- **LoRA 目录覆盖**：`qwen21_lora_dir` 不在 C ABI 里。用 `QwenZImage.config.json`、`QziClientOptions.Qwen21LoraDirectory` 或 `QZI_QWEN21_LORA_DIR` 指定；只改 `qzi_engine_config.qwen21_dir` 不会改变 LoRA 目录。目录未配置且有 LoRA 时返回 `QZI_ERR_NOT_CONFIGURED`。
+- **换 LoRA 很贵**：adapter / scale 变化会重新打开 DiT（分钟级），并额外上报一次 `"model load"`；批量任务尽量把同一 adapter 的请求排在一起。
+- **`QZI_*` 是进程级变量**：`QziClient` 在构造时把代码级目录值发布成环境变量，native 在 `qzen_init()` 读取一次。同一进程里构造多个目录不同的 `QziClient` 时，以最后一个为准；创建 engine 之后再改变量不会生效。多目录场景请让每个进程只服务一套配置。
 - **许可**：`engine/` 是上游 MIT 代码的改名子集，分发时必须保留 [`engine/LICENSE`](../engine/LICENSE) 的版权与许可声明；仓库根 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) 已列出全部第三方依赖。

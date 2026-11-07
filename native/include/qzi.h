@@ -49,6 +49,10 @@ extern "C" {
 #define QZI_ERROR_CAPACITY 512u
 #define QZI_LAYOUT_SLOTS 6u
 
+/* Maximum byte length of a LoRA adapter file name (excluding the NUL).
+ * Both sides of the ABI reject longer names instead of truncating them. */
+#define QZI_LORA_NAME_MAX 255u
+
 /* Layout slot indices reported by qzi_abi_layout(). */
 #define QZI_LAYOUT_ENGINE_CONFIG  0u
 #define QZI_LAYOUT_QWEN21_REQUEST 1u
@@ -94,8 +98,17 @@ typedef struct qzi_engine_config {
 /* Qwen-Image 2.1 text-to-image request. Rules mirror the vendored engine:
  * width/height are multiples of 32 in [32, 2048], w*h <= 2048*2048;
  * tier "turbo" forces steps == 8 and guidance == 1.0 and rejects
- * negative_prompt; "base" allows steps 1..50, guidance 1..20;
- * lora is a bare file name (no path separators), lora_scale in [0.05, 4]. */
+ * negative_prompt; "base" allows steps 1..50, guidance 1..20.
+ * A zero steps / guidance means "use the tier default" (8/1.0 or 40/4.0);
+ * qzi_generate_qwen21() resolves those defaults before the backend sees the
+ * request, so both backends observe the same effective values.
+ *
+ * lora is a bare adapter file name resolved inside qwen21_lora_dir: at most
+ * QZI_LORA_NAME_MAX bytes, containing no '/', '\\', ':', '..' or control
+ * characters. LoRA works on both tiers. lora_scale == 0.0f means "engine
+ * default" (1.0) and is the only value allowed without lora; any other value
+ * requires lora, must be finite and must lie in [0.05, 4]. Invalid values are
+ * rejected, never silently coerced. */
 typedef struct qzi_qwen21_request {
     const char  *prompt;           /* required, non-empty, <= 16384 UTF-8 bytes */
     const char  *negative_prompt;  /* NULL or UTF-8; base tier only */

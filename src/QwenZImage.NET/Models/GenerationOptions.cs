@@ -47,7 +47,12 @@ public sealed record QwenImageOptions : GenerationOptions
     /// <summary>Base tier only. Turbo has no CFG branch.</summary>
     public string? NegativePrompt { get; init; }
 
-    /// <summary>Bare adapter file name from the engine's LoRA directory.</summary>
+    /// <summary>
+    /// Bare adapter file name (≤ 255 UTF-8 bytes) resolved inside the engine's
+    /// <c>qwen21_lora_dir</c>. Works on both tiers; changing the adapter or its
+    /// scale forces a DiT reload. Forbidden: path separators, ':', '..' and
+    /// control characters.
+    /// </summary>
     public string? Lora { get; init; }
 
     /// <summary>0.05..4, defaults to 1.0. Requires <see cref="Lora"/>.</summary>
@@ -62,7 +67,11 @@ public sealed record QwenImageOptions : GenerationOptions
     /// <summary>The guidance scale actually sent to the engine.</summary>
     public float EffectiveGuidance => Guidance ?? (Tier == QwenImageTier.Turbo ? 1.0f : 4.0f);
 
-    /// <summary>The LoRA strength actually sent to the engine.</summary>
+    /// <summary>
+    /// The effective LoRA strength (1.0 when <see cref="LoraScale"/> is null).
+    /// Without a <see cref="Lora"/> the client sends the ABI sentinel 0.0f
+    /// instead, which the native layer interprets as this same default.
+    /// </summary>
     public float EffectiveLoraScale => LoraScale ?? 1.0f;
 
     /// <summary>The tier name used by the C ABI.</summary>

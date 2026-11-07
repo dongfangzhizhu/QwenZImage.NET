@@ -44,6 +44,14 @@ typedef struct qzen_config {
 int qzen_config_load(const char *explicit_path, qzen_config *out,
                      char *error, size_t error_cap);
 
+/* Applies QZI_* environment overrides on top of a loaded config. The managed
+ * QziConfig loader follows the same precedence (environment > file), and
+ * QziClient publishes code-level values through these same variables for the
+ * keys the C ABI cannot carry (qwen21_lora_dir / zimage_nunchaku_dir).
+ * Values may start with ~. Returns 0, or -1 when a value is too long. */
+int qzen_config_apply_environment(qzen_config *config, char *error,
+                                  size_t error_cap);
+
 /* Returns the value of a known key, or "" when unset/unknown. */
 const char *qzen_config_field(const qzen_config *config, const char *key);
 

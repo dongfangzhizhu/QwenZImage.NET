@@ -145,7 +145,7 @@ public class NativeInteropTests
                 Height = 64,
                 Steps = 8,
                 Guidance = 1.0f,
-                LoraScale = 1.0f,
+                LoraScale = 0.0f,
                 Seed = 1
             };
             QziCallbacks callbacks = default;

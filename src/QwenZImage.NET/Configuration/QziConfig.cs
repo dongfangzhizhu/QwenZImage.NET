@@ -37,6 +37,12 @@ public sealed record QziConfig
     /// <summary>Environment variable naming an explicit config file.</summary>
     public const string EnvironmentVariable = "QZI_CONFIG";
 
+    /// <summary>Environment variable carrying the Qwen21 LoRA directory to the native backend.</summary>
+    public const string LoraDirectoryVariable = "QZI_QWEN21_LORA_DIR";
+
+    /// <summary>Environment variable carrying the Z-Image Nunchaku directory to the native backend.</summary>
+    public const string NunchakuDirectoryVariable = "QZI_ZIMAGE_NUNCHAKU_DIR";
+
     private static readonly HashSet<string> KnownKeys = new(StringComparer.Ordinal)
     {
         "qwen21_dir", "zimage_dir", "zimage_nunchaku_dir", "qwen21_lora_dir",
@@ -87,7 +93,9 @@ public sealed record QziConfig
     public static QziConfig Load(string? explicitPath = null)
     {
         string? path = ResolvePath(explicitPath);
-        if (path is null) return new QziConfig();
+        // Environment overrides must apply even when no config file exists:
+        // a container that only sets QZI_* still has to reach the engine.
+        if (path is null) return new QziConfig().ApplyEnvironmentOverrides();
 
         using JsonDocument doc = Parse(path);
         JsonElement root = doc.RootElement;
@@ -157,6 +165,8 @@ public sealed record QziConfig
         Qwen21Directory = Qwen21Directory,
         ZImageDirectory = ZImageDirectory,
         CacheDirectory = TextCacheDirectory,
+        Qwen21LoraDirectory = Qwen21LoraDirectory,
+        ZImageNunchakuDirectory = ZImageNunchakuDirectory,
         DeviceId = DeviceId,
         ThreadCount = ThreadCount,
         NativeLibraryPath = NativeLibraryPath,
@@ -243,8 +253,8 @@ public sealed record QziConfig
         QziConfig result = this;
         result = Env(result, "QZI_QWEN21_DIR", c => c with { Qwen21Directory = Expand(Environment.GetEnvironmentVariable("QZI_QWEN21_DIR")) });
         result = Env(result, "QZI_ZIMAGE_DIR", c => c with { ZImageDirectory = Expand(Environment.GetEnvironmentVariable("QZI_ZIMAGE_DIR")) });
-        result = Env(result, "QZI_ZIMAGE_NUNCHAKU_DIR", c => c with { ZImageNunchakuDirectory = Expand(Environment.GetEnvironmentVariable("QZI_ZIMAGE_NUNCHAKU_DIR")) });
-        result = Env(result, "QZI_QWEN21_LORA_DIR", c => c with { Qwen21LoraDirectory = Expand(Environment.GetEnvironmentVariable("QZI_QWEN21_LORA_DIR")) });
+        result = Env(result, NunchakuDirectoryVariable, c => c with { ZImageNunchakuDirectory = Expand(Environment.GetEnvironmentVariable(NunchakuDirectoryVariable)) });
+        result = Env(result, LoraDirectoryVariable, c => c with { Qwen21LoraDirectory = Expand(Environment.GetEnvironmentVariable(LoraDirectoryVariable)) });
         result = Env(result, "QZI_MODEL_CACHE", c => c with { TextCacheDirectory = Expand(Environment.GetEnvironmentVariable("QZI_MODEL_CACHE")) });
         result = Env(result, "QZI_NATIVE_LIBRARY", c => c with { NativeLibraryPath = Expand(Environment.GetEnvironmentVariable("QZI_NATIVE_LIBRARY")) });
         if (int.TryParse(Environment.GetEnvironmentVariable("QZI_DEVICE_ID"), out int device))

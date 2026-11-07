@@ -99,14 +99,17 @@
       </div>
     </div>
 
-    <div class="grid-2" data-only="qwen21" data-requires="base">
+    <!-- LoRA is a Qwen21 feature on BOTH tiers (the library and C ABI allow
+         it on turbo as well), so only steps/guidance/negative-prompt are
+         base-only. Changing the adapter or scale reloads the DiT. -->
+    <div class="grid-2" data-only="qwen21">
       <div class="field">
-        <label for="lora">LoRA <span class="hint">bare file name</span></label>
-        <input id="lora" type="text" placeholder="dmd2.safetensors" disabled>
+        <label for="lora">LoRA <span class="hint">bare file name · turbo &amp; base</span></label>
+        <input id="lora" type="text" placeholder="dmd2.safetensors">
       </div>
       <div class="field">
         <label for="lora-scale">LoRA scale <span class="hint">0.05–4</span></label>
-        <input id="lora-scale" type="number" min="0.05" max="4" step="0.05" value="1" disabled>
+        <input id="lora-scale" type="number" min="0.05" max="4" step="0.05" value="1">
       </div>
     </div>
 

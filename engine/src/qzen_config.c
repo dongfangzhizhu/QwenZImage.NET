@@ -286,6 +286,43 @@ int qzen_config_load(const char *explicit_path, qzen_config *out,
     return 1;
 }
 
+/* Mirrors QziConfig.ApplyEnvironmentOverrides() exactly. These variables are
+ * also how QziClient forwards code-level values for keys that have no field
+ * in qzi_engine_config, so ignoring them here would silently drop LoRA /
+ * Nunchaku directory overrides. */
+static const struct {
+    const char *env;
+    const char *key;
+} env_overrides[] = {
+    {"QZI_QWEN21_DIR",           "qwen21_dir"},
+    {"QZI_ZIMAGE_DIR",           "zimage_dir"},
+    {"QZI_QWEN21_LORA_DIR",      "qwen21_lora_dir"},
+    {"QZI_ZIMAGE_NUNCHAKU_DIR",  "zimage_nunchaku_dir"},
+    {"QZI_MODEL_CACHE",          "text_cache_dir"},
+};
+
+int qzen_config_apply_environment(qzen_config *config, char *error,
+                                  size_t error_cap) {
+    size_t index;
+    if (!config) return -1;
+    if (error && error_cap) error[0] = '\0';
+    for (index = 0; index < sizeof(env_overrides) / sizeof(env_overrides[0]);
+         index++) {
+        const char *value = getenv(env_overrides[index].env);
+        int slot;
+        if (!value || !*value) continue;
+        slot = find_field(env_overrides[index].key);
+        if (slot < 0) continue;
+        if (!qzen_config_expand_home(value, config_slot(config, slot),
+                                     QZEN_CONFIG_PATH_MAX)) {
+            report(error, error_cap, env_overrides[index].env, NULL,
+                   "path is too long");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 const char *qzen_config_field(const qzen_config *config, const char *key) {
     if (!config || !key) return "";
     int index = find_field(key);

@@ -19,6 +19,9 @@
 | `QZI_ABI_VERSION` | `1` |
 | `QZI_ERROR_CAPACITY` | `512` |
 | `QZI_LAYOUT_SLOTS` | `6` |
+| `QZI_LORA_NAME_MAX` | `255`（LoRA 裸文件名的最大 UTF-8 字节数，不含 NUL） |
+
+> 新增 `QZI_LORA_NAME_MAX` 只影响输入校验，不改变任何结构体布局或函数签名，因此 **ABI 版本仍是 v1**。
 
 `qzi_abi_layout(size_t *sizes, size_t count)` 按以下槽位写 `sizeof()`（x86-64 / 64 位平台上实测值）：
 
@@ -67,6 +70,25 @@
 | 7 | `QZI_ERR_ENGINE` | 模型加载 / denoise / VAE / 设备错误 |
 | 8 | `QZI_ERR_INTERNAL` | 内部错误 |
 
+## 请求归一化与 LoRA 契约（v1）
+
+`qzi_generate_qwen21()` 先用 `qzi_validate_qwen21()` 拒绝非法请求，再用 `qzi_normalize_qwen21()` 复制并归一化，最后把**归一化副本**交给 backend；调用方的结构体不变。参考后端与真实 CUDA 后端看到的有效值因此完全一致。
+
+| 字段 | 合法输入 | 归一化 / 语义 |
+| --- | --- | --- |
+| `tier` | `NULL` / `"turbo"` / `"base"` | `NULL` → `"turbo"`；两个 tier 都允许 LoRA |
+| `steps` | `0` 或 tier 对应合法值 | `0` → turbo `8` / base `40` |
+| `guidance` | `0.0f` 或有限合法值 | `0.0f` → turbo `1.0f` / base `4.0f`；NaN / Inf 一律拒绝 |
+| `lora` | `NULL` 或裸文件名 | ≤ `QZI_LORA_NAME_MAX` UTF-8 字节；禁止 `/`、`\`、`:`、`..`、`< 0x20`、`0x7f`；在 `qwen21_lora_dir` 中解析 |
+| `lora_scale` | `0.0f` 或 `[0.05, 4]` 内的有限值 | `0.0f` 是「无 adapter / 默认强度」sentinel：有 `lora` 时归一化为 `1.0f`，没有 `lora` 时**是唯一允许的值** |
+
+关键约束：
+
+- **非法值一律拒绝，不静默 coerce**：`scale <= 0`（除 `0` sentinel 外）、`< 0.05`、`> 4`、NaN / Inf、无 `lora` 却带非 0 scale，全部返回 `QZI_ERR_INVALID_ARGUMENT`。
+- `0.0f` 与 `1.0f` scale 在真实后端视为同一 adapter 状态，避免多 GB 的 DiT 重载。
+- `lora` 切换、scale 改变或移除 adapter 都会触发 DiT 重载并上报一次 `"model load"` phase；真实后端在加载权重**之前**校验裸文件名与目录，合并失败会清空 DiT，不留半合并权重。
+- `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` 不在 ABI 里：它们通过 `QZI_CONFIG` 指定的配置文件或环境变量传入，native 侧由 `qzen_config_apply_environment()` 在 `qzen_config_load()` 之后应用（支持 `~` 展开）。`QziClient` 会把代码级 `QziClientOptions.Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 发布成这两个变量。
+
 ## 典型调用序列
 
 ```c
@@ -97,7 +119,8 @@ if (qzi_engine_create(&config, &engine, error, sizeof(error)) != QZI_OK) goto fa
 qzi_qwen21_request req = {0};
 req.prompt = "a red fox in snow";
 req.width = 1024; req.height = 1024;
-req.steps = 8; req.guidance = 1.0f; req.lora_scale = 1.0f; req.seed = 42;
+req.steps = 8; req.guidance = 1.0f; req.lora_scale = 0.0f; req.seed = 42;
+/* lora_scale == 0 表示「引擎默认 1.0」；没有 req.lora 时这是唯一允许的值。 */
 
 qzi_callbacks cb = { on_progress, should_cancel, user_data };
 qzi_image image = {0};
@@ -140,7 +163,7 @@ qzi_engine_destroy(engine);
 
 ## 两个内置 backend
 
-- **参考后端**：`native/src/qzi_stub.c` 实现的 `qzi-reference`，无需 GPU/权重/网络，按 prompt、seed、尺寸、模型标签生成确定性 RGB 噪点图，再由 `native/src/qzi_png.c` 编码为 PNG（stored DEFLATE 块，无 zlib 依赖）。它跑完整的 5 个阶段并上报 `dit` 步，`qzi_health.reference_backend == 1`。用途：CI、托管单测、C smoke test、ABI 对照。**它不是图像模型，输出不是真实生成结果。**
+- **参考后端**：`native/src/qzi_stub.c` 实现的 `qzi-reference`，无需 GPU/权重/网络，按**所有会改变引擎输出的字段**（prompt、seed、尺寸、模型标签、tier、lora、lora_scale、steps、guidance、negative_prompt）生成确定性 RGB 噪点图，再由 `native/src/qzi_png.c` 编码为 PNG（stored DEFLATE 块，无 zlib 依赖）。它跟踪模型 / tier / adapter / scale 变化并像真实后端一样上报 `"model load"`，还跑完整的 5 个阶段与 `dit` 步，`qzi_health.reference_backend == 1`。用途：CI、托管单测、C smoke test、ABI 对照与参数贯通验证。**它不是图像模型，输出不是真实生成结果。**
 - **真实后端**：`native/src/qzi_engine_backend.c` + `engine/` 的 C/CUDA 引擎，仅在 `-DQZI_WITH_CUDA_ENGINE=ON` 时链入。做文本编码、DiT 去噪与 VAE 解码，PNG 直接在内存里编码，`qzi_health.reference_backend == 0`。需要 CUDA Toolkit、匹配的 SM 架构以及自备的模型权重。
 
-`native/tests/qzi_abi_smoke.c` 会根据 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release），真实构建只验证 ABI 布局与参数校验，避免 CI 加载多 GB 权重。详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
+`native/tests/qzi_abi_smoke.c` 会根据 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release、LoRA 参数字节差异、`"model load"` phase），两种构建都跑 ABI 布局、LoRA 裸文件名 / 长度 / scale 边界与 fp4 大小写校验，真实构建**不加载多 GB 权重**。详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。

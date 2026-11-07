@@ -140,7 +140,7 @@ cancel, retry, SSE progress, gallery, trash, unload) is unchanged.
 | `--models <path>` | — | Override both model pack directories (`qwen21_dir` / `zimage_dir`) |
 | `QZI_MODEL_DIR` | from config | `QziClientOptions.Qwen21Directory` / `ZImageDirectory` |
 | `QZI_QWEN21_DIR` / `QZI_ZIMAGE_DIR` | from config | Per-model directory overrides |
-| `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_QWEN21_LORA_DIR` | from config | Native-only pack overrides (also read from the config file) |
+| `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_QWEN21_LORA_DIR` | from config | Pack directories for LoRA / Nunchaku weights. Read by both `QziConfig` and the native config loader; code-level `QziClientOptions` values are published through these variables so the engine sees them |
 | `QZI_MODEL_CACHE` | from config | Text-encoder cache directory |
 | `QZI_NATIVE_LIBRARY` | auto-probe | Full path to `QwenZImageNative.dll` / `libQwenZImageNative.so` |
 | `QZI_DEVICE_ID` | `-1` | CUDA device selector passed to the native backend |
@@ -193,8 +193,11 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 ```
 
 `model` accepts `qwen21` (aliases `qwen`, `qwen-image`) or `zimage`
-(aliases `z-image`, `z_image`). Qwen21 adds `tier` (`turbo`/`base`), and for
-`base`: `steps`, `guidance`, `negative_prompt`, `lora`, `lora_scale`.
+(aliases `z-image`, `z_image`). Qwen21 adds `tier` (`turbo`/`base`);
+`lora` and `lora_scale` are valid on **both** tiers, while `steps`,
+`guidance` and `negative_prompt` are `base` only. The browser form keeps the
+LoRA fields enabled for both tiers and sends them outside the base-only branch;
+changing the adapter or its scale reloads the DiT.
 Z-Image adds `checkpoint` (`bf16`, `nunchaku`, `nunchaku-r<rank>`).
 The full validation rules are in [PARAMETERS.md](PARAMETERS.md); invalid
 envelopes fail with `400` **before** any native model loading.
@@ -223,6 +226,8 @@ connections. `EventSource` reconnects automatically.
 - Model selector, presets filtered by model, prompt / negative prompt, width,
   height (step hint changes 32 ↔ 16), seed with randomiser, tier / steps /
   guidance / LoRA / checkpoint fields with automatic enable-disable rules.
+  LoRA + LoRA scale stay enabled on **both** `turbo` and `base` (matching the
+  library and C ABI); only steps / guidance / negative prompt are base-only.
 - Live job table with state badge, progress bar, elapsed time, cancel / retry.
 - Output gallery with lazy thumbnails, multi-select, batch delete, "Undo
   delete" (restore), lightbox, and direct link to the original PNG.

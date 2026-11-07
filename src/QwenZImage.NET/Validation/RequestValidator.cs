@@ -19,6 +19,9 @@ public static class RequestValidator
     /// <summary>Maximum output area, in pixels.</summary>
     public const long MaxCanvasPixels = 2048L * 2048L;
 
+    /// <summary>Maximum LoRA adapter file name length, in UTF-8 bytes.</summary>
+    public const int MaxLoraNameBytes = 255;
+
     /// <summary>Validates any request kind.</summary>
     /// <exception cref="ArgumentException">A rule was violated.</exception>
     public static void Validate(GenerationOptions options)
@@ -63,8 +66,10 @@ public static class RequestValidator
             if (options.Steps is < 1 or > 50)
                 throw new ArgumentException("Base tier Steps must be 1..50.", nameof(options));
             if (options.Guidance is not null &&
-                (options.Guidance < 1.0f || options.Guidance > 20.0f))
-                throw new ArgumentException("Base tier Guidance must be 1..20.", nameof(options));
+                (!float.IsFinite(options.Guidance.Value) ||
+                 options.Guidance < 1.0f || options.Guidance > 20.0f))
+                throw new ArgumentException(
+                    "Base tier Guidance must be finite and in 1..20.", nameof(options));
         }
 
         if (options.LoraScale is not null && string.IsNullOrEmpty(options.Lora))
@@ -73,14 +78,32 @@ public static class RequestValidator
                 nameof(options));
         if (!string.IsNullOrEmpty(options.Lora))
         {
-            string lora = options.Lora!;
-            if (lora.Contains('/') || lora.Contains('\\') || lora.Contains("..", StringComparison.Ordinal))
+            if (!IsBareLoraName(options.Lora!))
                 throw new ArgumentException(
-                    "Lora must be a bare file name without path separators.", nameof(options));
+                    $"Lora must be a bare file name of at most {MaxLoraNameBytes} UTF-8 bytes " +
+                    "(no path separators, ':', '..' or control characters).", nameof(options));
             float scale = options.EffectiveLoraScale;
-            if (scale < 0.05f || scale > 4.0f)
-                throw new ArgumentException("LoraScale must be 0.05..4.", nameof(options));
+            if (!float.IsFinite(scale) || scale < 0.05f || scale > 4.0f)
+                throw new ArgumentException(
+                    "LoraScale must be finite and in 0.05..4.", nameof(options));
         }
+    }
+
+    /// <summary>
+    /// Mirrors <c>qzi.c</c>'s <c>no_path_separators()</c>: the name is joined
+    /// onto <c>qwen21_lora_dir</c> by the engine, so it must never be able to
+    /// escape that directory or be truncated by a fixed-size buffer.
+    /// </summary>
+    private static bool IsBareLoraName(string name)
+    {
+        if (string.IsNullOrEmpty(name) ||
+            Encoding.UTF8.GetByteCount(name) > MaxLoraNameBytes ||
+            name.Contains('/') || name.Contains('\\') || name.Contains(':') ||
+            name.Contains("..", StringComparison.Ordinal))
+            return false;
+        foreach (char ch in name)
+            if (ch < ' ' || ch == '\u007f') return false;
+        return true;
     }
 
     /// <summary>Validates a Z-Image request.</summary>

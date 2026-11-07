@@ -65,7 +65,10 @@ typedef struct qzen_state {
     qzen_qwen21_model  *dit;
     qzen_qwen21_vae    *vae;
     int   tier_resident;        /* -1 none, 0 base, 1 turbo */
-    char  lora_resident[128];
+    /* QZI_LORA_NAME_MAX + 1: never truncate an adapter name, otherwise two
+     * different adapters sharing a prefix would look "resident" and the
+     * wrong weights would stay merged. */
+    char  lora_resident[QZI_LORA_NAME_MAX + 1];
     float lora_scale_resident;
     float *uncond;
     int    uncond_tokens;
@@ -343,12 +346,32 @@ static qzi_status resolve_qwen21_pack(qzen_state *s, char *error, size_t cap)
 
 /* The ABI already guarantees `lora` is a bare file name. Keep the check here
  * too: the backend is the last line of defence before joining a user-supplied
- * name onto a directory. */
+ * name onto a directory. Mirrors qzi.c's no_path_separators() exactly. */
 static int adapter_name_is_bare(const char *name)
 {
+    const unsigned char *p;
     if (!name || !*name) return 0;
+    if (strlen(name) > QZI_LORA_NAME_MAX) return 0;
     if (strchr(name, '/') || strchr(name, '\\') || strchr(name, ':')) return 0;
-    return strncmp(name, "..", 2) != 0;
+    if (strstr(name, "..")) return 0;
+    for (p = (const unsigned char *)name; *p; p++)
+        if (*p < 0x20u || *p == 0x7fu) return 0;
+    return 1;
+}
+
+/* Drops every trace of a resident DiT. `qzen_qwen21_apply_lora()` merges
+ * adapters into the INT8 weights *in place*, so a failed merge can leave a
+ * half-applied model behind. Keeping such a DiT would make the next request
+ * (especially one with no LoRA) silently render with corrupted weights. */
+static void forget_qwen21_dit(qzen_state *s)
+{
+    if (s->dit) { qzen_qwen21_close(s->dit); s->dit = NULL; }
+    s->tier_resident = -1;
+    s->lora_resident[0] = '\0';
+    s->lora_scale_resident = 0.0f;
+    /* Deliberately keep s->resident: the text tower / VAE may still be
+     * resident, and qzen_generate_zimage() uses this flag to release them on
+     * a model switch. s->dit == NULL is what forces the next reload. */
 }
 
 static qzi_status ensure_qwen21_dit(qzen_state *s, int turbo,
@@ -357,39 +380,23 @@ static qzi_status ensure_qwen21_dit(qzen_state *s, int turbo,
                                     char *error, size_t cap)
 {
     const char *tier_path = turbo ? s->q_turbo : s->q_base;
+    const char *wanted = lora && *lora ? lora : "";
+    /* qzi_generate_qwen21() already normalises the 0 sentinel to 1.0, but
+     * keep the backend correct on its own: 0 and 1.0 must not look like two
+     * different adapters and trigger a multi-GB reload. */
+    const float scale = lora_scale > 0.0f ? lora_scale : 1.0f;
+    char lora_path[QZEN_PATH_CAP] = "";
+    int resident, same_adapter, need_reload;
+
     if (!*tier_path) {
         qzi_set_error_fmt(error, cap,
             "the qwen21 pack has no %s checkpoint", turbo ? "turbo" : "base");
         return QZI_ERR_UNSUPPORTED;
     }
-    const char *wanted = lora && *lora ? lora : "";
-    int resident = s->lora_resident[0] != '\0';
-    int same_adapter = (*wanted == '\0' && !resident) ||
-                       (*wanted && resident &&
-                        !strcmp(wanted, s->lora_resident) &&
-                        lora_scale == s->lora_scale_resident);
-    int need_reload = !s->dit || s->tier_resident != turbo ||
-                      (resident && !same_adapter) ||
-                      (!resident && *wanted);
 
-    if (need_reload) {
-        if (s->dit) { qzen_qwen21_close(s->dit); s->dit = NULL; }
-        bridge_emit(bridge, "model load", 0, 1);
-        char load_error[QZEN_ERR_CAP] = "";
-        s->dit = qzen_qwen21_open(tier_path, 0, load_error,
-                                  sizeof(load_error));
-        if (!s->dit) {
-            qzi_set_error_fmt(error, cap, "qwen21 DiT: %s", load_error);
-            return QZI_ERR_ENGINE;
-        }
-        s->tier_resident = turbo;
-        s->lora_resident[0] = '\0';
-        s->lora_scale_resident = 0.0f;
-        free(s->uncond);
-        s->uncond = NULL;
-        s->uncond_tokens = 0;
-    }
-    if (*wanted && !same_adapter) {
+    /* Validate and resolve the adapter *before* loading multi-GB weights, so
+     * a bad name or a missing directory fails immediately. */
+    if (*wanted) {
         if (!adapter_name_is_bare(wanted)) {
             qzi_set_error_fmt(error, cap, "invalid adapter name \"%s\"",
                               wanted);
@@ -400,20 +407,49 @@ static qzi_status ensure_qwen21_dit(qzen_state *s, int turbo,
                 "qwen21_lora_dir is not configured (see QwenZImage.config.json)");
             return QZI_ERR_NOT_CONFIGURED;
         }
-        char lora_path[QZEN_PATH_CAP];
         if (!join_path(lora_path, sizeof(lora_path), s->qwen21_lora_dir,
                        wanted)) {
             qzi_set_error(error, cap, "the LoRA path is too long");
             return QZI_ERR_ENGINE;
         }
+    }
+
+    resident = s->lora_resident[0] != '\0';
+    same_adapter = (*wanted == '\0' && !resident) ||
+                   (*wanted && resident &&
+                    !strcmp(wanted, s->lora_resident) &&
+                    scale == s->lora_scale_resident);
+    need_reload = !s->dit || s->tier_resident != turbo ||
+                  (resident && !same_adapter) ||
+                  (!resident && *wanted);
+
+    if (need_reload) {
+        /* Clear the cache first: if qzen_qwen21_open() fails, no stale
+         * "adapter is resident" state may survive. */
+        forget_qwen21_dit(s);
+        bridge_emit(bridge, "model load", 0, 1);
         char load_error[QZEN_ERR_CAP] = "";
-        if (!qzen_qwen21_apply_lora(s->dit, lora_path, lora_scale,
+        s->dit = qzen_qwen21_open(tier_path, 0, load_error,
+                                  sizeof(load_error));
+        if (!s->dit) {
+            qzi_set_error_fmt(error, cap, "qwen21 DiT: %s", load_error);
+            return QZI_ERR_ENGINE;
+        }
+        s->tier_resident = turbo;
+        free(s->uncond);
+        s->uncond = NULL;
+        s->uncond_tokens = 0;
+    }
+    if (*wanted && (need_reload || !same_adapter)) {
+        char load_error[QZEN_ERR_CAP] = "";
+        if (!qzen_qwen21_apply_lora(s->dit, lora_path, scale,
                                     load_error, sizeof(load_error))) {
+            forget_qwen21_dit(s);
             qzi_set_error_fmt(error, cap, "qwen21 LoRA: %s", load_error);
             return QZI_ERR_ENGINE;
         }
         snprintf(s->lora_resident, sizeof(s->lora_resident), "%s", wanted);
-        s->lora_scale_resident = lora_scale;
+        s->lora_scale_resident = scale;
     }
     if (!s->vae) {
         char load_error[QZEN_ERR_CAP] = "";
@@ -588,6 +624,14 @@ static qzi_status qzen_init(void **out_context,
     char config_error[QZEN_ERR_CAP] = "";
     int rc = qzen_config_load(NULL, &file, config_error, sizeof(config_error));
     if (rc < 0) {
+        qzi_set_error_fmt(error, error_cap, "config: %s", config_error);
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    /* Environment overrides have the same precedence as on the managed side,
+     * and are the only channel for qwen21_lora_dir / zimage_nunchaku_dir set
+     * in code (the C ABI has no fields for them). */
+    if (qzen_config_apply_environment(&file, config_error,
+                                      sizeof(config_error)) < 0) {
         qzi_set_error_fmt(error, error_cap, "config: %s", config_error);
         return QZI_ERR_NOT_CONFIGURED;
     }

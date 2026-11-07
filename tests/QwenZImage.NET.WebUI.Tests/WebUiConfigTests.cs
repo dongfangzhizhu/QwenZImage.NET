@@ -53,6 +53,39 @@ public class WebUiConfigTests : IDisposable
         Assert.Equal(Path.Combine(_dir, "outputs"), config.OutputDirectory);
     }
 
+    [Theory]
+    [InlineData("turbo")]
+    [InlineData("base")]
+    public void Lora_Is_Mapped_On_Both_Tiers(string tier)
+    {
+        GenerateRequest request = new()
+        {
+            Model = "qwen21", Prompt = "a red fox", Tier = tier,
+            Lora = "dmd2.safetensors", LoraScale = 1.5f,
+            Steps = tier == "base" ? 20 : null,
+            Guidance = tier == "base" ? 4.0f : null
+        };
+
+        QwenImageOptions options = Assert.IsType<QwenImageOptions>(RequestMapper.ToOptions(request));
+        Assert.Equal("dmd2.safetensors", options.Lora);
+        Assert.Equal(1.5f, options.LoraScale);
+    }
+
+    [Fact]
+    public void Config_Propagates_Lora_And_Nunchaku_Directories()
+    {
+        string path = Path.Combine(_dir, "with-loras.json");
+        File.WriteAllText(path, """
+            { "qwen21_lora_dir": "/webui/loras",
+              "zimage_nunchaku_dir": "/webui/svdq" }
+            """);
+
+        WebUiConfig config = WebUiConfig.FromEnvironment(_dir, ["--config", path]);
+        Assert.Equal("/webui/loras", config.ClientOptions.Qwen21LoraDirectory);
+        Assert.Equal("/webui/svdq", config.ClientOptions.ZImageNunchakuDirectory);
+        Assert.Equal(path, config.ConfigPath);
+    }
+
     [Fact]
     public void Output_File_Names_Are_Validated()
     {

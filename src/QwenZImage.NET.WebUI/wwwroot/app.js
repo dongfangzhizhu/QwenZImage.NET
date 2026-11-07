@@ -162,16 +162,18 @@ function buildRequestBody() {
   };
   if (model === "qwen21") {
     body.tier = $("tier").value;
+    // LoRA is valid on both tiers in the library / C ABI; only the sampler
+    // controls and negative prompt are base-only.
+    const lora = $("lora").value.trim();
+    if (lora) {
+      body.lora = lora;
+      body.lora_scale = Number($("lora-scale").value);
+    }
     if (body.tier === "base") {
       body.steps = Number($("steps").value);
       body.guidance = Number($("guidance").value);
       const negative = $("negative").value.trim();
       if (negative) body.negative_prompt = negative;
-      const lora = $("lora").value.trim();
-      if (lora) {
-        body.lora = lora;
-        body.lora_scale = Number($("lora-scale").value);
-      }
     }
   } else {
     body.checkpoint = $("checkpoint").value;

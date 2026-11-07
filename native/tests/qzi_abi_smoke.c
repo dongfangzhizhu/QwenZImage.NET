@@ -29,12 +29,67 @@ static int is_png(const qzi_image *image)
     return image->size > 33 && memcmp(image->data, sig, 8) == 0;
 }
 
+static int model_load_seen = 0;
+
+static void on_progress(const char *phase, int32_t completed, int32_t total,
+                        double elapsed, void *user)
+{
+    (void)completed; (void)total; (void)elapsed; (void)user;
+    if (phase && strcmp(phase, "model load") == 0) model_load_seen++;
+}
+
+/* LoRA validation is duplicated in qzi.c, the managed RequestValidator and
+ * the real backend. These cases run before the vtable is called, so they are
+ * valid on both backends (no model weights needed). Returns the number of
+ * rejected requests issued, so main() can assert the health counters. */
+static int check_lora_validation(qzi_engine *engine,
+                                 const qzi_qwen21_request *base,
+                                 char *error, size_t error_cap)
+{
+    char long_name[QZI_LORA_NAME_MAX + 2];
+    qzi_image image;
+    int index, rejected = 0;
+    struct {
+        const char *lora;
+        float scale;
+    } cases[] = {
+        {"../escape.safetensors", 1.0f},
+        {"C:escape.safetensors", 1.0f},
+        {"a\\b.safetensors", 1.0f},
+        {NULL, 1.0f},                 /* filled with long_name below */
+        {NULL, 2.0f},                 /* scale without an adapter */
+        {"a.safetensors", 5.0f},
+        {"a.safetensors", -1.0f},
+        {"a.safetensors", 0.01f},
+        {"a.safetensors", 4.01f},
+    };
+    memset(&image, 0, sizeof(image));
+    memset(long_name, 'a', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    cases[3].lora = long_name;       /* QZI_LORA_NAME_MAX + 1 bytes */
+
+    for (index = 0; index < (int)(sizeof(cases) / sizeof(cases[0])); index++) {
+        qzi_qwen21_request r = *base;
+        r.lora = cases[index].lora;
+        r.lora_scale = cases[index].scale;
+        if (qzi_generate_qwen21(engine, &r, NULL, &image, error,
+                                error_cap) != QZI_ERR_INVALID_ARGUMENT) {
+            fprintf(stderr, "FAIL: lora validation case %d (%s)\n",
+                    index, error[0] ? error : "no error");
+            failures++;
+        }
+        rejected++;
+    }
+    return rejected;
+}
+
 int main(void)
 {
     qzi_engine_config config;
     qzi_qwen21_request qwen;
     qzi_zimage_request zimage;
-    qzi_image a, b;
+    qzi_image a, b, c;
+    qzi_callbacks callbacks;
     qzi_health health;
     qzi_engine *engine = NULL;
     char error[QZI_ERROR_CAPACITY];
@@ -42,12 +97,15 @@ int main(void)
     qzi_status status;
     int equal = 0;
     int reference = 0;
+    int extra_rejected = 0;
 
     memset(&config, 0, sizeof(config));
     memset(&qwen, 0, sizeof(qwen));
     memset(&zimage, 0, sizeof(zimage));
     memset(&a, 0, sizeof(a));
     memset(&b, 0, sizeof(b));
+    memset(&c, 0, sizeof(c));
+    memset(&callbacks, 0, sizeof(callbacks));
     memset(&health, 0, sizeof(health));
 
     CHECK(qzi_abi_version() == QZI_ABI_VERSION, "abi version");
@@ -84,7 +142,7 @@ int main(void)
     qwen.height = 64;
     qwen.steps = 8;
     qwen.guidance = 1.0f;
-    qwen.lora_scale = 1.0f;
+    qwen.lora_scale = 0.0f;   /* 0 = ABI default (1.0); non-zero requires lora */
     qwen.seed = 42;
 
     zimage.prompt = "a red fox in snow";
@@ -109,6 +167,37 @@ int main(void)
             equal = memcmp(a.data, b.data, a.size) == 0;
         CHECK(equal, "identical request is byte-identical");
 
+        /* LoRA and its strength are part of the request identity. Without a
+         * GPU these bytes are the only way to prove the parameter is plumbed
+         * all the way through the ABI instead of being silently dropped. */
+        callbacks.progress = on_progress;
+        qwen.lora = "dmd2.safetensors";
+        qwen.lora_scale = 0.0f;        /* ABI default -> effective 1.0 */
+        model_load_seen = 0;
+        status = qzi_generate_qwen21(engine, &qwen, &callbacks, &c, error,
+                                     sizeof(error));
+        CHECK(status == QZI_OK, "qwen21 lora generate");
+        if (status != QZI_OK) fprintf(stderr, "  lora error: %s\n", error);
+        CHECK(status != QZI_OK ||
+              (a.size == c.size && memcmp(a.data, c.data, a.size) != 0),
+              "lora changes output bytes");
+        CHECK(model_load_seen == 1, "adapter switch emits model load phase");
+
+        qzi_image_release(engine, &b);   /* free the byte-identical baseline */
+        qwen.lora_scale = 2.0f;
+        model_load_seen = 0;
+        status = qzi_generate_qwen21(engine, &qwen, &callbacks, &b, error,
+                                     sizeof(error));
+        CHECK(status == QZI_OK, "qwen21 lora scale generate");
+        CHECK(status != QZI_OK ||
+              (b.size == c.size && memcmp(b.data, c.data, b.size) != 0),
+              "lora_scale changes output bytes");
+        CHECK(model_load_seen == 1, "scale change emits model load phase");
+
+        qwen.lora = NULL;
+        qwen.lora_scale = 0.0f;
+        callbacks.progress = NULL;
+        qzi_image_release(engine, &c);
         qzi_image_release(engine, &b);
         CHECK(b.data == NULL && b.token == 0, "image release zeroes struct");
         qzi_image_release(engine, &a);
@@ -138,18 +227,30 @@ int main(void)
     status = qzi_generate_zimage(engine, &zimage, NULL, &a, error,
                                  sizeof(error));
     CHECK(status == QZI_ERR_UNSUPPORTED, "fp4 checkpoint rejected");
+    extra_rejected = 0;
+    zimage.checkpoint = "SVDQ-FP4-r256";   /* managed side is case-insensitive */
+    status = qzi_generate_zimage(engine, &zimage, NULL, &a, error,
+                                 sizeof(error));
+    CHECK(status == QZI_ERR_UNSUPPORTED, "uppercase fp4 checkpoint rejected");
+    extra_rejected++;
     zimage.checkpoint = "bf16";
+
+    /* Every LoRA validation case is rejected in qzi.c, before any backend
+     * call, so these run on the real CUDA build too. */
+    extra_rejected += check_lora_validation(engine, &qwen, error,
+                                            sizeof(error));
 
     CHECK(qzi_engine_health(engine, &health, error, sizeof(error)) == QZI_OK,
           "health");
     if (reference) {
-        CHECK(health.served == 3, "served counter");
-        CHECK(health.rejected == 2, "rejected counter");
+        /* 2 baseline qwen21 + 2 LoRA qwen21 + 1 zimage generation. */
+        CHECK(health.served == 5, "served counter");
+        CHECK(health.rejected == 2 + extra_rejected, "rejected counter");
         CHECK(health.reference_backend == 1, "reference backend flag");
         CHECK(health.resident_model == QZI_MODEL_ZIMAGE, "resident model");
     } else {
         CHECK(health.served == 0, "served counter");
-        CHECK(health.rejected == 2, "rejected counter");
+        CHECK(health.rejected == 2 + extra_rejected, "rejected counter");
         CHECK(health.reference_backend == 0, "real backend flag");
     }
     CHECK(qzi_engine_unload(engine, error, sizeof(error)) == QZI_OK, "unload");

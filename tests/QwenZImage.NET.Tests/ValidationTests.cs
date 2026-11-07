@@ -92,11 +92,56 @@ public class ValidationTests
         RequestValidator.Validate(Qwen() with { Lora = "a.safetensors", LoraScale = 1.0f });
     }
 
+    [Theory]
+    [InlineData("../escape.safetensors")]
+    [InlineData("a/b.safetensors")]
+    [InlineData("a\\b.safetensors")]
+    [InlineData("C:escape.safetensors")]
+    [InlineData("bad\u0001name.safetensors")]
+    public void Lora_Bare_Name_Is_Enforced(string lora)
+        => Assert.Throws<ArgumentException>(() => RequestValidator.Validate(
+            Qwen() with { Lora = lora, LoraScale = 1.0f }));
+
+    [Fact]
+    public void Lora_Name_Length_Is_Bounded()
+    {
+        string tooLong = new('a', RequestValidator.MaxLoraNameBytes + 1);
+        Assert.Throws<ArgumentException>(() => RequestValidator.Validate(
+            Qwen() with { Lora = tooLong, LoraScale = 1.0f }));
+        string atLimit = new string('a', RequestValidator.MaxLoraNameBytes - 12) + ".safetensors";
+        RequestValidator.Validate(Qwen() with { Lora = atLimit, LoraScale = 1.0f });
+    }
+
+    [Fact]
+    public void LoraScale_Must_Be_Finite()
+    {
+        foreach (float bad in new[] { float.NaN, float.PositiveInfinity, float.NegativeInfinity })
+            Assert.Throws<ArgumentException>(() => RequestValidator.Validate(
+                Qwen() with { Lora = "a.safetensors", LoraScale = bad }));
+    }
+
+    [Fact]
+    public void Lora_Is_Available_On_Both_Tiers()
+    {
+        RequestValidator.Validate(Qwen() with { Lora = "a.safetensors", LoraScale = 1.0f });
+        RequestValidator.Validate(Qwen() with
+        {
+            Tier = QwenImageTier.Base, Lora = "dmd2.safetensors"
+        });
+    }
+
+    [Fact]
+    public void Base_Guidance_Must_Be_Finite()
+        => Assert.Throws<ArgumentException>(() => RequestValidator.Validate(
+            Qwen() with { Tier = QwenImageTier.Base, Guidance = float.NaN }));
+
     [Fact]
     public void ZImage_Checkpoint_Rules()
     {
         Assert.Throws<ArgumentException>(() => RequestValidator.Validate(
             ZImage() with { Checkpoint = "svdq-fp4-r256" }));
+        Assert.Throws<ArgumentException>(() => RequestValidator.Validate(
+            ZImage() with { Checkpoint = "SVDQ-FP4-r256" }));
         Assert.Throws<ArgumentException>(() => RequestValidator.Validate(
             ZImage() with { Checkpoint = "not-a-pack" }));
         RequestValidator.Validate(ZImage() with { Checkpoint = "nunchaku-r256" });
