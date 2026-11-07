@@ -134,6 +134,14 @@ Your app (.NET 10)                     Browser (manual testing only)
 - `bash scripts/stage-native.sh` 把两个 RID staging 恢复为**参考后端**（win 106,637 B / linux 38,440 B），随后 `dotnet pack` 产出 `.nupkg` + `.snupkg`，包内 16 项：`lib/net10.0/*.dll`+`.xml`、两个 RID native、4 份 docs、`README.md` / `LICENSE` / `THIRD_PARTY_NOTICES.md` / `engine/LICENSE`。
 - WebUI 运行时冒烟（Windows、参考后端，端口 7860）：`/api/health` 返回 `ok=true`、`transport: native-pinvoke`、`reference_backend: true`、`config_path` 自动解析到仓库根 `QwenZImage.config.json`；提交 qwen21 turbo / 32×32 / seed 7 后 job 变为 `done`，产出 3,172 B PNG 并出现在画廊，未因配置作用域化出现回归。
 
+阶段 13 执行结果（本轮新增）：
+
+- **仓库整洁度审计**：当前 tree 的 163 个文件全部是源码 / 文档 / 配置 / 脚本 / CI 定义，0 个未跟踪文件；11 个历史提交中从未加入过二进制、图片或构建产物（最大的两个 blob 都是 `engine/src/qzen_gpu.cu` 源码版本）。唯一命中的 `artifacts/.gitkeep` 是 0 字节目录占位，与 `.gitignore` 的 `artifacts/*` + `!artifacts/.gitkeep` 配套，保证 clone 后产物根目录存在，按结构文件保留而非删除。
+- **远程与推送**：`origin` 已用 `git remote set-url` 切到 `https://github.com/dongfangzhizhu/QwenZImage.NET.git`（原 `origin` 已存在，直接 `git remote add` 会失败）；远端原为空仓库，`git push -u origin main` 一次推送 11 个提交成功，无历史冲突。
+- **提交 `5562ffa`**：同步 `csproj` 的 `Authors` / `PackageProjectUrl` / `RepositoryUrl`、WebUI 页脚链接、PLAN 与 README；`release.yml` 改为 OIDC Trusted Publishing（`publish` job `id-token: write` + 单次 `NuGet/login@v1` + 短期 key 复用于 `.nupkg` / `.snupkg`，workflow 级权限降为 `contents: read`）；删除全部 `secrets.NUGET_API_KEY` 依赖与静态 key 发布命令。
+- **本机验证**：`git diff --check` 干净；`dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误（5 项目）；`dotnet test` **62 + 7 = 69** 全绿；Windows 参考后端 `ctest` **1/1**；`dotnet pack` 产出 16 项 `.nupkg` 与 5 项 `.snupkg`，nuspec 的 `<authors>` / `<projectUrl>` / `<repository url>` 均已指向 `dongfangzhizhu/QwenZImage.NET`；`release.yml` 经 YAML 解析确认权限块与 login 步骤正确。
+- **尚未执行 tag 发布**：首次实际发布仍需用户在 nuget.org 建 Trusted Publishing policy、在 GitHub 设 `NUGET_USER` secret（见第 5 节），之后推 `v*` tag 触发；刻意不在策略缺失时打 tag，避免触发必然失败的发布工作流。
+
 ## 4. 交付物清单
 
 ```
