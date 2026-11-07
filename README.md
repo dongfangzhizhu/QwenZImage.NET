@@ -295,10 +295,12 @@ PLAN.md                         计划、决策记录与发布清单
 ## 测试
 
 ```bash
-ctest --test-dir native/build --output-on-failure       # 参考后端完整契约
+ctest --test-dir native/build --output-on-failure       # 参考后端完整契约（Windows 1 项 / Linux 3 项）
 ctest --test-dir native/build-cuda --output-on-failure  # 真实后端 ABI + 校验（无需权重）
 dotnet test QwenZImage.NET.sln -c Release               # 托管测试
 ```
+
+Linux 上 `ctest` 另有 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两项，验证 POSIX ICU 兼容层的两条运行时路径：前者 `dlopen` 命中宿主 ICU 并把 `e + U+0301` 组合成 `é`，后者用 `-Wl,--wrap=dlopen` 强制「无 ICU」走内置回退（恒等 NFC）。二者共同覆盖字符分类、空白判断、含 4 字节代理对的 UTF-8 ↔ UTF-16 round-trip 与非法 UTF-8 报错。因为 `qzen_posix_unicode.c` 用 `pthread_once` 只解析一次 ICU，两条路径由两个独立可执行分担；链接器不支持 `--wrap` 时 configure 会优雅跳过该变体，宿主无 ICU 时对应测试记为 SKIP。这两项**不需要 CUDA**，GPU-less 的 Linux CI 在 reference 构建里就会跑。
 
 托管测试共 **61 项**（54 库 + 7 WebUI）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射。全部不需要 GPU、权重或网络监听。
 
@@ -316,7 +318,7 @@ bash scripts/run-real-image-regression.sh --out artifacts/regress/full
 
 ## 路线与发布
 
-见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）、阶段 12c（**LoRA / 参数全链路一致性**）与阶段 12d（**真图回归矩阵 10/10**，覆盖 LoRA、base、1024×1024、Z-Image bf16 与 Nunchaku r32/r256）亦已完成；按用户要求不做 macOS 适配；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
+见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）、阶段 12c（**LoRA / 参数全链路一致性**）与阶段 12d（**真图回归矩阵 10/10**，覆盖 LoRA、base、1024×1024、Z-Image bf16 与 Nunchaku r32/r256）与阶段 12e（**POSIX ICU 双路径检查接入 CTest**）亦已完成；按用户要求不做 macOS 适配；推送 GitHub 并发布 NuGet 按用户决定**暂缓**。
 
 ## 许可与声明
 

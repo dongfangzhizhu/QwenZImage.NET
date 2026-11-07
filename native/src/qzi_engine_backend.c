@@ -552,16 +552,14 @@ static qzi_status resolve_zimage_pack(qzen_state *s, const char *checkpoint,
         return QZI_ERR_UNSUPPORTED;
     }
 
-    /* Enumerate svdq-*.safetensors under zimage_nunchaku_dir. The checkpoint
-     * spelling is "nunchaku" (first int4 pack), "nunchaku-r<rank>" or
-     * "nunchaku-fp4-r<rank>"; a single .safetensors path is also accepted. */
+    /* Enumerate svdq-*.safetensors under zimage_nunchaku_dir. qzi.c rejects
+     * every checkpoint containing "fp4" (int4 packs only), so this resolver
+     * handles just "nunchaku" (first int4 pack) and "nunchaku-r<rank>";
+     * a single .safetensors path is also accepted. */
     char found[QZEN_PATH_CAP] = "";
     char best_name[256] = "";
     char rank[32] = "";
-    int want_fp4 = strncmp(checkpoint, "nunchaku-fp4-r", 14) == 0;
-    if (want_fp4) {
-        snprintf(rank, sizeof(rank), "%s", checkpoint + 13);
-    } else if (strncmp(checkpoint, "nunchaku-r", 10) == 0) {
+    if (strncmp(checkpoint, "nunchaku-r", 10) == 0) {
         snprintf(rank, sizeof(rank), "%s", checkpoint + 10);
     }
     char pattern[64];
@@ -587,10 +585,8 @@ static qzi_status resolve_zimage_pack(qzen_state *s, const char *checkpoint,
             if (strncmp(name, "svdq-", 5) != 0) continue;
             if (length < 14 || strcmp(name + length - 12, ".safetensors") != 0)
                 continue;
-            if (want_fp4 && strncmp(name, "svdq-fp4", 8) != 0) continue;
-            if (!want_fp4 && *rank && !strstr(name, pattern)) continue;
-            if (!want_fp4 && !*rank && strncmp(name, "svdq-int4", 9) != 0)
-                continue;
+            if (*rank && !strstr(name, pattern)) continue;
+            if (!*rank && strncmp(name, "svdq-int4", 9) != 0) continue;
             /* Deterministic choice: lexicographically first matching pack. */
             if (!*best_name || strcmp(name, best_name) < 0)
                 snprintf(best_name, sizeof(best_name), "%s", name);

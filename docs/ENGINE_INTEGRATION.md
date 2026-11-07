@@ -141,6 +141,8 @@ Windows 需要 MSVC + CUDA Toolkit 13+（nvcc / cudart / cuBLAS / cuBLASLt），
 
 `ctest` 的 `qzi_abi_smoke` 会按 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release、LoRA 参数引起的字节差异、`"model load"` phase），两种构建都跑 ABI 布局、LoRA 裸文件名 / 长度 / scale 边界与 fp4 大小写校验，真实构建**不加载多 GB 权重**。
 
+POSIX 构建额外注册两项 ICU 双路径检查（Windows 只有 `qzi_abi_smoke` 一项，因此 Linux `ctest` 是 3 项）：`posix_unicode_with_icu` 正常 `dlopen` 宿主 ICU，`posix_unicode_without_icu` 用 `-Wl,--wrap=dlopen` 让所有 `dlopen` 失败以走内置回退。测试源是 `native/tests/qzi_posix_unicode_check.c`，直接编译 `engine/platform/posix/qzen_posix_unicode.c`，不依赖 CUDA，所以 GPU-less CI 也会跑。两条路径必须同时满足字符分类、空白判断、含 U+1F98A 代理对的 UTF-8 ↔ UTF-16 字节级 round-trip、非法 UTF-8 报错与已组合文本 NFC 不变；唯一允许的差异是 `e + U+0301`：真实 ICU 组合为 `U+00E9`，回退按设计保持恒等。因为兼容层用 `pthread_once` 只解析一次 ICU，两项测试用两个独立可执行；链接器不支持 `--wrap` 时 CMake 打印 STATUS 并跳过回退变体，宿主无 ICU 时对应测试以退出码 77 记为 SKIP。
+
 把应用指向真实产物即可，托管程序集与 API 一行都不用改：
 
 ```bash

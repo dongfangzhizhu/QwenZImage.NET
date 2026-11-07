@@ -99,6 +99,52 @@ if(QZI_BUILD_TESTS)
     COMMENT "Placing QwenZImageNative next to qzi_abi_smoke")
   enable_testing()
   add_test(NAME qzi_abi_smoke COMMAND qzi_abi_smoke)
+
+  # POSIX ICU compatibility layer. It resolves ICU exactly once per process
+  # (pthread_once), so the two runtime paths need separate executables: one
+  # that dlopen()s the host ICU and one where GNU ld's --wrap=dlopen forces
+  # every open to fail. This is independent of the CUDA engine, so GPU-less
+  # Linux CI runs it on the reference build too.
+  if(NOT WIN32)
+    include(CheckLinkerFlag)
+    check_linker_flag(C "-Wl,--wrap=dlopen" QZI_HAVE_WRAP_DLOPEN)
+
+    set(QZI_POSIX_UNICODE_SRC
+        "${CMAKE_CURRENT_SOURCE_DIR}/../engine/platform/posix/qzen_posix_unicode.c")
+    set(QZI_POSIX_UNICODE_INC
+        "${CMAKE_CURRENT_SOURCE_DIR}/../engine/platform/posix/include")
+    find_package(Threads REQUIRED)
+
+    add_executable(qzi_posix_unicode_icu
+        tests/qzi_posix_unicode_check.c ${QZI_POSIX_UNICODE_SRC})
+    target_include_directories(qzi_posix_unicode_icu PRIVATE
+        ${QZI_POSIX_UNICODE_INC})
+    target_link_libraries(qzi_posix_unicode_icu PRIVATE
+        Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME posix_unicode_with_icu COMMAND qzi_posix_unicode_icu)
+    # Exit 77 means "no usable ICU on this host"; the shared assertions still
+    # ran and passed, so report it as a skip instead of a failure.
+    set_tests_properties(posix_unicode_with_icu PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    if(QZI_HAVE_WRAP_DLOPEN)
+      add_executable(qzi_posix_unicode_fallback
+          tests/qzi_posix_unicode_check.c ${QZI_POSIX_UNICODE_SRC})
+      target_compile_definitions(qzi_posix_unicode_fallback PRIVATE
+          QZEN_TEST_NO_ICU)
+      target_include_directories(qzi_posix_unicode_fallback PRIVATE
+          ${QZI_POSIX_UNICODE_INC})
+      target_link_libraries(qzi_posix_unicode_fallback PRIVATE
+          Threads::Threads ${CMAKE_DL_LIBS})
+      target_link_options(qzi_posix_unicode_fallback PRIVATE
+          "-Wl,--wrap=dlopen")
+      add_test(NAME posix_unicode_without_icu
+          COMMAND qzi_posix_unicode_fallback)
+    else()
+      message(STATUS
+        "QwenZImageNative: linker has no --wrap=dlopen; skipping the no-ICU CTest variant")
+    endif()
+  endif()
 endif()
 
 # Convenience: put binaries in artifacts/native/<platform> so the .NET test

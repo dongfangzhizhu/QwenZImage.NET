@@ -63,7 +63,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 2 | C ABI v1：`qzi.h` / `qzi_backend.h`、`qzi.c` 控制层、参考后端、无依赖 PNG 编码器、CMake、C smoke test | ✅ |
 | 3 | `.NET 10` 封装：Native 层 + 公开模型 / 校验 / 结果 / 客户端；同步 + 异步 + 零拷贝 `WriteTo` | ✅ |
 | 4 | 纯 `.NET` 队列与预设：`Channels` 串行分发、取消、重试、事件流、9 个预设 | ✅ |
-| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12c 后为 61 项）+ `ctest` native smoke（reference / CUDA 各 1/1） | ✅ 全绿 |
+| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12c 后为 61 项）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
 | 6 | 开源文档：README / LICENSE / THIRD_PARTY_NOTICES / NATIVE_ABI / PARAMETERS / ENGINE_INTEGRATION / WEBUI / 本计划 / 后端模板 | ✅ |
 | 7 | CI 与发布工作流：`ci.yml`、`release.yml`、`scripts/build-native.*` | ✅ |
 | 8 | `git init` + 本地提交 | ✅（不 push） |
@@ -74,6 +74,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 12b | **真实后端跨 GPU / 跨发行版可分发**（阶段 12 之后的收尾）：默认 fat binary 覆盖 11 个 SM + CMake 按 nvcc 能力过滤；Linux 运行时 `dlopen` ICU、产物无版本化 `libicuuc.so.NN` 依赖；OpenMP 显式链接；修复 `stage-native.sh` 的 `-cuda` 路径匹配 | ✅ |
 | 12c | **LoRA / 参数全链路一致性**（用户要求「确保功能完整性和一致性，包括 LoRA 支持」；不做 macOS 适配）：统一 ABI 契约与两侧校验（裸文件名 + 255 字节 + `QZI_LORA_NAME_MAX`、scale finite / `0.05..4`、fp4 大小写不敏感、默认值归一化）；打通 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` 配置覆盖链并让 native 读环境变量；修复真实后端 DiT/LoRA 状态机（提前校验、0 与 1.0 等价、合并失败清场）；参考后端把 tier / LoRA / scale / steps / guidance / negative prompt 纳入确定性哈希并跟踪重载 phase；WebUI 在 turbo / base 都开放 LoRA；补测试与文档 | ✅ |
 | 12d | **真图回归矩阵**（用户指定开发节奏第 1 项）：新增独立 `tools/RealImageRegression` harness（刻意不进 sln / CI，检测并拒绝参考后端），`cases.json` 覆盖 qwen21 turbo/base、LoRA scale 1.0 / 0.6、512 / 1024，以及 Z-Image bf16 与 Nunchaku r32 / r256；逐用例输出 PNG + SHA-256 + phase trace，报告增量落盘；Windows / Linux 运行脚本；10/10 真图通过并人工抽查确认非噪点 | ✅ |
+| 12e | **POSIX ICU 双路径检查接进 CTest**（用户指定节奏第 2 项）：把一次性 `.scratch` 脚本整理成 `native/tests/qzi_posix_unicode_check.c`，CMake 仅在 POSIX 且链接器支持 `--wrap=dlopen` 时构建 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两个可执行，不支持时优雅跳过；宿主无 ICU 时 CTest 记 SKIP；顺带清理真图回归审计发现的 `qzi_engine_backend.c` fp4 不可达死代码与 `checkpoint + 13` 偏移错误 | ✅ |
 | 13 | **推送 GitHub 开源 + 发布 NuGet** | ⏸ **按 D6 暂缓**，命令见第 5 节 |
 
 本机验证结果（D10 完成度）：
@@ -93,7 +94,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 - Linux 真实后端（WSL Debian 12 / GCC 12.2 + CUDA 13.0）先以单 SM 89、再以**默认 fat binary** 各重编一次，`ctest` 均 1/1；最终 `libQwenZImageNative.so` 22,434,336 字节，`readelf -d` 的 `NEEDED` **不再含 `libicuuc.so.72`**，改为正常的 `libgomp.so.1`，未解析 ICU 符号为 0，架构列表宏同样嵌入产物。此前该 `.so` 带版本化 ICU 依赖，跨发行版会加载失败。
 - 修掉两个既有构建缺陷：① OpenMP 只以 `COMPILE_LANGUAGE` 保护的编译选项传入，链接阶段求值为空，导致 `.so` 留下未解析 `omp_*` / `GOMP_parallel` 并让 smoke 链接失败 → 改用 `OpenMP::OpenMP_C` 显式链接；② `scripts/stage-native.sh` 的 `find -path '*/-cuda/*'` 永远匹配不到 `Linux-x86_64-cuda`，CUDA 产物 stage 不到且 reference 排除规则失效 → 改为 `'*-cuda/*'`，两种 flavour 均已实测。
 - `dotnet build` 0 警告 0 错误（5 项目）；`dotnet test` **42 + 4 = 46** 全绿；`dotnet pack` 产出 16 项包（含 `lib/net10.0/*.dll`、两个 RID native、4 份 docs、`engine/LICENSE`）。打包前已把 RID staging 恢复为 reference 后端。
-- POSIX ICU 兼容层另做了**独立运行时双路径验证**：正常链接（`dlopen` 命中系统 ICU 72）与用 `-Wl,--wrap=dlopen` 强制「无 ICU」两条路径，字符分类、UTF-8/UTF-16（含 4 字节代理对）round-trip、非法 UTF-8 报错、NFC 调用全部通过；前者把 `e + U+0301` 正确组合为 `é`，后者按设计退化为恒等归一化。该一次性检查脚本放在 `.scratch/`（git 忽略），未接进 CTest。
+- POSIX ICU 兼容层另做了**独立运行时双路径验证**：正常链接（`dlopen` 命中系统 ICU 72）与用 `-Wl,--wrap=dlopen` 强制「无 ICU」两条路径，字符分类、UTF-8/UTF-16（含 4 字节代理对）round-trip、非法 UTF-8 报错、NFC 调用全部通过；前者把 `e + U+0301` 正确组合为 `é`，后者按设计退化为恒等归一化。该一次性检查脚本当时放在 `.scratch/`（git 忽略）；**阶段 12e 已把它整理成仓库内正式 CTest**，两条路径由两个独立进程分别验证。
 
 阶段 12c 本机验证结果（本轮新增）：
 
@@ -111,8 +112,15 @@ Your app (.NET 10)                     Browser (manual testing only)
 - **Z-Image**：`bf16 512` 118.2 s、`bf16 1024` 10.2 s（权重常驻后）、`nunchaku-r32` 85.7 s、`nunchaku-r256` 61.9 s，四者 SHA 互不相同；checkpoint 切换都触发 `ModelLoad`。
 - phase trace 与阶段 12c 的状态机一致：首个用例及每次换 tier / LoRA / scale / checkpoint 均为 `ModelLoad → Text → Dit → Vae → Encode`；只有「参数完全相同的重复请求」和「bf16 512 → 1024」复用常驻权重、不出现 `ModelLoad`。
 - 人工抽查 6 张（qwen21 基线 / LoRA / 1024、Z-Image Nunchaku r32 / r256、Z-Image bf16 1024）均为清晰的雪地红狐照片，无噪点、无平铺或截断。512 PNG 字节数一律 787,072 是 native 编码器行 filter 全 0、固定开销所致，与图像内容无关。
-- 审计顺带发现：`qzi_engine_backend.c` 里 `nunchaku-fp4-r<rank>` 分支的 `checkpoint + 13` 偏移错误（应为 `+14`），且该分支因 ABI 已拒绝所有含 `fp4` 的 checkpoint 而**不可达**；留待下一阶段与 CTest 改造一并清理，不影响本次矩阵结果。
+- 审计顺带发现：`qzi_engine_backend.c` 里 `nunchaku-fp4-r<rank>` 分支的 `checkpoint + 13` 偏移错误（应为 `+14`），且该分支因 ABI 已拒绝所有含 `fp4` 的 checkpoint 而**不可达**。已在阶段 12e 直接删除该 fp4 分支、只保留 `nunchaku` / `nunchaku-r<rank>` 解析，使引擎与 ABI 契约一致；改动是不可达路径清理，不影响本次矩阵结果。
 - 工具自身改动：报告改为**逐用例增量落盘**（避免中途 CUDA 致命失败丢结果），并把每个用例的 phase 序列写进 `report.json` / `report.md`。新工具与脚本编译 0 警告 0 错误，仍不加入 `QwenZImage.NET.sln`。
+
+阶段 12e 本机验证结果（本轮新增）：
+
+- Windows 参考后端 `ctest` 1/1（新测试按 `NOT WIN32` 条件不注册）；WSL Linux 参考后端 `ctest` **3/3**：`qzi_abi_smoke`、`posix_unicode_with_icu`（`dlopen` 命中宿主 ICU，`e + U+0301` 组合成 `é`）、`posix_unicode_without_icu`（`-Wl,--wrap=dlopen` 强制无 ICU，恒等 NFC）。两条路径共同验证字符分类、空白判断、UTF-8 ↔ UTF-16（含 U+1F98A 代理对）字节级 round-trip、非法 UTF-8 报错、已组合文本 NFC 不变。
+- 优雅降级：宿主没有可用 ICU 时 `posix_unicode_with_icu` 以退出码 77 被 CTest 记为 **SKIP**（共享断言仍全部执行）；链接器不支持 `--wrap` 时 configure 打印 STATUS、只注册 ICU 那一个变体，不会构建失败。测试不依赖 CUDA，GPU-less 的 Linux CI 在 reference 构建里就会跑。
+- 真实 CUDA 后端因 fp4 清理增量重建：Windows（Ninja + MSVC 19.51 + CUDA 13.3）`ctest` 1/1，DLL 22,177,280 B；WSL（GCC 12.2 + CUDA 13.0）`ctest` **3/3**，`.so` 22,434,432 B；`readelf -d` 的 `NEEDED` 仍无 `libicuuc.so.NN`、未解析 ICU 符号 0，`qzen_arch_config.h` 仍是 11 个 SM。
+- `dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误；`dotnet test` **54 + 7 = 61** 全绿；`dotnet pack` 产出 `.nupkg` / `.snupkg`，包内两个 RID native 仍是 reference 大小（win 106,067 B / linux 34,152 B），未被 CUDA 构建覆盖。
 
 ## 4. 交付物清单
 
@@ -124,10 +132,11 @@ QwenZImage.NET/
 ├─ PLAN.md                       本文件
 ├─ QwenZImage.config.json        模型权重路径配置示例
 ├─ global.json / Directory.Build.props / QwenZImage.NET.sln
-├─ native/                        C ABI、参考后端、真实后端适配器、CMake、C smoke test
+├─ native/                        C ABI、参考后端、真实后端适配器、CMake、CTest
 │   ├─ include/qzi.h              稳定 C ABI v1
 │   ├─ include/qzi_backend.h      vtable 契约
-│   └─ src/qzi_engine_backend.c   真实引擎 in-process 适配器
+│   ├─ src/qzi_engine_backend.c   真实引擎 in-process 适配器
+│   └─ tests/                     C ABI smoke + POSIX ICU 双路径检查
 ├─ engine/                       vendored + 改名的真实 C/CUDA 推理引擎（64 文件）
 │   ├─ src/, platform/win32/, platform/posix/, third_party/, cmake/, CMakeLists.txt
 │   └─ LICENSE / UPSTREAM.md     上游 MIT 许可与来源说明
@@ -203,7 +212,7 @@ dotnet nuget push artifacts/packages/QwenZImage.NET.0.1.0.nupkg \
 
 1. **参考后端不是图像模型**：默认包里的 native 输出确定性合成 PNG，只用于验证 ABI、内存所有权、进度与队列；真实生成请用 `-DQZI_WITH_CUDA_ENGINE=ON` 构建。
 2. **真实引擎已实现**：`native/src/qzi_engine_backend.c` 完整实现 `qzi_backend`，编排参考上游 `serve_execute_qwen21()` / `serve_execute_zimage()`，PNG 直接在内存里编码而非临时文件。多 checkpoint（Z-Image bf16 / Nunchaku r32 / r256）、LoRA scale 变化、base tier 与 1024×1024 已在阶段 12d 用 `tools/RealImageRegression` 10-case 矩阵回归通过；该工具需要 GPU + 权重，**不进 CI**，CI 仍只跑参考后端。
-3. **平台**：参考库 Windows / Linux 均已构建、`ctest` 通过；真实 CUDA 后端也已在 Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL Debian 12 / GCC 12.2 + CUDA 13.0）双平台实测，默认 fat binary 各 11 个 SM、`ctest` 1/1。WSL 自带 CUDA 13.0，但 `nvcc` 不在默认 PATH，构建前需 `export PATH=/usr/local/cuda/bin:$PATH`。Linux 产物不再依赖版本化 ICU。**按用户明确要求「不需要适配 macOS」，macOS 不在开发范围内**（POSIX 兼容层虽可探测 `libicuuc.N.dylib`，但 CMake 仍链接 `stdc++`，若将来启用需换成 `c++`）。
+3. **平台**：参考库 Windows / Linux 均已构建、`ctest` 通过；真实 CUDA 后端也已在 Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL Debian 12 / GCC 12.2 + CUDA 13.0）双平台实测，默认 fat binary 各 11 个 SM，`ctest` Windows 1/1、Linux 3/3（含 POSIX ICU 双路径测试）。WSL 自带 CUDA 13.0，但 `nvcc` 不在默认 PATH，构建前需 `export PATH=/usr/local/cuda/bin:$PATH`。Linux 产物不再依赖版本化 ICU。**按用户明确要求「不需要适配 macOS」，macOS 不在开发范围内**（POSIX 兼容层虽可探测 `libicuuc.N.dylib`，但 CMake 仍链接 `stdc++`，若将来启用需换成 `c++`）。
 4. **CI 不含 GPU**：CI 只构建参考后端；真实后端由使用方或带 GPU 的自托管 runner 构建。
 5. **ABI 演进**：任何结构体/签名/所有权变化都必须升 `QZI_ABI_VERSION`，并同步 `NativeStructs.cs` 与 `AbiGuard`。
 6. **异步语义**：native 调用本质同步长任务，`Generate*Async` 是 `Task.Run` 外壳；高并发行走 `QziGenerationQueue`，不要用多个 `QziClient` 抢同一张 GPU。
