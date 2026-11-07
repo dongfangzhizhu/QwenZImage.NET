@@ -22,6 +22,9 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     private readonly QziEngineHandle _handle;
     private bool _disposed;
 
+    // Guards the process-wide QZI_* variables while one engine is being created.
+    private static readonly object EngineCreateGate = new();
+
     /// <summary>Path of the native library actually loaded, when known.</summary>
     public string? NativeLibraryPath { get; }
 
@@ -34,58 +37,56 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     /// directories are passed straight into the native backend; an explicit
     /// <see cref="QziClientOptions"/> wins over the file.
     /// </summary>
+    /// <remarks>
+    /// The three <c>QZI_*</c> variables carrying fields the C ABI does not have
+    /// are scoped to this single <c>qzi_engine_create</c> call and restored
+    /// immediately afterwards. Each engine therefore snapshots its own LoRA /
+    /// Nunchaku directories and config path, so clients with different values
+    /// can coexist in one process without clobbering one another.
+    /// </remarks>
     /// <exception cref="DllNotFoundException">No QwenZImageNative library could be resolved.</exception>
     /// <exception cref="QziException">The native library rejected the configuration.</exception>
     /// <exception cref="InvalidDataException">An invalid config file was found.</exception>
     public QziClient(QziClientOptions? options = null)
     {
-        options ??= QziClientOptions.FromConfig();
-
-        // The ABI carries the three core directories. QZI_CONFIG tells the
-        // native backend which file to read for the fields the ABI does not
-        // carry (Nunchaku packs, LoRA directory, platform overrides), so both
-        // sides always agree on the same configuration.
-        if (!string.IsNullOrWhiteSpace(options.ConfigPath))
-            Environment.SetEnvironmentVariable(QziConfig.EnvironmentVariable,
-                                               options.ConfigPath);
-
-        // Those two directories have no ABI field. Publishing the resolved
-        // values closes the gap for QziConfig.With(...) / code-level options
-        // *and* for a container that only sets QZI_* without a config file.
-        // A null option deliberately leaves any existing env value intact.
-        PublishNativeOverride(QziConfig.LoraDirectoryVariable,
-                              options.Qwen21LoraDirectory);
-        PublishNativeOverride(QziConfig.NunchakuDirectoryVariable,
-                              options.ZImageNunchakuDirectory);
-
-        NativeLibraryLoader.Configure(options.NativeLibraryPath);
-        AbiGuard.Verify();
-
-        using var qwenDir = new Utf8PinnedString(options.Qwen21Directory);
-        using var zimageDir = new Utf8PinnedString(options.ZImageDirectory);
-        using var cacheDir = new Utf8PinnedString(options.CacheDirectory);
-
-        QziEngineConfig config = new()
+        // QZI_* variables are process-wide while qzi_engine_create() runs and
+        // its backend init() snapshots them. Serialise construction so those
+        // scoped values cannot interleave with a concurrent client (including
+        // the FromConfig() lookup, which reads the same variables).
+        lock (EngineCreateGate)
         {
-            AbiVersion = NativeMethods.ExpectedAbiVersion,
-            Qwen21Dir = qwenDir.Pointer,
-            ZimageDir = zimageDir.Pointer,
-            CacheDir = cacheDir.Pointer,
-            DeviceId = options.DeviceId,
-            ThreadCount = options.ThreadCount,
-            Flags = 0
-        };
+            options ??= QziClientOptions.FromConfig();
+            using var scope = new NativeConfigScope(options);
 
-        byte* error = stackalloc byte[NativeMethods.ErrorCapacity];
-        new Span<byte>(error, NativeMethods.ErrorCapacity).Clear();
-        IntPtr raw = IntPtr.Zero;
-        int status = NativeMethods.EngineCreate(&config, &raw, error,
-                                                NativeMethods.ErrorCapacity);
-        if (status != 0 || raw == IntPtr.Zero)
-            throw NativeError.ToException(status, error);
+            NativeLibraryLoader.Configure(options.NativeLibraryPath);
+            AbiGuard.Verify();
 
-        _handle = new QziEngineHandle(raw);
-        NativeLibraryPath = NativeLibraryLoader.ResolvedPath;
+            using var qwenDir = new Utf8PinnedString(options.Qwen21Directory);
+            using var zimageDir = new Utf8PinnedString(options.ZImageDirectory);
+            using var cacheDir = new Utf8PinnedString(options.CacheDirectory);
+
+            QziEngineConfig config = new()
+            {
+                AbiVersion = NativeMethods.ExpectedAbiVersion,
+                Qwen21Dir = qwenDir.Pointer,
+                ZimageDir = zimageDir.Pointer,
+                CacheDir = cacheDir.Pointer,
+                DeviceId = options.DeviceId,
+                ThreadCount = options.ThreadCount,
+                Flags = 0
+            };
+
+            byte* error = stackalloc byte[NativeMethods.ErrorCapacity];
+            new Span<byte>(error, NativeMethods.ErrorCapacity).Clear();
+            IntPtr raw = IntPtr.Zero;
+            int status = NativeMethods.EngineCreate(&config, &raw, error,
+                                                    NativeMethods.ErrorCapacity);
+            if (status != 0 || raw == IntPtr.Zero)
+                throw NativeError.ToException(status, error);
+
+            _handle = new QziEngineHandle(raw);
+            NativeLibraryPath = NativeLibraryLoader.ResolvedPath;
+        }
     }
 
     // ---------------------------------------------------------------- public
@@ -256,12 +257,6 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     }
 
     // --------------------------------------------------------------- private
-
-    private static void PublishNativeOverride(string name, string? value)
-    {
-        if (!string.IsNullOrWhiteSpace(value))
-            Environment.SetEnvironmentVariable(name, value);
-    }
 
     private QziImage CallQwen21(QwenImageOptions options,
                                 IProgress<GenerationProgress>? progress,

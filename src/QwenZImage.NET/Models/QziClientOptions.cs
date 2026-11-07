@@ -21,22 +21,23 @@ public sealed class QziClientOptions
 
     /// <summary>
     /// Directory holding Qwen-Image 2.1 LoRA adapters. The C ABI has no field
-    /// for it, so the client publishes <c>QZI_QWEN21_LORA_DIR</c> for the
-    /// native backend. Code-level values win over the config file.
+    /// for it, so the client scopes <c>QZI_QWEN21_LORA_DIR</c> around engine
+    /// creation for the native backend. Code-level values win over the config
+    /// file; the variable is restored afterwards, so clients can differ.
     /// </summary>
     public string? Qwen21LoraDirectory { get; init; }
 
     /// <summary>
-    /// Directory holding Z-Image Nunchaku / SVDQuant int4 repacks. Published as
-    /// <c>QZI_ZIMAGE_NUNCHAKU_DIR</c> for the native backend.
+    /// Directory holding Z-Image Nunchaku / SVDQuant int4 repacks. Scoped as
+    /// <c>QZI_ZIMAGE_NUNCHAKU_DIR</c> around engine creation.
     /// </summary>
     public string? ZImageNunchakuDirectory { get; init; }
 
     /// <summary>
-    /// Path to <c>QwenZImage.config.json</c>. When set, it is published as the
-    /// <c>QZI_CONFIG</c> environment variable so the native backend reads the
-    /// very same file (including the platform overrides and any fields that
-    /// were not explicitly set here).
+    /// Path to <c>QwenZImage.config.json</c>. When set, it is scoped as the
+    /// <c>QZI_CONFIG</c> environment variable around engine creation so the
+    /// native backend reads the very same file (including platform overrides
+    /// and any fields not explicitly set here).
     /// </summary>
     public string? ConfigPath { get; init; }
 

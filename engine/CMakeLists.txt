@@ -121,6 +121,7 @@ target_include_directories(qzi_engine_core PUBLIC
     "${QZEN_ROOT}/src"
     "${QZEN_ROOT}"
     "${QZEN_ROOT}/third_party"
+    "${QZEN_ROOT}/../native/include"
     "${CMAKE_CURRENT_BINARY_DIR}")
 if(WIN32)
   target_include_directories(qzi_engine_core PUBLIC

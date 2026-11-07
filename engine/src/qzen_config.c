@@ -21,6 +21,9 @@
 #endif
 
 #include "third_party/cJSON.h"
+/* qzi_getenv() reads the live process environment. On Windows the CRT's
+ * getenv() cannot see values that the .NET host published after startup. */
+#include "qzi_env.h"
 
 typedef struct {
     const char *key;
@@ -219,7 +222,16 @@ int qzen_config_load(const char *explicit_path, qzen_config *out,
         return -1;
     }
     memset(out, 0, sizeof(*out));
-    if (!explicit_path || !*explicit_path) explicit_path = getenv("QZI_CONFIG");
+    char scoped_config[QZEN_CONFIG_PATH_MAX * 2];
+    if (!explicit_path || !*explicit_path) {
+        int found = qzi_getenv("QZI_CONFIG", scoped_config,
+                               sizeof(scoped_config));
+        if (found < 0) {
+            report(error, error_cap, "QZI_CONFIG", NULL, "path is too long");
+            return -1;
+        }
+        if (found > 0) explicit_path = scoped_config;
+    }
 
     char path[QZEN_CONFIG_PATH_MAX * 2];
     if (explicit_path && *explicit_path) {
@@ -306,11 +318,17 @@ int qzen_config_apply_environment(qzen_config *config, char *error,
     size_t index;
     if (!config) return -1;
     if (error && error_cap) error[0] = '\0';
+    char value[QZEN_CONFIG_PATH_MAX * 2];
     for (index = 0; index < sizeof(env_overrides) / sizeof(env_overrides[0]);
          index++) {
-        const char *value = getenv(env_overrides[index].env);
+        int found = qzi_getenv(env_overrides[index].env, value, sizeof(value));
         int slot;
-        if (!value || !*value) continue;
+        if (found < 0) {
+            report(error, error_cap, env_overrides[index].env, NULL,
+                   "path is too long");
+            return -1;
+        }
+        if (found == 0 || !*value) continue;
         slot = find_field(env_overrides[index].key);
         if (slot < 0) continue;
         if (!qzen_config_expand_home(value, config_slot(config, slot),

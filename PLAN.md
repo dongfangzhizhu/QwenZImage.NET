@@ -48,7 +48,7 @@ Your app (.NET 10)                     Browser (manual testing only)
               QwenZImage.config.json（模型权重路径，QZI_CONFIG / --config）
 ```
 
-**D10 边界**：`QziClient` 直接 P/Invoke 同一个进程内的 `QwenZImageNative`；WebUI 与用户应用处于同一层，都只走 `QziClient`。**没有任何外部服务、HTTP transport、sidecar 或 Go 进程**。`QZI_CONFIG` 让 native backend 读取 ABI 里没有的 `qwen21_lora_dir` / `zimage_nunchaku_dir` 等字段；`QziClientOptions.Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 由 `QziClient` 发布成 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`，native 侧 `qzen_config_apply_environment()` 在文件加载后应用，显式传值优先。
+**D10 边界**：`QziClient` 直接 P/Invoke 同一个进程内的 `QwenZImageNative`；WebUI 与用户应用处于同一层，都只走 `QziClient`。**没有任何外部服务、HTTP transport、sidecar 或 Go 进程**。`QZI_CONFIG` 让 native backend 读取 ABI 里没有的 `qwen21_lora_dir` / `zimage_nunchaku_dir` 等字段；`QziClient` 通过 `NativeConfigScope` 在 `qzi_engine_create()` 期间**作用域发布** `QZI_CONFIG` 与五个 `QZI_*` 目录变量（含 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`），构造结束即还原，构造期间由 `EngineCreateGate` 串行化。native 侧 `qzen_config_apply_environment()` 在文件加载后应用，显式传值优先；所有 native 配置读取统一走 `qzi_getenv()`（Windows 用 Win32 API 读实时环境，绕过 CRT 的启动快照）。每个 engine 因此快照自己的配置，多实例互不串扰，且 ABI v1 的导出符号与结构体布局不变。
 
 **为什么保留两种构建**：CI 与托管测试必须在无 GPU 环境运行，且真实 CUDA 库依赖 cudart / cuBLAS 与 GPU 驱动，不适合塞进默认包。因此 `QZI_WITH_CUDA_ENGINE=OFF` 的参考后端仍是默认打包形态；`ON` 的构建默认生成覆盖 sm_80 → sm_121 的 **fat binary**（CMake 查询 `nvcc --list-gpu-arch` 并按工具链能力自动过滤），一个同名 DLL/SO 即可适配常见显卡，不必按 GPU 重编译。用 `QZI_NATIVE_LIBRARY` 覆盖或替换 `runtimes/<rid>/native/` 即可，托管 API 不变。CI 不含 GPU，所以发布 workflow 里打包的仍是参考后端。
 
@@ -63,7 +63,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 2 | C ABI v1：`qzi.h` / `qzi_backend.h`、`qzi.c` 控制层、参考后端、无依赖 PNG 编码器、CMake、C smoke test | ✅ |
 | 3 | `.NET 10` 封装：Native 层 + 公开模型 / 校验 / 结果 / 客户端；同步 + 异步 + 零拷贝 `WriteTo` | ✅ |
 | 4 | 纯 `.NET` 队列与预设：`Channels` 串行分发、取消、重试、事件流、9 个预设 | ✅ |
-| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12c 后为 61 项）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
+| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12f 后为 69 项）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
 | 6 | 开源文档：README / LICENSE / THIRD_PARTY_NOTICES / NATIVE_ABI / PARAMETERS / ENGINE_INTEGRATION / WEBUI / 本计划 / 后端模板 | ✅ |
 | 7 | CI 与发布工作流：`ci.yml`、`release.yml`、`scripts/build-native.*` | ✅ |
 | 8 | `git init` + 本地提交 | ✅（不 push） |
@@ -75,6 +75,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 12c | **LoRA / 参数全链路一致性**（用户要求「确保功能完整性和一致性，包括 LoRA 支持」；不做 macOS 适配）：统一 ABI 契约与两侧校验（裸文件名 + 255 字节 + `QZI_LORA_NAME_MAX`、scale finite / `0.05..4`、fp4 大小写不敏感、默认值归一化）；打通 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` 配置覆盖链并让 native 读环境变量；修复真实后端 DiT/LoRA 状态机（提前校验、0 与 1.0 等价、合并失败清场）；参考后端把 tier / LoRA / scale / steps / guidance / negative prompt 纳入确定性哈希并跟踪重载 phase；WebUI 在 turbo / base 都开放 LoRA；补测试与文档 | ✅ |
 | 12d | **真图回归矩阵**（用户指定开发节奏第 1 项）：新增独立 `tools/RealImageRegression` harness（刻意不进 sln / CI，检测并拒绝参考后端），`cases.json` 覆盖 qwen21 turbo/base、LoRA scale 1.0 / 0.6、512 / 1024，以及 Z-Image bf16 与 Nunchaku r32 / r256；逐用例输出 PNG + SHA-256 + phase trace，报告增量落盘；Windows / Linux 运行脚本；10/10 真图通过并人工抽查确认非噪点 | ✅ |
 | 12e | **POSIX ICU 双路径检查接进 CTest**（用户指定节奏第 2 项）：把一次性 `.scratch` 脚本整理成 `native/tests/qzi_posix_unicode_check.c`，CMake 仅在 POSIX 且链接器支持 `--wrap=dlopen` 时构建 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两个可执行，不支持时优雅跳过；宿主无 ICU 时 CTest 记 SKIP；顺带清理真图回归审计发现的 `qzi_engine_backend.c` fp4 不可达死代码与 `checkpoint + 13` 偏移错误 | ✅ |
+| 12f | **消除 `QZI_*` 进程级环境变量多实例串扰**（用户指定节奏第 3 项）：`NativeConfigScope` 只在 `qzi_engine_create()` 期间发布 6 个变量并逆序还原（含构造失败回滚），`QziClient` 用静态锁串行化构造；`QziConfig` 补齐变量名常量；参考后端把 create 时配置指纹混入确定性 PNG；新增 8 项 xUnit（作用域发布/精确还原/未设选项/仅托管变量/失败回滚/双 engine 快照/并发构造隔离/Dispose 幂等）。**审计发现 Windows CRT `getenv()` 看不到 .NET 设置的环境变量**，新增内部 `qzi_getenv()`（Win32 `GetEnvironmentVariableA` / POSIX `getenv`），`qzen_config.c`、`qzi_stub.c` 与 C smoke 统一改用它，修复真实后端与参考后端的配置读取；文档与 PLAN 同步 | ✅ |
 | 13 | **推送 GitHub 开源 + 发布 NuGet** | ⏸ **按 D6 暂缓**，命令见第 5 节 |
 
 本机验证结果（D10 完成度）：
@@ -122,6 +123,16 @@ Your app (.NET 10)                     Browser (manual testing only)
 - 真实 CUDA 后端因 fp4 清理增量重建：Windows（Ninja + MSVC 19.51 + CUDA 13.3）`ctest` 1/1，DLL 22,177,280 B；WSL（GCC 12.2 + CUDA 13.0）`ctest` **3/3**，`.so` 22,434,432 B；`readelf -d` 的 `NEEDED` 仍无 `libicuuc.so.NN`、未解析 ICU 符号 0，`qzen_arch_config.h` 仍是 11 个 SM。
 - `dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误；`dotnet test` **54 + 7 = 61** 全绿；`dotnet pack` 产出 `.nupkg` / `.snupkg`，包内两个 RID native 仍是 reference 大小（win 106,067 B / linux 34,152 B），未被 CUDA 构建覆盖。
 
+阶段 12f 本机验证结果（本轮新增）：
+
+- Windows 参考后端以最终源码重建（新增 `src/qzi_env.c`），`ctest --test-dir native/build -C Release` **1/1**；smoke 新增的 4 条环境断言通过：未设置读为 0、Win32 API 在 CRT 启动后设置的值 `qzi_getenv()` 能读到、超长值返回 -1 且不静默截断、删除后读为 0。用最小 DLL 单独实测确认 **MinGW CRT 的 `getenv()` 在同一情形下始终返回 NULL**（这是审计定位到的根因）。
+- `dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误（5 项目）；`dotnet test` **62 + 7 = 69** 全绿（新增 8 项作用域 / 快照 / 并发 / 回滚测试）。测试程序集本来就通过 `CollectionBehavior(DisableTestParallelization = true)` 串行运行，避免环境变量测试互相干扰。
+- 修复前基线：`Two_Engines_Snapshot_Their_Own_Config` 因 Windows 上 native 读不到作用域变量而三张 PNG 完全相同；`Concurrent_Client_Creation_Does_Not_Interleave_Scopes` 还用了非法的 16×16 画布（已改为 32×32）。修复后两项均通过，证明不同 LoRA / Nunchaku 目录的两个 engine 产出不同 SHA、相同配置字节级一致、8 个并发构造的 8 张图片哈希互异。
+- Windows 真实 CUDA fat binary 增量重建（Ninja + MSVC 14.51.36231 + CUDA 13.3）：`ctest` **1/1**，`QwenZImageNative.dll` 22,184,960 B；Linux 真实 CUDA fat binary 增量重建（WSL GCC 12.2 + CUDA 13.0）：`ctest` **3/3**，`.so` 22,434,496 B，`readelf -d` 的 `NEEDED` 仍无 `libicuuc.so.NN`，`qzen_arch_config.h` 仍为 11 个 SM。两者都因 `qzen_config.c` / `qzi_env.c` 改动重编，配置链（`QZI_CONFIG` / `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`）在 Windows 真实后端上现在也能收到托管侧发布的值。
+- Linux **参考后端**重建后 `ctest` **3/3**（`qzi_abi_smoke` + 两个 POSIX ICU 路径）；Windows 参考后端 1/1。两者 smoke 都新增了作用域环境变量断言。
+- `bash scripts/stage-native.sh` 把两个 RID staging 恢复为**参考后端**（win 106,637 B / linux 38,440 B），随后 `dotnet pack` 产出 `.nupkg` + `.snupkg`，包内 16 项：`lib/net10.0/*.dll`+`.xml`、两个 RID native、4 份 docs、`README.md` / `LICENSE` / `THIRD_PARTY_NOTICES.md` / `engine/LICENSE`。
+- WebUI 运行时冒烟（Windows、参考后端，端口 7860）：`/api/health` 返回 `ok=true`、`transport: native-pinvoke`、`reference_backend: true`、`config_path` 自动解析到仓库根 `QwenZImage.config.json`；提交 qwen21 turbo / 32×32 / seed 7 后 job 变为 `done`，产出 3,172 B PNG 并出现在画廊，未因配置作用域化出现回归。
+
 ## 4. 交付物清单
 
 ```
@@ -135,15 +146,18 @@ QwenZImage.NET/
 ├─ native/                        C ABI、参考后端、真实后端适配器、CMake、CTest
 │   ├─ include/qzi.h              稳定 C ABI v1
 │   ├─ include/qzi_backend.h      vtable 契约
+│   ├─ include/qzi_env.h          内部环境变量读取辅助（非 ABI 导出）
+│   ├─ src/qzi_env.c              Win32 实时环境 / POSIX getenv 双实现
 │   ├─ src/qzi_engine_backend.c   真实引擎 in-process 适配器
-│   └─ tests/                     C ABI smoke + POSIX ICU 双路径检查
+│   └─ tests/                     C ABI smoke（含作用域环境断言）+ POSIX ICU 双路径检查
 ├─ engine/                       vendored + 改名的真实 C/CUDA 推理引擎（64 文件）
 │   ├─ src/, platform/win32/, platform/posix/, third_party/, cmake/, CMakeLists.txt
 │   └─ LICENSE / UPSTREAM.md     上游 MIT 许可与来源说明
 ├─ src/QwenZImage.NET/            NuGet 包体
-│   └─ Configuration/QziConfig.cs 配置文件加载器
+│   ├─ Configuration/QziConfig.cs         配置文件加载器
+│   └─ Configuration/NativeConfigScope.cs  QZI_* 作用域发布 / 还原
 ├─ src/QwenZImage.NET.WebUI/      跨平台手动测试 WebUI（不打包）
-├─ tests/                         61 个 xUnit 测试（54 库 + 7 WebUI）
+├─ tests/                         69 个 xUnit 测试（62 库 + 7 WebUI）
 ├─ samples/                       端到端示例
 ├─ integration/                   自定义 qzi_backend 模板
 ├─ tools/RealImageRegression/     真图回归 harness（需 GPU + 权重，不进 sln / CI）
@@ -201,6 +215,7 @@ dotnet nuget push artifacts/packages/QwenZImage.NET.0.1.0.nupkg \
 - [ ] README 中「当前状态」表格更新为已发布、已推送
 - [ ] `docs/NATIVE_ABI.md` 与 `AbiGuard` 的版本号一致（v1；`QZI_LORA_NAME_MAX` 只是输入校验常量，不升版本）
 - [ ] LoRA 契约在 `qzi.h` / `qzi.c` / `RequestValidator.cs` / `docs/PARAMETERS.md` / WebUI 五处一致：两个 tier 均可用、≤ 255 字节裸文件名、`lora_scale == 0.0f` sentinel、scale finite 且 `0.05..4`
+- [ ] `QZI_*` 作用域契约在 `NativeConfigScope.Variables` / `qzen_config.c:env_overrides[]` / `qzi_stub.c:config_fingerprint()` 三处变量表一致；native 配置读取统一用 `qzi_getenv()`，不出现裸 `getenv("QZI_...")`
 - [ ] `dotnet pack` 包内包含 `README.md` / `LICENSE` / `THIRD_PARTY_NOTICES.md` / `engine/LICENSE` / `docs/*.md`
 - [ ] 包内同时包含 `lib/net10.0/QwenZImage.NET.dll`、`runtimes/win-x64/native/QwenZImageNative.dll`、`runtimes/linux-x64/native/libQwenZImageNative.so`
 - [ ] `.snupkg` 符号包可上传、SourceLink 指向公开仓库
@@ -216,3 +231,5 @@ dotnet nuget push artifacts/packages/QwenZImage.NET.0.1.0.nupkg \
 4. **CI 不含 GPU**：CI 只构建参考后端；真实后端由使用方或带 GPU 的自托管 runner 构建。
 5. **ABI 演进**：任何结构体/签名/所有权变化都必须升 `QZI_ABI_VERSION`，并同步 `NativeStructs.cs` 与 `AbiGuard`。
 6. **异步语义**：native 调用本质同步长任务，`Generate*Async` 是 `Task.Run` 外壳；高并发行走 `QziGenerationQueue`，不要用多个 `QziClient` 抢同一张 GPU。
+7. **配置通道的平台差异**：`QZI_*` 仍靠进程级环境变量传递（ABI v1 没有这些字段），但已通过作用域发布 + create 时快照消除串扰。Windows 上 **CRT 的 `getenv()` 读不到 .NET 之后设置的值**，所有 native 配置读取必须走 `qzi_getenv()`；自定义 backend 若直接 `getenv("QZI_*")`，在 Windows 上会静默失效。Windows 路径字节沿用进程 ANSI 代码页（与 `fopen` 一致），含非 ASCII 的路径建议写进配置文件。
+8. **进程级 GPU 资源仍未隔离**：`CUDA_VISIBLE_DEVICES`、CUDA 上下文与常驻权重是进程/设备级资源；作用域配置不能让两个 `QziClient` 安全共享同一张卡，仍须按 #6 串行化。彻底的 per-client GPU 隔离需要独立进程，当前不在范围内。

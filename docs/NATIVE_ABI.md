@@ -87,7 +87,8 @@
 - **非法值一律拒绝，不静默 coerce**：`scale <= 0`（除 `0` sentinel 外）、`< 0.05`、`> 4`、NaN / Inf、无 `lora` 却带非 0 scale，全部返回 `QZI_ERR_INVALID_ARGUMENT`。
 - `0.0f` 与 `1.0f` scale 在真实后端视为同一 adapter 状态，避免多 GB 的 DiT 重载。
 - `lora` 切换、scale 改变或移除 adapter 都会触发 DiT 重载并上报一次 `"model load"` phase；真实后端在加载权重**之前**校验裸文件名与目录，合并失败会清空 DiT，不留半合并权重。
-- `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` 不在 ABI 里：它们通过 `QZI_CONFIG` 指定的配置文件或环境变量传入，native 侧由 `qzen_config_apply_environment()` 在 `qzen_config_load()` 之后应用（支持 `~` 展开）。`QziClient` 会把代码级 `QziClientOptions.Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 发布成这两个变量。
+- `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` 不在 ABI 里：它们通过 `QZI_CONFIG` 指定的配置文件或环境变量传入，native 侧由 `qzen_config_apply_environment()` 在 `qzen_config_load()` 之后应用（支持 `~` 展开）。`QziClient` 在 `qzi_engine_create()` 期间把代码级 `QziClientOptions` 值**作用域发布**并在返回后还原，所以每个 engine 快照自己的配置；创建完成后再改环境变量不影响已有 engine。
+- `qzi_getenv()`（`native/include/qzi_env.h`）是**内部辅助函数，不是 ABI 导出**：Windows 上 CRT 的 `getenv()` 看不到托管侧通过 Win32 API 设置的值，所以 native 配置读取一律走它。ABI v1 的导出符号表与结构体布局没有因此改变。自行实现 backend 时若需要读 `QZI_*`，请从仓库源码编译 `native/src/qzi_env.c`（或照此使用 `GetEnvironmentVariableA`），不要裸用 `getenv()`。
 
 ## 典型调用序列
 

@@ -37,11 +37,26 @@ public sealed record QziConfig
     /// <summary>Environment variable naming an explicit config file.</summary>
     public const string EnvironmentVariable = "QZI_CONFIG";
 
+    /// <summary>Environment variable overriding <c>qwen21_dir</c>.</summary>
+    public const string Qwen21DirectoryVariable = "QZI_QWEN21_DIR";
+
+    /// <summary>Environment variable overriding <c>zimage_dir</c>.</summary>
+    public const string ZImageDirectoryVariable = "QZI_ZIMAGE_DIR";
+
     /// <summary>Environment variable carrying the Qwen21 LoRA directory to the native backend.</summary>
     public const string LoraDirectoryVariable = "QZI_QWEN21_LORA_DIR";
 
     /// <summary>Environment variable carrying the Z-Image Nunchaku directory to the native backend.</summary>
     public const string NunchakuDirectoryVariable = "QZI_ZIMAGE_NUNCHAKU_DIR";
+
+    /// <summary>Environment variable overriding <c>text_cache_dir</c>.</summary>
+    public const string ModelCacheVariable = "QZI_MODEL_CACHE";
+
+    /// <summary>Environment variable naming the native library to load.</summary>
+    public const string NativeLibraryVariable = "QZI_NATIVE_LIBRARY";
+
+    /// <summary>Environment variable overriding <c>device_id</c>.</summary>
+    public const string DeviceIdVariable = "QZI_DEVICE_ID";
 
     private static readonly HashSet<string> KnownKeys = new(StringComparer.Ordinal)
     {
@@ -251,13 +266,13 @@ public sealed record QziConfig
     private QziConfig ApplyEnvironmentOverrides()
     {
         QziConfig result = this;
-        result = Env(result, "QZI_QWEN21_DIR", c => c with { Qwen21Directory = Expand(Environment.GetEnvironmentVariable("QZI_QWEN21_DIR")) });
-        result = Env(result, "QZI_ZIMAGE_DIR", c => c with { ZImageDirectory = Expand(Environment.GetEnvironmentVariable("QZI_ZIMAGE_DIR")) });
+        result = Env(result, Qwen21DirectoryVariable, c => c with { Qwen21Directory = Expand(Environment.GetEnvironmentVariable(Qwen21DirectoryVariable)) });
+        result = Env(result, ZImageDirectoryVariable, c => c with { ZImageDirectory = Expand(Environment.GetEnvironmentVariable(ZImageDirectoryVariable)) });
         result = Env(result, NunchakuDirectoryVariable, c => c with { ZImageNunchakuDirectory = Expand(Environment.GetEnvironmentVariable(NunchakuDirectoryVariable)) });
         result = Env(result, LoraDirectoryVariable, c => c with { Qwen21LoraDirectory = Expand(Environment.GetEnvironmentVariable(LoraDirectoryVariable)) });
-        result = Env(result, "QZI_MODEL_CACHE", c => c with { TextCacheDirectory = Expand(Environment.GetEnvironmentVariable("QZI_MODEL_CACHE")) });
-        result = Env(result, "QZI_NATIVE_LIBRARY", c => c with { NativeLibraryPath = Expand(Environment.GetEnvironmentVariable("QZI_NATIVE_LIBRARY")) });
-        if (int.TryParse(Environment.GetEnvironmentVariable("QZI_DEVICE_ID"), out int device))
+        result = Env(result, ModelCacheVariable, c => c with { TextCacheDirectory = Expand(Environment.GetEnvironmentVariable(ModelCacheVariable)) });
+        result = Env(result, NativeLibraryVariable, c => c with { NativeLibraryPath = Expand(Environment.GetEnvironmentVariable(NativeLibraryVariable)) });
+        if (int.TryParse(Environment.GetEnvironmentVariable(DeviceIdVariable), out int device))
             result = result with { DeviceId = device };
         return result;
     }

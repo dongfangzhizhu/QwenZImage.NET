@@ -44,6 +44,7 @@
 | `QwenZImage.config.json` 配置模型路径，`.NET` / native 双侧加载 | ✅ 已完成；LoRA / Nunchaku 目录支持配置文件、`QziConfig.With`、代码级 options、纯环境变量四种等价入口 |
 | **LoRA 全链路一致性**（ABI / 托管校验 / native / 真实引擎 / 参考后端 / WebUI / 文档） | ✅ 两个 tier 均可用，裸文件名与 scale 统一校验，切换 adapter 或 scale 正确重载 DiT |
 | **真图回归矩阵**（`tools/RealImageRegression`，需 GPU + 权重） | ✅ Windows CUDA 10/10 通过：turbo / base、LoRA scale 1.0 与 0.6、512 与 1024、Z-Image bf16 与 Nunchaku r32/r256；重复请求字节级确定性一致 |
+| **多实例配置隔离**（`QZI_*` 作用域发布 + 实时环境读取） | ✅ 每个 engine 在 `qzi_engine_create()` 时快照自己的配置，构造结束即还原；Windows CRT 环境快照陷阱已用 `qzi_getenv()` 消除 |
 | native 产物统一命名 `QwenZImageNative.dll` / `libQwenZImageNative.so` | ✅ 已完成，无 `h3` 命名产物 |
 | 单个 NuGet 包含 .NET 程序集 + win-x64 + linux-x64 native | ✅ 已完成，`QziEnsureNativeRuntimes` 缺平台即拒绝打包 |
 | 本地 git 仓库与提交 | ✅ 已完成 |
@@ -70,7 +71,9 @@
 }
 ```
 
-查找顺序：显式 `QZI_CONFIG` / `--config <path>` → 程序目录 → 当前工作目录 → 从这两个目录**向上最多 8 级**（`dotnet run` 会把工作目录设为项目目录，解决方案根目录的配置因此也能找到）→ `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量（`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_MODEL_CACHE`、`QZI_DEVICE_ID` 等）优先于文件；代码中显式传入的 `QziClientOptions` 优先于二者。`QziClient` 会把解析出的路径发布为 `QZI_CONFIG`，并把 `Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 发布成 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`；native 侧的 `qzen_config_apply_environment()` 在 `qzen_config_load()` 之后应用同一组覆盖。因此**配置文件、`QziConfig.With(...)`、代码级 options、纯环境变量**这四种方式都能作用到引擎——ABI 里装不下的字段不再静默丢失。
+查找顺序：显式 `QZI_CONFIG` / `--config <path>` → 程序目录 → 当前工作目录 → 从这两个目录**向上最多 8 级**（`dotnet run` 会把工作目录设为项目目录，解决方案根目录的配置因此也能找到）→ `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量（`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_MODEL_CACHE`、`QZI_DEVICE_ID` 等）优先于文件；代码中显式传入的 `QziClientOptions` 优先于二者。`QziClient` 在**构造 engine 的那一刻**把解析出的 `QZI_CONFIG` 与代码级目录值（`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_MODEL_CACHE`）临时发布出去，创建完成后立即还原进程环境；构造过程还有进程内互斥，所以同一进程里多个 `QziClient` 各自快照自己的配置、不会互相串扰。native 侧的 `qzen_config_apply_environment()` 在 `qzen_config_load()` 之后应用同一组覆盖。因此**配置文件、`QziConfig.With(...)`、代码级 options、纯环境变量**这四种方式都能作用到引擎——ABI 里装不下的字段不再静默丢失。
+
+> Windows 上 C 运行时的 `getenv()` 持有启动时的环境快照，看不到 `.NET` 之后设置的值；native 统一通过 `qzi_getenv()`（`native/include/qzi_env.h`，库内部符号、不是 ABI 导出）读实时进程环境，所以这条通道在两个平台都有效。自行实现 backend 时若要读 `QZI_*`，请从仓库源码编译 `native/src/qzi_env.c`（Windows 用 `GetEnvironmentVariableA`），不要裸用 `getenv()`。
 
 仓库根目录的 `QwenZImage.config.json` 是开发机示例，路径指向本机已有的权重目录；部署时改成自己的路径即可。权重文件本身不在仓库里。
 
@@ -302,7 +305,7 @@ dotnet test QwenZImage.NET.sln -c Release               # 托管测试
 
 Linux 上 `ctest` 另有 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两项，验证 POSIX ICU 兼容层的两条运行时路径：前者 `dlopen` 命中宿主 ICU 并把 `e + U+0301` 组合成 `é`，后者用 `-Wl,--wrap=dlopen` 强制「无 ICU」走内置回退（恒等 NFC）。二者共同覆盖字符分类、空白判断、含 4 字节代理对的 UTF-8 ↔ UTF-16 round-trip 与非法 UTF-8 报错。因为 `qzen_posix_unicode.c` 用 `pthread_once` 只解析一次 ICU，两条路径由两个独立可执行分担；链接器不支持 `--wrap` 时 configure 会优雅跳过该变体，宿主无 ICU 时对应测试记为 SKIP。这两项**不需要 CUDA**，GPU-less 的 Linux CI 在 reference 构建里就会跑。
 
-托管测试共 **61 项**（54 库 + 7 WebUI）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射。全部不需要 GPU、权重或网络监听。
+托管测试共 **69 项**（62 库 + 7 WebUI）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射，以及 `QZI_*` 作用域发布 / 还原、构造失败回滚、多 engine 配置快照与并发构造隔离。全部不需要 GPU、权重或网络监听。
 
 CI 另做 WebUI Linux 运行时冒烟：启动 Kestrel → 验证 `/api/health` 的 `ok=true` / `transport=native-pinvoke` / `config_path` → 检查 presets → 提交 zimage job → 轮询到完成 → 确认输出出现在 `/api/outputs`。
 

@@ -32,6 +32,7 @@ endif()
 add_library(QwenZImageNative SHARED
   src/qzi.c
   src/qzi_png.c
+  src/qzi_env.c
 )
 
 if(QZI_WITH_CUDA_ENGINE)
@@ -90,7 +91,9 @@ endif()
 # (Visibility is already hidden by default; QZI_API marks the exports.)
 
 if(QZI_BUILD_TESTS)
-  add_executable(qzi_abi_smoke tests/qzi_abi_smoke.c)
+  # qzi_getenv() is a hidden internal symbol, so the smoke test compiles the
+  # helper itself to pin down its live-environment semantics.
+  add_executable(qzi_abi_smoke tests/qzi_abi_smoke.c src/qzi_env.c)
   target_include_directories(qzi_abi_smoke PRIVATE include)
   target_link_libraries(qzi_abi_smoke PRIVATE QwenZImageNative)
   add_custom_command(TARGET qzi_abi_smoke POST_BUILD

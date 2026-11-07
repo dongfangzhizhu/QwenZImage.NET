@@ -74,11 +74,11 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 两侧都要读这个文件，原因是 **C ABI 装不下全部字段**：
 
 - `.NET` 侧 `QziConfig.Load()` → `QziConfig.ToClientOptions()`：完整解析、平台覆盖、`~` 展开、严格校验未知键；`qwen21_dir` / `zimage_dir` / `text_cache_dir` / `device_id` / `thread_count` 通过 `qzi_engine_config` 传给 native。`Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 则走下面的环境变量通道。
-- native 侧 `engine/src/qzen_config.c`：在 `qzen_init()` 里先 `qzen_config_load()` 读文件，**补齐** `qwen21_lora_dir` / `zimage_nunchaku_dir` 等 ABI 未携带的字段，再调用 `qzen_config_apply_environment()` 应用同一组 `QZI_*` 覆盖（含 `~` 展开）。`QziClient` 会把最终采用的配置文件路径发布为 `QZI_CONFIG`，保证两侧读的是同一份文件。
+- native 侧 `engine/src/qzen_config.c`：在 `qzen_init()` 里先 `qzen_config_load()` 读文件，**补齐** `qwen21_lora_dir` / `zimage_nunchaku_dir` 等 ABI 未携带的字段，再调用 `qzen_config_apply_environment()` 应用同一组 `QZI_*` 覆盖（含 `~` 展开）。`QziClient` 会在 `qzi_engine_create()` 期间把最终采用的配置文件路径临时发布为 `QZI_CONFIG`，保证两侧读的是同一份文件。
 
 查找顺序：显式 `QZI_CONFIG` / `--config <path>` → 程序目录 → 当前工作目录 → 从这两个目录向上最多 8 级（覆盖 `dotnet run` 从项目目录启动的情况）→ `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量覆盖文件；代码里显式传入的 `QziClientOptions` 优先于二者。**权重文件本身不含在仓库 / NuGet 包里**。
 
-`qzen_config_apply_environment()` 的变量表与托管侧 `QziConfig.ApplyEnvironmentOverrides()` 一一对应：`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_MODEL_CACHE`。`QziClient` 构造函数把 `QziClientOptions.Qwen21LoraDirectory` / `ZImageNunchakuDirectory` 发布为后两个变量，因此下面四种写法对引擎**等价生效**：
+`qzen_config_apply_environment()` 的变量表与托管侧 `QziConfig.ApplyEnvironmentOverrides()` 一一对应：`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_MODEL_CACHE`。`QziClient` 构造函数把这五个变量连同 `QZI_CONFIG` 一起**作用域发布**，因此下面四种写法对引擎**等价生效**：
 
 1. `QwenZImage.config.json` 里的 `qwen21_lora_dir` / `zimage_nunchaku_dir`；
 2. `QziConfig.With("qwen21_lora_dir", ...)` 或 `ToClientOptions()` 带出的代码级值；
@@ -86,6 +86,19 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 4. 进程里直接设置 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`（没有配置文件也可以）。
 
 优先级为 **显式代码值 / `QZI_*` 环境变量 > 配置文件**；native 侧不会把已覆盖的值再改回去。
+
+### 作用域发布与多实例隔离
+
+`QZI_*` 是进程级变量，而 `qzen_init()` 只在创建 engine 时读取一次。若把代码级值永久写进进程环境，同进程里后构造的 client 会覆盖先构造 client 的配置，容器里手工设置的环境变量也会被悄悄改掉。现在的行为是：
+
+1. `QziClient` 构造进入 `EngineCreateGate`（进程内静态锁，覆盖 `FromConfig()` 到 `qzi_engine_create()` 返回）。
+2. `NativeConfigScope` 只对**非空白**的选项值临时 `SetEnvironmentVariable`，记录原值；未设置的选项保持环境原样，使「只有环境变量、没有配置文件」的部署仍然生效。`QZI_NATIVE_LIBRARY` / `QZI_DEVICE_ID` 只由托管侧消费，不在作用域内。
+3. `qzi_engine_create()` 期间 native 读取并快照这些值到自己的 `qzen_state`。
+4. 构造结束（成功或抛异常）立即按逆序还原进程环境；构造失败也走 `using` 回滚，不会把半套配置泄漏给后续代码。
+
+因此同一进程可以并存多个配置不同的 `QziClient`，每个 engine 看到的就是构造它时的那套值。参考后端把这份配置指纹混入确定性 PNG，`NativeConfigScopeTests` 用它验证「不同配置 → 不同图片、相同配置 → 相同图片」，并覆盖并发构造与失败回滚。
+
+> **Windows 陷阱（务必注意）**：C 运行时的 `getenv()` 读的是 CRT 启动时复制的环境快照，`.NET` 的 `Environment.SetEnvironmentVariable()` 走的是 Win32 API，两者不互通。早期版本在 Windows 上因此读不到托管侧发布的值。native 侧统一改用 `qzi_getenv()`（`native/include/qzi_env.h`，内部隐藏符号）：Windows 用 `GetEnvironmentVariableA` 读实时环境，POSIX 仍用 `getenv`。`qzen_config.c`、`qzi_stub.c` 与 C smoke 都走它；**自定义 backend 若要读 `QZI_*`，请从仓库源码编译 `native/src/qzi_env.c`（该函数是隐藏符号，不在 ABI 导出表里）或照此使用 `GetEnvironmentVariableA`，不要裸用 `getenv()`**。Windows 上的路径字节沿用进程 ANSI 代码页（与 `fopen` 一致），含非 ASCII 的路径建议写进配置文件。
 
 ## `qzi_engine_backend.c` 做了什么
 
@@ -204,5 +217,5 @@ ABI 是可替换的，`engine/` 只是本仓库提供的默认真实实现。
 - **不要静默忽略非法参数**：Turbo 非 8 步、含 `fp4`（大小写不敏感）的 checkpoint、带路径 / `:` / 控制字符 / 超 255 字节的 LoRA、没有 LoRA 却带非 0 `lora_scale`，都必须明确失败；`steps` / `guidance` / `lora_scale` 的 `0` 是**默认值 sentinel**，不是「非法但被改成默认值」。
 - **LoRA 目录覆盖**：`qwen21_lora_dir` 不在 C ABI 里。用 `QwenZImage.config.json`、`QziClientOptions.Qwen21LoraDirectory` 或 `QZI_QWEN21_LORA_DIR` 指定；只改 `qzi_engine_config.qwen21_dir` 不会改变 LoRA 目录。目录未配置且有 LoRA 时返回 `QZI_ERR_NOT_CONFIGURED`。
 - **换 LoRA 很贵**：adapter / scale 变化会重新打开 DiT（分钟级），并额外上报一次 `"model load"`；批量任务尽量把同一 adapter 的请求排在一起。
-- **`QZI_*` 是进程级变量**：`QziClient` 在构造时把代码级目录值发布成环境变量，native 在 `qzen_init()` 读取一次。同一进程里构造多个目录不同的 `QziClient` 时，以最后一个为准；创建 engine 之后再改变量不会生效。多目录场景请让每个进程只服务一套配置。
+- **`QZI_*` 仍是进程级变量，但不再互相串扰**：`QziClient` 只在 `qzi_engine_create()` 期间作用域发布、随后还原，native 在 `qzen_init()` 读取一次并快照；创建 engine 之后再改变量不会改变已有 engine。注意 GPU 侧的 `CUDA_VISIBLE_DEVICES` 与常驻 CUDA 上下文仍是进程级资源，多 `QziClient` 指向同一张卡仍须用 `QziGenerationQueue` 串行化（见上文「并发」）。
 - **许可**：`engine/` 是上游 MIT 代码的改名子集，分发时必须保留 [`engine/LICENSE`](../engine/LICENSE) 的版权与许可声明；仓库根 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) 已列出全部第三方依赖。

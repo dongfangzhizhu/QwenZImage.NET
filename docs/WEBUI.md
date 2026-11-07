@@ -140,15 +140,19 @@ cancel, retry, SSE progress, gallery, trash, unload) is unchanged.
 | `--models <path>` | — | Override both model pack directories (`qwen21_dir` / `zimage_dir`) |
 | `QZI_MODEL_DIR` | from config | `QziClientOptions.Qwen21Directory` / `ZImageDirectory` |
 | `QZI_QWEN21_DIR` / `QZI_ZIMAGE_DIR` | from config | Per-model directory overrides |
-| `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_QWEN21_LORA_DIR` | from config | Pack directories for LoRA / Nunchaku weights. Read by both `QziConfig` and the native config loader; code-level `QziClientOptions` values are published through these variables so the engine sees them |
+| `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_QWEN21_LORA_DIR` | from config | Pack directories for LoRA / Nunchaku weights. Read by both `QziConfig` and the native config loader; code-level `QziClientOptions` values are scoped through these variables during engine creation so the engine sees them |
 | `QZI_MODEL_CACHE` | from config | Text-encoder cache directory |
 | `QZI_NATIVE_LIBRARY` | auto-probe | Full path to `QwenZImageNative.dll` / `libQwenZImageNative.so` |
 | `QZI_DEVICE_ID` | `-1` | CUDA device selector passed to the native backend |
 | `device_id` / `thread_count` (config keys) | `-1` / `0` | Auto device / thread count; only in the config file, no env override |
 
 `QziClient` resolves config → `QZI_*` overrides → explicit `QziClientOptions`
-(most specific wins) and publishes the chosen config file path as `QZI_CONFIG`
-so both the managed and native sides read the same file.
+(most specific wins). During `qzi_engine_create()` it temporarily publishes the
+chosen config path as `QZI_CONFIG` plus the directory overrides, then restores
+the process environment, so both sides read the same file without leaking one
+client's configuration into another. On Windows the native side reads these
+values through `qzi_getenv()` rather than the CRT's stale `getenv()` snapshot;
+see [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md#作用域发布与多实例隔离).
 
 The WebUI starts even if the native library cannot be loaded: `/api/health`
 then reports `ok=false` with the exact error, and `/api/events` emits an

@@ -9,10 +9,23 @@
  * weights is exercised by the WebUI / Sample instead.
  */
 
+/* setenv/unsetenv need the POSIX feature macro before any system header. */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "qzi.h"
+#include "qzi_env.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 static int failures = 0;
 
@@ -83,6 +96,42 @@ static int check_lora_validation(qzi_engine *engine,
     return rejected;
 }
 
+/* QziClient scopes QZI_* variables around qzi_engine_create(). On Windows the
+ * host changes the Win32 environment, which the native DLL's CRT getenv()
+ * cannot see (it holds a startup snapshot). Pin down that qzi_getenv() does. */
+static void check_scoped_environment(void)
+{
+    const char *name = "QZI_SMOKE_SCOPED";
+    char buffer[64];
+    char tiny[4];
+
+#ifdef _WIN32
+#define SET_ENV(v) SetEnvironmentVariableA(name, v)
+#define CLEAR_ENV() SetEnvironmentVariableA(name, NULL)
+#else
+#define SET_ENV(v) setenv(name, v, 1)
+#define CLEAR_ENV() unsetenv(name)
+#endif
+
+    CLEAR_ENV();
+    CHECK(qzi_getenv(name, buffer, sizeof(buffer)) == 0,
+          "unset scoped env reads as unset");
+
+    SET_ENV("live");
+    CHECK(qzi_getenv(name, buffer, sizeof(buffer)) == 1 &&
+          strcmp(buffer, "live") == 0,
+          "scoped env value visible to native config reader");
+    SET_ENV("much-longer-than-a-four-byte-buffer");
+    CHECK(qzi_getenv(name, tiny, sizeof(tiny)) == -1 && tiny[0] == '\0',
+          "oversized env value is reported, not truncated");
+    CLEAR_ENV();
+    CHECK(qzi_getenv(name, buffer, sizeof(buffer)) == 0,
+          "env removal visible to native config reader");
+
+#undef SET_ENV
+#undef CLEAR_ENV
+}
+
 int main(void)
 {
     qzi_engine_config config;
@@ -107,6 +156,8 @@ int main(void)
     memset(&c, 0, sizeof(c));
     memset(&callbacks, 0, sizeof(callbacks));
     memset(&health, 0, sizeof(health));
+
+    check_scoped_environment();
 
     CHECK(qzi_abi_version() == QZI_ABI_VERSION, "abi version");
     CHECK(strcmp(qzi_status_text(QZI_ERR_BUSY),
