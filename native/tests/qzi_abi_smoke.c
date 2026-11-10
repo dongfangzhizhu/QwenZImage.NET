@@ -730,10 +730,14 @@ int main(void)
           "image editing feature advertised");
     CHECK((qzi_abi_features() & QZI_FEATURE_ZIMAGE_CONTROL) != 0,
           "Z-Image ControlNet feature advertised");
+    CHECK((qzi_abi_features() & QZI_FEATURE_QWEN21_EDIT_ADV) != 0,
+          "advanced image editing feature advertised");
     CHECK(qzi_qwen21_edit_layout() == sizeof(qzi_qwen21_edit_request),
           "edit request layout size");
     CHECK(qzi_zimage_control_layout() == sizeof(qzi_zimage_control_request),
           "control request layout size");
+    CHECK(qzi_qwen21_edit_ex_layout() == sizeof(qzi_qwen21_edit_ex_request),
+          "advanced edit request layout size");
     CHECK(strcmp(qzi_status_text(QZI_ERR_BUSY),
                  "a generation owns the device") == 0, "status text");
     CHECK(qzi_abi_layout(sizes, QZI_LAYOUT_SLOTS) == QZI_OK, "abi layout");
@@ -836,6 +840,7 @@ int main(void)
 
         check_control_generation(engine, &zimage, error, sizeof(error));
         check_edit_generation(engine, &qwen, error, sizeof(error));
+        check_edit_ex_generation(engine, &qwen, error, sizeof(error));
     } else {
         printf("qzi_abi_smoke: generation skipped (real backend needs model "
                "weights configured in QwenZImage.config.json)\n");
@@ -871,17 +876,19 @@ int main(void)
                                             sizeof(error));
     extra_rejected += check_control_validation(engine, &zimage, error,
                                                sizeof(error));
+    extra_rejected += check_edit_ex_validation(engine, &qwen, error,
+                                               sizeof(error));
 
     CHECK(qzi_engine_health(engine, &health, error, sizeof(error)) == QZI_OK,
           "health");
     if (reference) {
         /* 2 baseline + 2 LoRA + 1 zimage + 6 control (1 plain t2i + 5
-         * control) + 3 image-edit generations. */
-        CHECK(health.served == 14, "served counter");
+         * control) + 3 image-edit + 4 advanced-edit generations. */
+        CHECK(health.served == 18, "served counter");
         CHECK(health.rejected == 2 + extra_rejected, "rejected counter");
         CHECK(health.reference_backend == 1, "reference backend flag");
-        /* The last three generations are qwen21 image edits, so the resident
-         * model is QWEN21 again (not ZIMAGE from the earlier zimage job). */
+        /* The last four generations are qwen21 advanced edits, so the resident
+         * model is QWEN21 (not ZIMAGE from the earlier zimage job). */
         CHECK(health.resident_model == QZI_MODEL_QWEN21, "resident model");
     } else {
         CHECK(health.served == 0, "served counter");
