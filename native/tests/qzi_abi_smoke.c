@@ -225,6 +225,140 @@ static void check_edit_generation(qzi_engine *engine,
     qzi_image_release(engine, &z);
 }
 
+/* Advanced Qwen-Image 2.1 editing is the THIRD additive ABI v1 extension:
+ * Red Canvas outpainting, LanPaint model modes and RGBA output. Validation
+ * happens in qzi.c before the vtable is called, so these cases also run on
+ * the real CUDA build without weights. Returns the number of rejected calls. */
+#define EXPECT_ADV_INVALID(call, label) do {                           \
+    if ((call) != QZI_ERR_INVALID_ARGUMENT) {                          \
+        fprintf(stderr, "FAIL: advanced edit validation %s (%s)\n",   \
+                label, error[0] ? error : "no error");                 \
+        failures++;                                                    \
+    }                                                                  \
+    rejected++;                                                        \
+} while (0)
+
+static int check_edit_ex_validation(qzi_engine *engine,
+                                    const qzi_qwen21_request *base,
+                                    char *error, size_t error_cap)
+{
+    static uint8_t rgb[3 * 64 * 64];
+    static uint8_t mask[64 * 64];
+    qzi_qwen21_edit_ex_request e;
+    qzi_image image;
+    int rejected = 0;
+
+    memset(&image, 0, sizeof(image));
+    memset(&e, 0, sizeof(e));
+    memset(rgb, 0x22, sizeof(rgb));
+    memset(mask, 255, sizeof(mask));
+    e.base.base = *base;
+    e.base.reference_rgb = rgb;
+    e.base.reference_width = 64;
+    e.base.reference_height = 64;
+    e.base.strength = 0.5f;
+
+    e.flags = 1;
+    EXPECT_ADV_INVALID(qzi_generate_qwen21_edit_ex(engine, &e, NULL, &image,
+                                                   error, error_cap),
+                       "reserved flags");
+    e.flags = 0;
+    e.margin_top = 16;
+    EXPECT_ADV_INVALID(qzi_generate_qwen21_edit_ex(engine, &e, NULL, &image,
+                                                   error, error_cap),
+                       "margin alignment");
+    e.margin_top = 64;
+    EXPECT_ADV_INVALID(qzi_generate_qwen21_edit_ex(engine, &e, NULL, &image,
+                                                   error, error_cap),
+                       "source rectangle too small");
+    e.margin_top = 0;
+    e.model_mode = 7;
+    EXPECT_ADV_INVALID(qzi_generate_qwen21_edit_ex(engine, &e, NULL, &image,
+                                                   error, error_cap),
+                       "unknown model mode");
+    e.model_mode = QZI_EDIT_MODE_LANPAINT_5;
+    EXPECT_ADV_INVALID(qzi_generate_qwen21_edit_ex(engine, &e, NULL, &image,
+                                                   error, error_cap),
+                       "LanPaint requires mask");
+    e.base.mask = mask;
+    e.base.masking_strength = 1.0f;
+    e.margin_left = 32;
+    EXPECT_ADV_INVALID(qzi_generate_qwen21_edit_ex(engine, &e, NULL, &image,
+                                                   error, error_cap),
+                       "LanPaint and outpainting are exclusive");
+    e.margin_left = 0;
+    e.rgba = 2;
+    EXPECT_ADV_INVALID(qzi_generate_qwen21_edit_ex(engine, &e, NULL, &image,
+                                                   error, error_cap),
+                       "rgba must be 0 or 1");
+    return rejected;
+}
+
+#undef EXPECT_ADV_INVALID
+
+/* The deterministic backend mixes every advanced knob into its PNG tag and
+ * can emit colour type 6, so the whole path is observable without a GPU. */
+static void check_edit_ex_generation(qzi_engine *engine,
+                                     const qzi_qwen21_request *base,
+                                     char *error, size_t error_cap)
+{
+    static uint8_t rgb[3 * 64 * 64];
+    static uint8_t mask[64 * 64];
+    qzi_qwen21_edit_ex_request e;
+    qzi_image a, b, c, d;
+    qzi_status status;
+
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    memset(&c, 0, sizeof(c));
+    memset(&d, 0, sizeof(d));
+    memset(rgb, 0x44, sizeof(rgb));
+    memset(mask, 255, sizeof(mask));
+    memset(&e, 0, sizeof(e));
+    e.base.base = *base;
+    e.base.reference_rgb = rgb;
+    e.base.reference_width = 64;
+    e.base.reference_height = 64;
+    e.base.strength = 0.5f;
+
+    status = qzi_generate_qwen21_edit_ex(engine, &e, NULL, &a, error, error_cap);
+    CHECK(status == QZI_OK, "advanced edit generate");
+    if (status != QZI_OK) fprintf(stderr, "  adv edit error: %s\n", error);
+    CHECK(is_png(&a), "advanced edit png signature");
+    CHECK(a.data && a.size > 26 && a.data[25] == 2, "advanced edit RGB colour type");
+
+    e.margin_top = 32;
+    status = qzi_generate_qwen21_edit_ex(engine, &e, NULL, &b, error, error_cap);
+    CHECK(status == QZI_OK, "outpainting generate");
+    CHECK(status != QZI_OK ||
+          (a.size == b.size && memcmp(a.data, b.data, a.size) != 0),
+          "outpainting margins change output bytes");
+
+    e.margin_top = 0;
+    e.rgba = 1;
+    status = qzi_generate_qwen21_edit_ex(engine, &e, NULL, &c, error, error_cap);
+    CHECK(status == QZI_OK, "RGBA advanced edit generate");
+    CHECK(is_png(&c), "RGBA png signature");
+    CHECK(status == QZI_OK && c.data && c.size > 26 && c.data[25] == 6,
+          "RGBA output uses PNG colour type 6");
+    CHECK(status == QZI_OK && c.size > a.size, "RGBA output is larger than RGB");
+
+    e.rgba = 0;
+    e.model_mode = QZI_EDIT_MODE_LANPAINT_5;
+    e.base.mask = mask;
+    e.base.masking_strength = 1.0f;
+    status = qzi_generate_qwen21_edit_ex(engine, &e, NULL, &d, error, error_cap);
+    CHECK(status == QZI_OK, "LanPaint generate");
+    CHECK(status != QZI_OK ||
+          (a.size == d.size && memcmp(a.data, d.data, a.size) != 0),
+          "LanPaint mode changes output bytes");
+
+    qzi_image_release(engine, &a);
+    qzi_image_release(engine, &b);
+    qzi_image_release(engine, &c);
+    qzi_image_release(engine, &d);
+}
+
 /* Z-Image ControlNet is the second additive ABI v1 extension. These requests
  * are rejected in qzi.c before the vtable is called, so they run on both
  * backends without model weights. Returns the number of rejected requests. */
@@ -467,6 +601,7 @@ static void check_legacy_backend(const qzi_engine_config *config,
     static uint8_t rgb[3 * 64 * 64];
     qzi_backend legacy;
     qzi_qwen21_edit_request e;
+    qzi_qwen21_edit_ex_request x;
     qzi_zimage_control_request c;
     qzi_zimage_request z;
     qzi_image image;
@@ -475,6 +610,7 @@ static void check_legacy_backend(const qzi_engine_config *config,
 
     memset(&legacy, 0, sizeof(legacy));
     memset(&e, 0, sizeof(e));
+    memset(&x, 0, sizeof(x));
     memset(&c, 0, sizeof(c));
     memset(&z, 0, sizeof(z));
     memset(&image, 0, sizeof(image));
@@ -500,6 +636,7 @@ static void check_legacy_backend(const qzi_engine_config *config,
     legacy.release_image = legacy_release;
     legacy.generate_qwen21_edit = NULL;
     legacy.generate_zimage_control = NULL;
+    legacy.generate_qwen21_edit_ex = NULL;
 
     CHECK(qzi_register_backend(&legacy) == QZI_OK, "register legacy backend");
     status = qzi_engine_create(config, &engine, error, cap);
@@ -510,12 +647,16 @@ static void check_legacy_backend(const qzi_engine_config *config,
         e.reference_width = 64;
         e.reference_height = 64;
         e.strength = 0.5f;
+        x.base = e;
         CHECK(qzi_generate_qwen21_edit(engine, &e, NULL, &image, error, cap) ==
                   QZI_ERR_UNSUPPORTED,
               "legacy backend rejects image editing");
         CHECK(qzi_generate_zimage_control(engine, &c, NULL, &image, error, cap) ==
                   QZI_ERR_UNSUPPORTED,
               "legacy backend rejects Z-Image ControlNet");
+        CHECK(qzi_generate_qwen21_edit_ex(engine, &x, NULL, &image, error, cap) ==
+                  QZI_ERR_UNSUPPORTED,
+              "legacy backend rejects advanced image editing");
         qzi_engine_destroy(engine);
     }
     CHECK(qzi_register_backend(NULL) == QZI_OK, "restore default backend");

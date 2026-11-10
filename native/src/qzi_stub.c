@@ -163,38 +163,45 @@ static qzi_status run_phases(const qzi_callbacks *callbacks, double start,
     return QZI_OK;
 }
 
-static uint8_t *make_rgb(const char *prompt, uint32_t w, uint32_t h,
-                         uint64_t seed, uint64_t tag,
-                         char *error, size_t error_cap)
+/* Deterministic interleaved RGB (channels = 3) or RGBA (channels = 4) pixels.
+ * The alpha plane is derived from the same PRNG stream, so an rgba request is
+ * byte-distinguishable from its RGB counterpart without a GPU. */
+static uint8_t *make_pixels(const char *prompt, uint32_t w, uint32_t h,
+                            uint32_t channels, uint64_t seed, uint64_t tag,
+                            char *error, size_t error_cap)
 {
-    size_t row_bytes = (size_t)w * 3u;
+    size_t row_bytes = (size_t)w * channels;
     size_t bytes = row_bytes * (size_t)h;
     uint8_t *rgb;
     uint64_t state = mix_seed(prompt, seed, w, h, tag);
     uint32_t y, x;
-    uint8_t base[3];
-    if ((size_t)w > SIZE_MAX / 3u / (size_t)h) {
+    uint8_t base[4];
+    if ((size_t)w > SIZE_MAX / channels / (size_t)h) {
         qzi_set_error(error, error_cap, "stub: dimensions overflow");
         return NULL;
     }
     rgb = (uint8_t *)malloc(bytes);
     if (!rgb) {
-        qzi_set_error(error, error_cap, "stub: RGB allocation failed");
+        qzi_set_error(error, error_cap, "stub: pixel allocation failed");
         return NULL;
     }
     base[0] = (uint8_t)(state >> 8);
     base[1] = (uint8_t)(state >> 24);
     base[2] = (uint8_t)(state >> 40);
+    base[3] = (uint8_t)(state >> 56);
     for (y = 0; y < h; y++) {
         uint8_t *row = rgb + (size_t)y * row_bytes;
         uint64_t r = next_rand(&state);
         for (x = 0; x < w; x++) {
-            uint8_t *pixel = row + (size_t)x * 3u;
+            uint8_t *pixel = row + (size_t)x * channels;
             r = next_rand(&state);
             pixel[0] = (uint8_t)(base[0] + (uint8_t)r + (uint8_t)x);
             pixel[1] = (uint8_t)(base[1] + (uint8_t)(r >> 16) + (uint8_t)y);
             pixel[2] = (uint8_t)(base[2] + (uint8_t)(r >> 32) +
                                  (uint8_t)(x ^ y));
+            if (channels == 4u)
+                pixel[3] = (uint8_t)(base[3] + (uint8_t)(r >> 48) +
+                                     (uint8_t)(x + y));
         }
     }
     return rgb;
@@ -281,10 +288,13 @@ static uint64_t hash_bytes(const uint8_t *data, size_t size)
 
 /* Shared qwen21 implementation. `edit` is NULL for plain text-to-image; when
  * present, the deterministic tag mixes in the reference/mask/strength and the
- * dit phase only reports the steps actually re-run (WanGP's first_step). */
+ * dit phase only reports the steps actually re-run (WanGP's first_step).
+ * `adv` is the additive advanced-edit request: its base IS the edit request,
+ * so every path lands on the same tag / phase / encode logic. */
 static qzi_status stub_generate_qwen21_impl(void *context,
                                             const qzi_qwen21_request *base,
                                             const qzi_qwen21_edit_request *edit,
+                                            const qzi_qwen21_edit_ex_request *adv,
                                             const qzi_callbacks *callbacks,
                                             qzi_image *out_image,
                                             char *error, size_t error_cap)
@@ -293,9 +303,13 @@ static qzi_status stub_generate_qwen21_impl(void *context,
     qzi_status status;
     uint8_t *rgb, *png;
     size_t png_size = 0;
+    if (adv) edit = &adv->base;
     const qzi_qwen21_request *request = edit ? &edit->base : base;
     int32_t steps = request->steps > 0 ? request->steps : 8;
     int32_t run_steps = steps;
+    const int outpainting = adv && (adv->margin_top || adv->margin_bottom ||
+                                    adv->margin_left || adv->margin_right);
+    const uint32_t channels = adv && adv->rgba ? 4u : 3u;
     const char *tier = request->tier && *request->tier ? request->tier : "turbo";
     const char *lora = request->lora ? request->lora : "";
     int switched = (s->resident != QZI_MODEL_QWEN21) ||
@@ -316,8 +330,9 @@ static qzi_status stub_generate_qwen21_impl(void *context,
      * ABI layer already validated this request, a backend can also be called
      * directly by an integrator, and a bogus reference_width must not turn
      * into an out-of-bounds read in hash_bytes(). */
-    status = edit ? qzi_validate_qwen21_edit(edit, error, error_cap)
-                  : qzi_validate_qwen21(request, error, error_cap);
+    status = adv ? qzi_validate_qwen21_edit_ex(adv, error, error_cap)
+                 : edit ? qzi_validate_qwen21_edit(edit, error, error_cap)
+                        : qzi_validate_qwen21(request, error, error_cap);
     if (status != QZI_OK) return status;
 
     if (edit) {
@@ -326,9 +341,13 @@ static qzi_status stub_generate_qwen21_impl(void *context,
         /* Mirror WanGP's first_step = int(steps * (1 - denoising_strength))
          * so the reference backend's progress trace matches the edit semantics
          * even on GPU-less CI. The real engine uses the same step-based rule
-         * (qzen_qwen21_edit_start), so both agree on every strength. */
-        int32_t first_step = (int32_t)((double)steps *
-                                       (1.0 - (double)edit->strength));
+         * (qzen_qwen21_edit_start), so both agree on every strength.
+         * LanPaint forces strength 1.0 (first_step 0) and Red Canvas
+         * outpainting uses step_offset 0 -- both run the full schedule. */
+        float strength = edit->strength > 0.0f ? edit->strength : 0.75f;
+        if (adv && adv->model_mode != QZI_EDIT_MODE_MASKED) strength = 1.0f;
+        int32_t first_step = outpainting ? 0
+            : (int32_t)((double)steps * (1.0 - (double)strength));
         if (first_step >= steps) first_step = steps - 1;
         if (first_step < 0) first_step = 0;
         run_steps = steps - first_step;
@@ -341,6 +360,18 @@ static qzi_status stub_generate_qwen21_impl(void *context,
         tag ^= float_bits(edit->masking_strength) * 0xD6E8FEB86659FD93ULL;
         tag ^= (uint64_t)edit->reference_width << 32 ^
                (uint64_t)edit->reference_height;
+    }
+    if (adv) {
+        /* Every advanced knob must be observable without a GPU. */
+        tag ^= 0x4144564544495431ULL; /* "ADVEDIT1" */
+        tag ^= (uint64_t)adv->margin_top << 48 ^
+               (uint64_t)adv->margin_bottom << 32 ^
+               (uint64_t)adv->margin_left << 16 ^ (uint64_t)adv->margin_right;
+        tag ^= (uint64_t)adv->model_mode * 0x9E3779B97F4A7C15ULL;
+        tag ^= (uint64_t)adv->rgba * 0xBF58476D1CE4E5B9ULL;
+        if (outpainting)
+            tag ^= qzi_fnv1a("Remove the red paddings on the sides and show "
+                             "what's behind them.") * 0xD6E8FEB86659FD93ULL;
     }
     if (!s->qwen21_dir) {
         qzi_set_error(error, error_cap,
@@ -355,11 +386,15 @@ static qzi_status stub_generate_qwen21_impl(void *context,
     snprintf(s->lora, sizeof(s->lora), "%s", lora);
     s->lora_scale = request->lora_scale;
 
-    rgb = make_rgb(request->prompt, (uint32_t)request->width,
-                   (uint32_t)request->height, request->seed, tag,
-                   error, error_cap);
+    rgb = make_pixels(request->prompt, (uint32_t)request->width,
+                      (uint32_t)request->height, channels, request->seed, tag,
+                      error, error_cap);
     if (!rgb) return QZI_ERR_OUT_OF_MEMORY;
-    png = qzi_png_encode_rgb8(rgb, (uint32_t)request->width,
+    png = channels == 4u
+        ? qzi_png_encode_rgba8(rgb, (uint32_t)request->width,
+                               (uint32_t)request->height, &png_size,
+                               error, error_cap)
+        : qzi_png_encode_rgb8(rgb, (uint32_t)request->width,
                               (uint32_t)request->height, &png_size,
                               error, error_cap);
     free(rgb);
@@ -379,7 +414,7 @@ static qzi_status stub_generate_qwen21(void *context,
                                        qzi_image *out_image,
                                        char *error, size_t error_cap)
 {
-    return stub_generate_qwen21_impl(context, request, NULL, callbacks,
+    return stub_generate_qwen21_impl(context, request, NULL, NULL, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -389,7 +424,17 @@ static qzi_status stub_generate_qwen21_edit(void *context,
                                             qzi_image *out_image,
                                             char *error, size_t error_cap)
 {
-    return stub_generate_qwen21_impl(context, NULL, request, callbacks,
+    return stub_generate_qwen21_impl(context, NULL, request, NULL, callbacks,
+                                     out_image, error, error_cap);
+}
+
+static qzi_status stub_generate_qwen21_edit_ex(void *context,
+                                               const qzi_qwen21_edit_ex_request *request,
+                                               const qzi_callbacks *callbacks,
+                                               qzi_image *out_image,
+                                               char *error, size_t error_cap)
+{
+    return stub_generate_qwen21_impl(context, NULL, NULL, request, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -444,9 +489,9 @@ static qzi_status stub_generate_zimage_impl(void *context,
     if (status != QZI_OK) return status;
     s->zimage_control = control != NULL;
 
-    rgb = make_rgb(request->prompt, (uint32_t)request->width,
-                   (uint32_t)request->height, request->seed, tag,
-                   error, error_cap);
+    rgb = make_pixels(request->prompt, (uint32_t)request->width,
+                      (uint32_t)request->height, 3u, request->seed, tag,
+                      error, error_cap);
     if (!rgb) return QZI_ERR_OUT_OF_MEMORY;
     png = qzi_png_encode_rgb8(rgb, (uint32_t)request->width,
                               (uint32_t)request->height, &png_size,
@@ -493,7 +538,8 @@ const qzi_backend qzi_reference_vtable = {
     stub_unload,
     stub_release_image,
     stub_generate_qwen21_edit,
-    stub_generate_zimage_control
+    stub_generate_zimage_control,
+    stub_generate_qwen21_edit_ex
 };
 
 /* The vtable's context pointer must be per-engine, not a global: qzi.c copies

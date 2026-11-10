@@ -84,7 +84,7 @@ public record QwenImageOptions : GenerationOptions
 /// blended into the noise at WanGP's denoising strength; an optional mask pins
 /// the unmasked latent cells to the reference trajectory.
 /// </summary>
-public sealed record Qwen21EditOptions : QwenImageOptions
+public record Qwen21EditOptions : QwenImageOptions
 {
     /// <summary>Required planar RGB8 reference image.</summary>
     public required QziRasterImage Reference { get; init; }
@@ -116,6 +116,88 @@ public sealed record Qwen21EditOptions : QwenImageOptions
     /// <summary>The masking strength actually sent (0 without a mask).</summary>
     public float EffectiveMaskingStrength =>
         Mask is null ? 0.0f : (MaskingStrength ?? 1.0f);
+}
+
+/// <summary>
+/// WanGP <c>qwen21_handler</c> model modes. Mode 0 is ordinary masked
+/// denoising; the four nonzero values select training-free LanPaint with
+/// NSteps = 2 / 5 / 10 / 15 inner Langevin iterations before each sampler
+/// step. The numeric values are the WanGP combo-box indices, NOT the iteration
+/// counts, and are passed through the C ABI unchanged.
+/// </summary>
+public enum Qwen21EditMode : uint
+{
+    /// <summary>Ordinary masked denoising (WanGP "Masked Denoising").</summary>
+    MaskedDenoising = 0,
+
+    /// <summary>LanPaint, 2 inner iterations (WanGP mode 2).</summary>
+    LanPaint2 = 2,
+
+    /// <summary>LanPaint, 5 inner iterations (WanGP mode 3).</summary>
+    LanPaint5 = 3,
+
+    /// <summary>LanPaint, 10 inner iterations (WanGP mode 4).</summary>
+    LanPaint10 = 4,
+
+    /// <summary>LanPaint, 15 inner iterations (WanGP mode 5).</summary>
+    LanPaint15 = 5
+}
+
+/// <summary>
+/// Advanced Qwen-Image 2.1 editing, additive over <see cref="Qwen21EditOptions"/>
+/// and using the SAME 7B weights (no extra checkpoint). Three WanGP features
+/// are exposed:
+/// <list type="number">
+///   <item>Red Canvas outpainting: the four margins extend the output canvas;
+///   the reference is cover-fitted into the inner source rectangle and the
+///   red margins are fully regenerated.</item>
+///   <item>LanPaint model modes (see <see cref="Qwen21EditMode"/>), which force
+///   denoising / masking strengths to 1.0 and require a mask.</item>
+///   <item>RGBA output, keeping the VAE decoder's generated 4th channel.</item>
+/// </list>
+/// </summary>
+/// <remarks>
+/// <c>Width</c> and <c>Height</c> describe the FINAL canvas
+/// including the margins. Every margin must be a multiple of 32
+/// (<c>RequestValidator.OutpaintAlignment</c>) and the inner source rectangle
+/// must remain at least 32x32. Outpainting and LanPaint are mutually
+/// exclusive, matching WanGP.
+/// </remarks>
+public sealed record Qwen21EditExOptions : Qwen21EditOptions
+{
+    /// <summary>Output-canvas pixels added above the source rectangle.</summary>
+    public uint MarginTop { get; init; }
+
+    /// <summary>Output-canvas pixels added below the source rectangle.</summary>
+    public uint MarginBottom { get; init; }
+
+    /// <summary>Output-canvas pixels added left of the source rectangle.</summary>
+    public uint MarginLeft { get; init; }
+
+    /// <summary>Output-canvas pixels added right of the source rectangle.</summary>
+    public uint MarginRight { get; init; }
+
+    /// <summary>Masked denoising or one of the LanPaint modes.</summary>
+    public Qwen21EditMode ModelMode { get; init; } = Qwen21EditMode.MaskedDenoising;
+
+    /// <summary>
+    /// <see langword="true"/> writes an RGBA PNG (PNG colour type 6) using the
+    /// VAE decoder's generated alpha; <see langword="false"/> returns RGB.
+    /// </summary>
+    public bool Rgba { get; init; }
+
+    /// <summary>Reserved for the C ABI; must be 0.</summary>
+    public uint Flags { get; init; }
+
+    /// <summary>True when at least one outpainting margin is nonzero.</summary>
+    public bool HasOutpainting =>
+        (MarginTop | MarginBottom | MarginLeft | MarginRight) != 0;
+
+    /// <summary>True when a LanPaint model mode is selected.</summary>
+    public bool IsLanPaint => ModelMode != Qwen21EditMode.MaskedDenoising;
+
+    /// <summary>The numeric WanGP model mode actually sent over the C ABI.</summary>
+    public uint EffectiveModelMode => (uint)ModelMode;
 }
 
 /// <summary>

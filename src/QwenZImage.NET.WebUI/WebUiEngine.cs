@@ -31,6 +31,14 @@ public sealed record WebUiEngineHealth
     /// </summary>
     [JsonPropertyName("supports_controlnet")]
     public bool SupportsControlNet { get; init; }
+
+    /// <summary>
+    /// Whether the loaded native library exports the third additive ABI v1
+    /// increment (advanced Qwen-Image 2.1 editing). Mirrors the top-level
+    /// <c>supports_advanced_editing</c> flag in <c>/api/health</c>.
+    /// </summary>
+    [JsonPropertyName("supports_advanced_editing")]
+    public bool SupportsAdvancedEditing { get; init; }
 }
 
 /// <summary>
@@ -53,6 +61,23 @@ public static class WebUiCapabilities
         "ControlNet Union. Rebuild QwenZImageNative from the matching source tree; " +
         "text-to-image generation is unaffected.";
 
+    /// <summary>400 message for an advanced-edit job on an older library.</summary>
+    public const string AdvancedEditingUnavailable =
+        "The loaded native library does not implement advanced Qwen-Image 2.1 " +
+        "editing (outpainting / LanPaint / RGBA). Rebuild QwenZImageNative from " +
+        "the matching source tree; ordinary image editing and text-to-image " +
+        "generation are unaffected.";
+
+    /// <summary>
+    /// Two-argument overload kept for callers that predate the third additive
+    /// increment; it assumes the advanced capability follows the basic one.
+    /// </summary>
+    public static string? ErrorFor(GenerationOptions options,
+                                   bool supportsImageEditing,
+                                   bool supportsControlNet)
+        => ErrorFor(options, supportsImageEditing, supportsControlNet,
+                    supportsImageEditing);
+
     /// <summary>
     /// Returns a 400-style error when <paramref name="options"/> needs a
     /// feature the loaded library does not provide, otherwise <c>null</c>.
@@ -63,9 +88,13 @@ public static class WebUiCapabilities
     /// </summary>
     public static string? ErrorFor(GenerationOptions options,
                                    bool supportsImageEditing,
-                                   bool supportsControlNet)
+                                   bool supportsControlNet,
+                                   bool supportsAdvancedEditing)
         => options switch
         {
+            // Advanced editing derives from the ordinary edit options, so it
+            // must be matched first.
+            Qwen21EditExOptions when !supportsAdvancedEditing => AdvancedEditingUnavailable,
             Qwen21EditOptions when !supportsImageEditing => EditingUnavailable,
             ZImageControlOptions when !supportsControlNet => ControlNetUnavailable,
             _ => null
@@ -102,6 +131,13 @@ public sealed class WebUiEngine : IQziExecutor, IDisposable
     /// </summary>
     public bool SupportsControlNet => _client.SupportsControlNet;
 
+    /// <summary>
+    /// Whether the loaded native library exports the third additive ABI v1
+    /// increment (advanced editing). Exposed so the WebUI can reject advanced
+    /// jobs with a 400 instead of letting them fail minutes later.
+    /// </summary>
+    public bool SupportsAdvancedEditing => _client.SupportsAdvancedEditing;
+
     public GenerationResult Generate(GenerationOptions options,
                                      IProgress<GenerationProgress>? progress = null,
                                      CancellationToken cancellationToken = default)
@@ -131,7 +167,8 @@ public sealed class WebUiEngine : IQziExecutor, IDisposable
             UptimeSeconds = h.Uptime.TotalSeconds,
             IsReferenceBackend = h.IsReferenceBackend,
             Backend = h.IsReferenceBackend ? "reference (noise)" : "QwenZImageNative",
-            SupportsControlNet = SupportsControlNet
+            SupportsControlNet = SupportsControlNet,
+            SupportsAdvancedEditing = SupportsAdvancedEditing
         };
     }
 

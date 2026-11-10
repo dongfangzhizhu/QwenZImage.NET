@@ -246,6 +246,10 @@ static const qzi_backend custom_backend_vtable = {
     /* Optional, additive in ABI v1: Z-Image Turbo Fun ControlNet Union. NULL
      * makes qzi_generate_zimage_control() answer QZI_ERR_UNSUPPORTED while
      * every older generate path keeps working. */
+    NULL,
+    /* Optional, additive in ABI v1: advanced Qwen-Image 2.1 editing
+     * (outpainting / LanPaint / RGBA). NULL makes
+     * qzi_generate_qwen21_edit_ex() answer QZI_ERR_UNSUPPORTED. */
     NULL
 };
 

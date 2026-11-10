@@ -64,6 +64,24 @@ typedef struct {
      * meaning and a NULL / 0 pair is a plain img2img edit. */
     const uint8_t *latent_mask;
     float masking_strength;
+    /* Advanced WanGP editing, additive in the same struct. All four fields
+     * default to zero/NULL for existing positional initialisers.
+     *
+     * WanGP's edit pipeline is a CONDITION-PREFIX model: the reference latent
+     * is concatenated in front of the noised target and the DiT attends to it,
+     * so outpainting can start from pure noise and still keep the source. This
+     * engine is an img2img sampler instead -- the reference IS the starting
+     * latent -- so Red Canvas outpainting is approximated by:
+     *   - step_offset = 0 (the full schedule, like WanGP's red margins);
+     *   - masked cells (margins + painted interior) start from full noise,
+     *     kept cells start at sigmas[first_step] (retain the source);
+     *   - mask == 0 cells are pinned to the known trajectory, which is what
+     *     preserves the source content without a condition prefix.
+     * See qzen_qwen21_pipeline.c for the exact formulas. */
+    int outpainting;        /* 1 = Red Canvas margins, run from step 0 */
+    int lanpaint_steps;     /* 0 = off; 2/5/10/15 inner Langevin iterations */
+    uint64_t lanpaint_seed; /* deterministic stream for the Langevin noise */
+    unsigned char *alpha;   /* optional [1][16*height][16*width] RGBA plane */
 } qzen_qwen21_sample;
 
 /* Phase progress for the resident service: "dit" with (step, steps) before each

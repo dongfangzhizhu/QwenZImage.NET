@@ -87,8 +87,9 @@ static void set_error(char *error, size_t error_cap, const char *message)
     error[n] = '\0';
 }
 
-uint8_t *qzi_png_encode_rgb8(const uint8_t *rgb, uint32_t width, uint32_t height,
-                             size_t *out_size, char *error, size_t error_cap)
+static uint8_t *png_encode(const uint8_t *rgb, uint32_t width, uint32_t height,
+                           uint32_t channels, size_t *out_size,
+                           char *error, size_t error_cap)
 {
     static const uint8_t signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
     size_t row_bytes, raw_size, blocks, idat_size, total, off, remaining;
@@ -97,16 +98,17 @@ uint8_t *qzi_png_encode_rgb8(const uint8_t *rgb, uint32_t width, uint32_t height
     uint32_t y;
 
     if (out_size) *out_size = 0;
-    if (!rgb || width == 0 || height == 0 || !out_size) {
+    if (!rgb || width == 0 || height == 0 || !out_size ||
+        (channels != 3u && channels != 4u)) {
         set_error(error, error_cap, "png: invalid input");
         return NULL;
     }
-    if ((size_t)width > SIZE_MAX / 3u / (size_t)height ||
-        (size_t)height > SIZE_MAX / ((size_t)width * 3u + 1u)) {
+    if ((size_t)width > SIZE_MAX / channels / (size_t)height ||
+        (size_t)height > SIZE_MAX / ((size_t)width * channels + 1u)) {
         set_error(error, error_cap, "png: dimensions overflow");
         return NULL;
     }
-    row_bytes = (size_t)width * 3u;
+    row_bytes = (size_t)width * channels;
     raw_size = (row_bytes + 1u) * (size_t)height;
     blocks = (raw_size + 65534u) / 65535u;
     if (blocks == 0) blocks = 1;
@@ -163,7 +165,7 @@ uint8_t *qzi_png_encode_rgb8(const uint8_t *rgb, uint32_t width, uint32_t height
     put_be32(ihdr, width);
     put_be32(ihdr + 4, height);
     ihdr[8] = 8; /* 8-bit */
-    ihdr[9] = 2; /* truecolor RGB */
+    ihdr[9] = channels == 4u ? 6 : 2; /* 6 = truecolor+alpha, 2 = truecolor */
     p = emit_chunk(p, "IHDR", ihdr, 13);
     if (p) p = emit_chunk(p, "IDAT", idat, (uint32_t)idat_size);
     if (p) p = emit_chunk(p, "IEND", NULL, 0);
@@ -177,4 +179,16 @@ uint8_t *qzi_png_encode_rgb8(const uint8_t *rgb, uint32_t width, uint32_t height
     }
     *out_size = (size_t)(p - out);
     return out;
+}
+
+uint8_t *qzi_png_encode_rgb8(const uint8_t *rgb, uint32_t width, uint32_t height,
+                             size_t *out_size, char *error, size_t error_cap)
+{
+    return png_encode(rgb, width, height, 3u, out_size, error, error_cap);
+}
+
+uint8_t *qzi_png_encode_rgba8(const uint8_t *rgba, uint32_t width, uint32_t height,
+                              size_t *out_size, char *error, size_t error_cap)
+{
+    return png_encode(rgba, width, height, 4u, out_size, error, error_cap);
 }

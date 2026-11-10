@@ -77,6 +77,16 @@ typedef struct qzi_backend {
                                           const qzi_callbacks *callbacks,
                                           qzi_image *out_image,
                                           char *error, size_t error_cap);
+
+    /* Optional, additive in ABI v1: advanced Qwen-Image 2.1 editing
+     * (outpainting / LanPaint / RGBA). NULL makes
+     * qzi_generate_qwen21_edit_ex() report QZI_ERR_UNSUPPORTED while all four
+     * older generate paths keep working unchanged. Always the LAST slot. */
+    qzi_status (*generate_qwen21_edit_ex)(void *context,
+                                          const qzi_qwen21_edit_ex_request *request,
+                                          const qzi_callbacks *callbacks,
+                                          qzi_image *out_image,
+                                          char *error, size_t error_cap);
 } qzi_backend;
 
 /* Filled in by the built-in deterministic reference backend. Exposed so an

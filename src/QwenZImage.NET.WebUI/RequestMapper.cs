@@ -52,7 +52,8 @@ public static class RequestMapper
                 "Z-Image ControlNet is a Z-Image feature; use model 'zimage-control'.");
         if (!wantsEdit && HasEditParameters(request))
             throw new ArgumentException(
-                "mask_image / strength / masking_strength require reference_image.");
+                "mask_image / strength / masking_strength and the advanced edit fields " +
+                "(margin_*, model_mode, rgba) require reference_image.");
         if (!wantsControl && HasControlParameters(request))
             throw new ArgumentException(
                 "control_type / control_scale require control_image.");
@@ -102,7 +103,7 @@ public static class RequestMapper
     /// common fields from <see cref="MapQwen21"/> keeps t2i and edit validation
     /// from drifting apart.
     /// </summary>
-    private static Qwen21EditOptions MapQwen21Edit(GenerateRequest request)
+    private static GenerationOptions MapQwen21Edit(GenerateRequest request)
     {
         string reference = NullIfBlank(request.ReferenceImage)
             ?? throw new ArgumentException(
@@ -126,7 +127,45 @@ public static class RequestMapper
                 "region to restore from the reference.");
         float? masking = mask is null ? null : request.MaskingStrength;
 
-        return new Qwen21EditOptions
+        // No advanced field: keep the ordinary edit request on the second ABI
+        // increment so older native libraries can still serve the job.
+        if (!HasAdvancedParameters(request))
+            return new Qwen21EditOptions
+            {
+                Prompt = common.Prompt,
+                Width = common.Width,
+                Height = common.Height,
+                Seed = common.Seed,
+                Tier = common.Tier,
+                Steps = common.Steps,
+                Guidance = common.Guidance,
+                NegativePrompt = common.NegativePrompt,
+                Lora = common.Lora,
+                LoraScale = common.LoraScale,
+                Reference = raster,
+                Mask = mask,
+                Strength = request.Strength,
+                MaskingStrength = masking
+            };
+
+        Qwen21EditMode modelMode = request.ModelMode switch
+        {
+            null or 0 => Qwen21EditMode.MaskedDenoising,
+            2 => Qwen21EditMode.LanPaint2,
+            3 => Qwen21EditMode.LanPaint5,
+            4 => Qwen21EditMode.LanPaint10,
+            5 => Qwen21EditMode.LanPaint15,
+            var other => throw new ArgumentException(
+                $"Unknown model_mode '{other}'. Use 0 (masked denoising) or " +
+                "2/3/4/5 (LanPaint 2/5/10/15).")
+        };
+        if (request.Rgba is not (null or 0 or 1))
+            throw new ArgumentException("rgba must be 0 or 1.", nameof(request));
+
+        // The library validator re-checks 32-pixel alignment, the residual
+        // source rectangle, LanPaint's mask requirement and the mutual
+        // exclusion with outpainting; the mapper only converts the JSON types.
+        return new Qwen21EditExOptions
         {
             Prompt = common.Prompt,
             Width = common.Width,
@@ -141,13 +180,33 @@ public static class RequestMapper
             Reference = raster,
             Mask = mask,
             Strength = request.Strength,
-            MaskingStrength = masking
+            MaskingStrength = masking,
+            MarginTop = Margin(request.MarginTop, "margin_top"),
+            MarginBottom = Margin(request.MarginBottom, "margin_bottom"),
+            MarginLeft = Margin(request.MarginLeft, "margin_left"),
+            MarginRight = Margin(request.MarginRight, "margin_right"),
+            ModelMode = modelMode,
+            Rgba = request.Rgba == 1,
+            Flags = 0
         };
     }
 
+    private static uint Margin(int? value, string name)
+    {
+        if (value is null) return 0u;
+        if (value < 0) throw new ArgumentException($"{name} must be non-negative.");
+        return (uint)value.Value;
+    }
+
+    private static bool HasAdvancedParameters(GenerateRequest request)
+        => request.MarginTop is not null || request.MarginBottom is not null ||
+           request.MarginLeft is not null || request.MarginRight is not null ||
+           request.ModelMode is not null || request.Rgba is not null;
+
     private static bool HasEditParameters(GenerateRequest request)
         => !string.IsNullOrWhiteSpace(request.MaskImage) ||
-           request.Strength is not null || request.MaskingStrength is not null;
+           request.Strength is not null || request.MaskingStrength is not null ||
+           HasAdvancedParameters(request);
 
     private static ZImageOptions MapZImage(GenerateRequest request)
         => new()

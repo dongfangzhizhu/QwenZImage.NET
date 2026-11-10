@@ -18,6 +18,8 @@ qzi_status  qzi_validate_qwen21(const qzi_qwen21_request *request,
                                 char *error, size_t error_cap);
 qzi_status  qzi_validate_qwen21_edit(const qzi_qwen21_edit_request *request,
                                      char *error, size_t error_cap);
+qzi_status  qzi_validate_qwen21_edit_ex(const qzi_qwen21_edit_ex_request *request,
+                                        char *error, size_t error_cap);
 qzi_status  qzi_validate_zimage(const qzi_zimage_request *request,
                                 char *error, size_t error_cap);
 qzi_status  qzi_validate_zimage_control(const qzi_zimage_control_request *request,

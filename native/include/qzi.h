@@ -56,6 +56,22 @@ extern "C" {
  * stays 1 and every pre-existing struct and export keeps its exact layout. */
 #define QZI_FEATURE_QWEN21_EDIT    0x1u
 #define QZI_FEATURE_ZIMAGE_CONTROL 0x2u
+/* Advanced WanGP editing: outpainting, LanPaint and RGBA output. All three are
+ * pure orchestration / sampling on the SAME 7B weights; no new checkpoint. */
+#define QZI_FEATURE_QWEN21_EDIT_ADV 0x4u
+
+/* Outpainting margins and source offsets are aligned to 32 pixels, matching
+ * models/qwen21/pipeline.py OUTPAINTING_ALIGNMENT. */
+#define QZI_OUTPAINT_ALIGNMENT 32u
+
+/* WanGP qwen21_handler model_modes: 0 = "Masked Denoising", the four nonzero
+ * modes select LanPaint with NSteps = 2 / 5 / 10 / 15 inner Langevin iterations
+ * before each sampler step. LanPaint needs no extra weights. */
+#define QZI_EDIT_MODE_MASKED       0u
+#define QZI_EDIT_MODE_LANPAINT_2   2u
+#define QZI_EDIT_MODE_LANPAINT_5   3u
+#define QZI_EDIT_MODE_LANPAINT_10  4u
+#define QZI_EDIT_MODE_LANPAINT_15  5u
 
 /* Maximum byte length of a LoRA adapter file name (excluding the NUL).
  * Both sides of the ABI reject longer names instead of truncating them. */
@@ -160,6 +176,52 @@ typedef struct qzi_qwen21_edit_request {
     float              masking_strength; /* 0 sentinel, else 0.05..1.0 */
     uint32_t           flags;            /* reserved, must be 0 */
 } qzi_qwen21_edit_request;
+
+/* Qwen-Image 2.1 ADVANCED image editing, additive in ABI v1 exactly like
+ * qzi_qwen21_edit_request: no pre-existing struct or export changes. The old
+ * edit request is the first member, so a caller can keep using
+ * qzi_generate_qwen21_edit() unchanged; probe QZI_FEATURE_QWEN21_EDIT_ADV and
+ * qzi_qwen21_edit_ex_layout() before calling qzi_generate_qwen21_edit_ex().
+ *
+ * Three WanGP capabilities that need NO new weights are exposed here:
+ *
+ * 1. Outpainting (Red Canvas). margin_* are output-canvas pixels on each side;
+ *    all four must be multiples of QZI_OUTPAINT_ALIGNMENT (32) and leave at
+ *    least a 32x32 source rectangle. The reference is centre-crop cover-fitted
+ *    into that inner rectangle and composited on an opaque red (FF0000) canvas,
+ *    the fixed WanGP suffix
+ *      "Remove the red paddings on the sides and show what's behind them."
+ *    is appended to the prompt, and the red margins always run the full
+ *    denoise schedule while `strength` only applies to the painted interior.
+ *    All zero margins mean "no outpainting".
+ *
+ * 2. LanPaint (model_mode 2/3/4/5). A training-free BiG-score Langevin
+ *    refinement inserted before each sampler step. Requires `base.mask`;
+ *    incompatible with outpainting (WanGP disables it for instruction
+ *    outpainting) and forces denoising_strength = masking_strength = 1.0.
+ *
+ * 3. RGBA output (rgba != 0). The Qwen-Image 2.1 VAE decoder's conv_out has
+ *    four channels; WanGP keeps the 4th as model-generated alpha when
+ *    custom_settings.rgba == "Enabled" and writes an RGBA PNG. With rgba == 0
+ *    the alpha channel is discarded and a normal RGB PNG is returned.
+ *
+ * NOTE on fidelity: this engine is an img2img sampler (the reference enters
+ * through its VAE latent), not WanGP's Qwen3-VL vision-tower + DiT image
+ * prefix. Outpainting therefore preserves the source through latent masking,
+ * which is approximate; see docs/ENGINE_INTEGRATION.md. Multi-reference
+ * editing, 20B edit/edit_plus/layered, Viggle / Pruna and accelerator profiles
+ * need separate weights or a vision tower and are intentionally NOT exposed.
+ */
+typedef struct qzi_qwen21_edit_ex_request {
+    qzi_qwen21_edit_request base;  /* the ordinary one-reference edit request */
+    uint32_t margin_top;
+    uint32_t margin_bottom;
+    uint32_t margin_left;
+    uint32_t margin_right;
+    uint32_t model_mode;           /* 0 or QZI_EDIT_MODE_LANPAINT_* */
+    uint32_t rgba;                 /* 0 = RGB PNG, nonzero = RGBA PNG */
+    uint32_t flags;                /* reserved, must be 0 */
+} qzi_qwen21_edit_ex_request;
 
 /* Z-Image (Turbo / Nunchaku) text-to-image request. Rules mirror the engine:
  * width/height are multiples of 16 in [16, 2048], w*h <= 2048*2048;
@@ -266,6 +328,9 @@ QZI_API uint32_t    qzi_abi_features(void);
  * six slots and old libraries do not export these symbols at all. */
 QZI_API size_t      qzi_qwen21_edit_layout(void);
 QZI_API size_t      qzi_zimage_control_layout(void);
+/* sizeof(qzi_qwen21_edit_ex_request); additive in v1, old libraries do not
+ * export it at all. */
+QZI_API size_t      qzi_qwen21_edit_ex_layout(void);
 
 /* Reports sizeof() for the six POD structs above. Used by the managed wrapper
  * to fail fast on a struct-packing mismatch instead of corrupting memory. */
@@ -317,6 +382,18 @@ QZI_API qzi_status  qzi_generate_qwen21_edit(qzi_engine *engine,
  * the caller. */
 QZI_API qzi_status  qzi_generate_zimage_control(qzi_engine *engine,
                                                 const qzi_zimage_control_request *request,
+                                                const qzi_callbacks *callbacks,
+                                                qzi_image *out_image,
+                                                char *error, size_t error_cap);
+
+/* Advanced Qwen-Image 2.1 image editing (outpainting / LanPaint / RGBA).
+ * Same single-flight, progress, cancellation and buffer-ownership rules as
+ * qzi_generate_qwen21_edit(). Returns QZI_ERR_UNSUPPORTED when the registered
+ * backend has no advanced-edit slot. All caller-owned buffers (reference,
+ * mask) are only read during the call. The returned PNG is RGB (color type 2)
+ * or RGBA (color type 6) according to request->rgba. */
+QZI_API qzi_status  qzi_generate_qwen21_edit_ex(qzi_engine *engine,
+                                                const qzi_qwen21_edit_ex_request *request,
                                                 const qzi_callbacks *callbacks,
                                                 qzi_image *out_image,
                                                 char *error, size_t error_cap);

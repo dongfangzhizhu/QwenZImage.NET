@@ -48,6 +48,15 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     public bool SupportsControlNet => AbiGuard.ZImageControlSupported;
 
     /// <summary>
+    /// Whether the loaded native library implements the third additive ABI v1
+    /// increment: advanced Qwen-Image 2.1 editing (Red Canvas outpainting,
+    /// LanPaint model modes and RGBA output). Older libraries keep serving
+    /// ordinary image editing and text-to-image; the wrapper probes the exports
+    /// instead of assuming the feature exists.
+    /// </summary>
+    public bool SupportsAdvancedEditing => AbiGuard.Qwen21EditAdvSupported;
+
+    /// <summary>
     /// Creates a native engine instance. With no options,
     /// <c>QwenZImage.config.json</c> is loaded automatically and its model
     /// directories are passed straight into the native backend; an explicit
@@ -192,6 +201,36 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         }
     }
 
+    /// <summary>
+    /// Advanced Qwen-Image 2.1 editing: Red Canvas outpainting, LanPaint model
+    /// modes and/or RGBA output (synchronous, may take minutes). Requires a
+    /// native library implementing the third additive ABI v1 increment; see
+    /// <see cref="SupportsAdvancedEditing"/>. With all advanced knobs at their
+    /// defaults the sampling schedule matches <see cref="GenerateQwen21Edit"/>;
+    /// the reference backend still tags the advanced call so both paths stay
+    /// distinguishable in GPU-less tests.
+    /// </summary>
+    public GenerationResult GenerateQwen21EditEx(Qwen21EditExOptions options,
+                                                  IProgress<GenerationProgress>? progress = null,
+                                                  CancellationToken cancellationToken = default)
+    {
+        QziImage image = CallQwen21EditEx(options, progress, cancellationToken,
+                                          out TimeSpan elapsed);
+        try
+        {
+            int length = checked((int)image.Size);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            new ReadOnlySpan<byte>(image.Data, length).CopyTo(buffer);
+            return new GenerationResult(buffer, length, (int)image.Width,
+                                        (int)image.Height, options.Seed,
+                                        GenerationModel.Qwen21, elapsed);
+        }
+        finally
+        {
+            ReleaseImage(ref image);
+        }
+    }
+
     /// <summary>Generates a Z-Image PNG (synchronous, may take minutes).</summary>
     public GenerationResult GenerateZImage(ZImageOptions options,
                                            IProgress<GenerationProgress>? progress = null,
@@ -246,6 +285,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         => options switch
         {
             // Derived options must be matched before their base record.
+            Qwen21EditExOptions advanced => GenerateQwen21EditEx(advanced, progress, cancellationToken),
             Qwen21EditOptions edit => GenerateQwen21Edit(edit, progress, cancellationToken),
             QwenImageOptions qwen => GenerateQwen21(qwen, progress, cancellationToken),
             ZImageControlOptions control => GenerateZImageControl(control, progress, cancellationToken),
@@ -267,6 +307,9 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         QziImage image;
         switch (options)
         {
+            case Qwen21EditExOptions advanced:
+                image = CallQwen21EditEx(advanced, progress, cancellationToken, out _);
+                break;
             case Qwen21EditOptions edit:
                 image = CallQwen21Edit(edit, progress, cancellationToken, out _);
                 break;
@@ -316,6 +359,14 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         IProgress<GenerationProgress>? progress = null,
         CancellationToken cancellationToken = default)
         => Task.Run(() => GenerateQwen21Edit(options, progress, cancellationToken),
+                    cancellationToken);
+
+    /// <summary>Async wrapper over the synchronous advanced image-edit call.</summary>
+    public Task<GenerationResult> GenerateQwen21EditExAsync(
+        Qwen21EditExOptions options,
+        IProgress<GenerationProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+        => Task.Run(() => GenerateQwen21EditEx(options, progress, cancellationToken),
                     cancellationToken);
 
     /// <summary>Async wrapper over the synchronous native call.</summary>
@@ -370,7 +421,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         QziQwen21Request request = BuildQwen21Request(options, prompt, negative,
                                                        tier, lora);
 
-        return Invoke(&request, null, null, null, callbacks.Callbacks,
+        return Invoke(&request, null, null, null, null, callbacks.Callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -419,7 +470,73 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so both pins stay alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, &request, null, callbacks.Callbacks,
+            return Invoke(null, null, &request, null, null, callbacks.Callbacks,
+                          cancellationToken, out elapsed);
+        }
+    }
+
+    private QziImage CallQwen21EditEx(Qwen21EditExOptions options,
+                                      IProgress<GenerationProgress>? progress,
+                                      CancellationToken cancellationToken,
+                                      out TimeSpan elapsed)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        RequestValidator.Validate(options);
+        ThrowIfDisposed();
+        if (!AbiGuard.Qwen21EditAdvSupported)
+            throw new QziException(QziStatus.Unsupported,
+                "The loaded native library does not implement advanced Qwen-Image 2.1 " +
+                "editing (qzi_generate_qwen21_edit_ex is not exported). Rebuild " +
+                "QwenZImageNative from the matching source tree; ordinary image " +
+                "editing and text-to-image generation are unaffected.");
+        cancellationToken.ThrowIfCancellationRequested();
+
+        using var prompt = new Utf8PinnedString(options.Prompt);
+        using var negative = new Utf8PinnedString(options.NegativePrompt);
+        using var tier = new Utf8PinnedString(options.TierName);
+        using var lora = new Utf8PinnedString(options.Lora);
+        using var callbacks = new CallbackScope(progress, cancellationToken);
+
+        QziQwen21Request baseRequest = BuildQwen21Request(options, prompt, negative,
+                                                           tier, lora);
+        QziRasterImage reference = options.Reference;
+        QziRasterImage? mask = options.Mask;
+        // A non-null, non-empty stand-in keeps `fixed` well defined when there
+        // is no mask; the pointer itself is never passed in that case.
+        byte[] maskBytes = mask?.Bytes ?? [0];
+        // The native layer normalises LanPaint to full strength; sending the
+        // same values keeps the managed and C views of the request identical.
+        float strength = options.IsLanPaint ? 1.0f : options.EffectiveStrength;
+        float maskingStrength = options.IsLanPaint ? 1.0f
+                                                   : options.EffectiveMaskingStrength;
+        fixed (byte* referencePtr = reference.Bytes)
+        fixed (byte* maskPtr = maskBytes)
+        {
+            QziQwen21EditRequest editRequest = new()
+            {
+                Base = baseRequest,
+                ReferenceRgb = referencePtr,
+                ReferenceWidth = (uint)reference.Width,
+                ReferenceHeight = (uint)reference.Height,
+                Mask = mask is null ? null : maskPtr,
+                Strength = strength,
+                MaskingStrength = maskingStrength,
+                Flags = 0
+            };
+            QziQwen21EditExRequest request = new()
+            {
+                Base = editRequest,
+                MarginTop = options.MarginTop,
+                MarginBottom = options.MarginBottom,
+                MarginLeft = options.MarginLeft,
+                MarginRight = options.MarginRight,
+                ModelMode = options.EffectiveModelMode,
+                Rgba = options.Rgba ? 1u : 0u,
+                Flags = options.Flags
+            };
+            // The native call is synchronous, so both pins stay alive until
+            // Invoke returns and the caller owns the resulting PNG buffer.
+            return Invoke(null, null, null, null, &request, callbacks.Callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -470,7 +587,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             Flags = 0
         };
 
-        return Invoke(null, &request, null, null, callbacks.Callbacks,
+        return Invoke(null, &request, null, null, null, callbacks.Callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -521,17 +638,18 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so the pin stays alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, null, &request, callbacks.Callbacks,
+            return Invoke(null, null, null, &request, null, callbacks.Callbacks,
                           cancellationToken, out elapsed);
         }
     }
 
     private QziImage Invoke(QziQwen21Request* qwen, QziZImageRequest* zimage,
                             QziQwen21EditRequest* edit, QziZImageControlRequest* control,
+                            QziQwen21EditExRequest* editEx,
                             QziCallbacks callbacks,
                             CancellationToken cancellationToken, out TimeSpan elapsed)
     {
-        // Exactly one of the four request pointers is non-null.
+        // Exactly one of the five request pointers is non-null.
         QziImage image = default;
         IntPtr engine = _handle.DangerousGetHandle();
         byte* error = stackalloc byte[NativeMethods.ErrorCapacity];
@@ -543,7 +661,10 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         try
         {
             int status;
-            if (edit is not null)
+            if (editEx is not null)
+                status = NativeMethods.GenerateQwen21EditEx(engine, editEx, &callbacks, &image,
+                                                            error, NativeMethods.ErrorCapacity);
+            else if (edit is not null)
                 status = NativeMethods.GenerateQwen21Edit(engine, edit, &callbacks, &image,
                                                           error, NativeMethods.ErrorCapacity);
             else if (control is not null)

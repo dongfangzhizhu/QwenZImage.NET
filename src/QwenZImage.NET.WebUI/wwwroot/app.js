@@ -17,6 +17,8 @@ const state = {
   referencePng: null,
   maskDirty: false,
   editingAvailable: true,
+  // Third additive ABI v1 increment: outpainting / LanPaint / RGBA.
+  advancedEditingAvailable: true,
   // Z-Image Turbo Fun ControlNet Union state. The control image is a PNG data
   // URL re-encoded by a canvas; it must already be preprocessed upstream.
   controlPng: null,
@@ -82,6 +84,11 @@ async function refreshHealth() {
         $("model").value = "qwen21";
         switchModel();
       }
+      // Advanced editing is a further optional increment: disable its controls
+      // rather than queueing a job that the library cannot serve. Basic editing
+      // remains available on libs that only export the second increment.
+      state.advancedEditingAvailable = h.supports_advanced_editing === true;
+      syncAdvancedControls();
       // ControlNet is additive in ABI v1 too: hide the mode when the loaded
       // library has no qzi_generate_zimage_control export, so a job never
       // silently degrades to text-to-image or the noise backend.
@@ -182,6 +189,7 @@ function syncModelUI() {
   $("negative").disabled = !isBase;
   syncMaskControls();
   syncControlScaleHint();
+  syncAdvancedControls();
 }
 
 function switchModel() {
@@ -394,6 +402,41 @@ function syncControlScaleHint() {
 
 // --------------------------------------------------------------------- form
 
+// Advanced editing is additive: when the loaded library lacks the third
+// increment, disable its controls and keep ordinary editing usable.
+function syncAdvancedControls() {
+  const available = state.advancedEditingAvailable;
+  document.querySelectorAll("#advanced-edit input, #advanced-edit select").forEach((el) => {
+    el.disabled = !available;
+  });
+  $("advanced-unavailable").hidden = available;
+}
+
+// Only send the advanced envelope when at least one knob differs from the
+// default. Otherwise the request stays a plain qwen21-edit job (second
+// increment), which works on older native libraries too.
+function advancedEditFields() {
+  if (!state.advancedEditingAvailable) return null;
+  const margin = (id) => Number($(id).value) || 0;
+  const top = margin("margin-top");
+  const bottom = margin("margin-bottom");
+  const left = margin("margin-left");
+  const right = margin("margin-right");
+  const mode = Number($("model-mode").value) || 0;
+  const rgba = Number($("rgba").value) || 0;
+  if (top === 0 && bottom === 0 && left === 0 && right === 0 && mode === 0 && rgba === 0) {
+    return null;
+  }
+  return {
+    margin_top: top,
+    margin_bottom: bottom,
+    margin_left: left,
+    margin_right: right,
+    model_mode: mode,
+    rgba,
+  };
+}
+
 function buildRequestBody() {
   const model = $("model").value;
   const family = modelFamily();
@@ -433,6 +476,8 @@ function buildRequestBody() {
       // mapper rejects that combination. Only send both together.
       body.masking_strength = Number($("masking-strength").value);
     }
+    const advanced = advancedEditFields();
+    if (advanced) Object.assign(body, advanced);
   }
   if (isControlMode()) {
     body.control_image = state.controlPng;
@@ -508,6 +553,9 @@ function renderJobs() {
     const editBadge = job.edit
       ? `<span class="job-edit-badge">edit${job.has_mask ? " · mask" : ""}</span>`
       : "";
+    const advancedBadge = job.advanced_edit
+      ? `<span class="job-edit-badge">adv${job.outpaint ? " · outpaint" : ""}${job.rgba ? " · rgba" : ""}</span>`
+      : "";
     const controlBadge = job.control
       ? `<span class="job-control-badge">control</span>`
       : "";
@@ -516,7 +564,7 @@ function renderJobs() {
     else actions.push(`<button class="btn btn-ghost btn-sm" data-action="retry" data-id="${job.id}">Retry</button>`);
     return `<tr>
       <td>#${job.id}${job.retry_of ? `<div class="hint">↻ #${job.retry_of}</div>` : ""}</td>
-      <td>${escapeHtml(job.model)}${editBadge}${controlBadge}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
+      <td>${escapeHtml(job.model)}${editBadge}${advancedBadge}${controlBadge}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
       <td><span class="state state-${escapeHtml(job.state)}">${escapeHtml(job.state)}</span></td>
       <td class="progress-cell">
         <div class="progress-track"><div class="progress-fill" style="width:${job.state === "done" ? 100 : fraction}%"></div></div>
@@ -694,6 +742,11 @@ function wire() {
   maskCanvas.addEventListener("lostpointercapture", endStroke);
   ["strength", "masking-strength", "brush-size"].forEach((id) => {
     $(id).addEventListener("input", syncMaskControls);
+  });
+  ["margin-top", "margin-bottom", "margin-left", "margin-right",
+   "model-mode", "rgba"].forEach((id) => {
+    $(id).addEventListener("input", markCustom);
+    $(id).addEventListener("change", markCustom);
   });
 
   // Z-Image ControlNet Union: control-image upload, removal and scale slider.

@@ -43,6 +43,28 @@ public sealed class GenerateRequest
     public float? MaskingStrength { get; set; }
 
     /// <summary>
+    /// Advanced WanGP editing only. These four margins enlarge the OUTPUT
+    /// canvas (the reference is cover-fitted into the remaining inner
+    /// rectangle); each must be a multiple of 32 and all zero means "no
+    /// outpainting". Sending any advanced field upgrades a qwen21-edit job to
+    /// the third additive ABI v1 increment.
+    /// </summary>
+    public int? MarginTop { get; set; }
+    public int? MarginBottom { get; set; }
+    public int? MarginLeft { get; set; }
+    public int? MarginRight { get; set; }
+
+    /// <summary>
+    /// WanGP model mode: 0 = masked denoising, 2/3/4/5 = LanPaint with
+    /// 2/5/10/15 inner iterations. LanPaint requires a mask and is mutually
+    /// exclusive with outpainting.
+    /// </summary>
+    public int? ModelMode { get; set; }
+
+    /// <summary>1 writes an RGBA PNG using the VAE's generated alpha; 0 (default) writes RGB.</summary>
+    public int? Rgba { get; set; }
+
+    /// <summary>
     /// Z-Image Turbo Fun ControlNet Union only: a base64 PNG (optionally a
     /// <c>data:image/png;base64,...</c> URL) carrying the preprocessed control
     /// image. The browser canvas re-encodes uploads so JPEG / WebP also work.
@@ -76,6 +98,9 @@ public sealed class JobDto
     public string Model { get; init; } = "none";
     public bool Edit { get; init; }
     public bool HasMask { get; init; }
+    public bool AdvancedEdit { get; init; }
+    public bool Outpaint { get; init; }
+    public bool Rgba { get; init; }
     public bool Control { get; init; }
     public bool HasControl { get; init; }
     public string Prompt { get; init; } = "";
@@ -104,6 +129,7 @@ public sealed class JobDto
         string? output = runtime.OutputNameFor(job.Id);
         GenerationProgress p = job.LastProgress;
         (bool control, bool hasControl) = ControlState(request);
+        (bool advanced, bool outpaint, bool rgba) = AdvancedEditState(request);
         return new JobDto
         {
             Id = job.Id,
@@ -118,6 +144,9 @@ public sealed class JobDto
             // alone cannot tell an edit job apart in the gallery / job list.
             Edit = request is Qwen21EditOptions,
             HasMask = request is Qwen21EditOptions { Mask: not null },
+            AdvancedEdit = advanced,
+            Outpaint = outpaint,
+            Rgba = rgba,
             Control = control,
             HasControl = hasControl,
             Prompt = request.Prompt,
@@ -151,6 +180,16 @@ public sealed class JobDto
         => request is ZImageControlOptions control
             ? (true, control.ControlImage is not null)
             : (false, false);
+
+    /// <summary>
+    /// Advanced-edit state derived from a request. Pure function so the gallery
+    /// badges are unit-testable without a native engine.
+    /// </summary>
+    internal static (bool Advanced, bool Outpaint, bool Rgba) AdvancedEditState(
+        GenerationOptions request)
+        => request is Qwen21EditExOptions advanced
+            ? (true, advanced.HasOutpainting, advanced.Rgba)
+            : (false, false, false);
 }
 
 /// <summary>A preset as the UI needs it: flat values, no polymorphic request object.</summary>

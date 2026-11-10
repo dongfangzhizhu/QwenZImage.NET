@@ -48,8 +48,8 @@ static q21_vae_gpu *q21_vae_gpu_create(qzen_qwen21_vae *vae, char *error,
 static void q21_vae_gpu_free(q21_vae_gpu *state);
 static int q21_vae_gpu_decode(qzen_qwen21_vae *vae, q21_vae_gpu *state,
                               const float *latent, int height, int width,
-                              unsigned char *rgb, char *error,
-                              size_t error_size);
+                              unsigned char *rgb, unsigned char *alpha,
+                              char *error, size_t error_size);
 
 typedef struct {
     float *weight; /* [out][in][k][k] */
@@ -494,8 +494,25 @@ done:
     return ok;
 }
 
-int qzen_qwen21_vae_decode(qzen_qwen21_vae *vae, const float *latent, int height, int width,
-                         unsigned char *rgb, char *error, size_t error_size) {
+/* All four conv_out channels use the same clamp + (x + 1) * 127.5 mapping.
+ * Keeping it in one place guarantees the CPU and CUDA tails agree on RGBA. */
+static unsigned char q21_quantize(float value) {
+    value = value < -1.0f ? -1.0f : value > 1.0f ? 1.0f : value;
+    value = (value + 1.0f) * 127.5f;
+    int quantized = (int)(value + 0.5f);
+    if (quantized < 0) quantized = 0;
+    if (quantized > 255) quantized = 255;
+    return (unsigned char)quantized;
+}
+
+/* Decode RGB and, when requested, the VAE conv_out's 4th channel into a
+ * separate alpha plane. WanGP's rgba = Enabled path quantises channel 3 with
+ * the very same (x + 1) * 127.5 mapping as RGB; nothing is recomputed, the
+ * channel was simply being thrown away before. alpha may be NULL. */
+int qzen_qwen21_vae_decode_ex(qzen_qwen21_vae *vae, const float *latent,
+                              int height, int width, unsigned char *rgb,
+                              unsigned char *alpha,
+                              char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!vae || !latent || !rgb || height <= 0 || width <= 0) {
         snprintf(error, error_size, "invalid VAE decode request");
@@ -505,7 +522,7 @@ int qzen_qwen21_vae_decode(qzen_qwen21_vae *vae, const float *latent, int height
         if (!vae->gpu) vae->gpu = q21_vae_gpu_create(vae, error, error_size);
         if (!vae->gpu) return 0;
         return q21_vae_gpu_decode(vae, vae->gpu, latent, height, width, rgb,
-                                  error, error_size);
+                                  alpha, error, error_size);
     }
     const int threads = vae->threads;
     const int plane = height * width;
@@ -590,15 +607,10 @@ int qzen_qwen21_vae_decode(qzen_qwen21_vae *vae, const float *latent, int height
         q21_conv2d(&vae->conv_out, a, current_h, current_w, b, threads);
         q21_vae_stage_log("conv_out", b, (size_t)vae->conv_out.out_c * pixels);
         for (size_t index = 0; index < pixels; index++) {
-            for (int channel = 0; channel < 3; channel++) {
-                float value = b[(size_t)channel * pixels + index];
-                value = value < -1.0f ? -1.0f : value > 1.0f ? 1.0f : value;
-                value = (value + 1.0f) * 127.5f;
-                int quantized = (int)(value + 0.5f);
-                if (quantized < 0) quantized = 0;
-                if (quantized > 255) quantized = 255;
-                rgb[(size_t)channel * pixels + index] = (unsigned char)quantized;
-            }
+            for (int channel = 0; channel < 3; channel++)
+                rgb[(size_t)channel * pixels + index] =
+                    q21_quantize(b[(size_t)channel * pixels + index]);
+            if (alpha) alpha[index] = q21_quantize(b[3u * pixels + index]);
         }
     }
     ok = 1;
@@ -612,6 +624,13 @@ done:
     free(scores);
     free(qkv);
     return ok;
+}
+
+/* Legacy RGB-only entry point: every pre-RGBA caller keeps its exact ABI. */
+int qzen_qwen21_vae_decode(qzen_qwen21_vae *vae, const float *latent, int height, int width,
+                           unsigned char *rgb, char *error, size_t error_size) {
+    return qzen_qwen21_vae_decode_ex(vae, latent, height, width, rgb, NULL,
+                                     error, error_size);
 }
 
 /* ---------------------------------------------------------------- encoding */
@@ -1202,8 +1221,8 @@ static int q21_gpu_mid_attention(qzen_gpu *gpu, const q21_vae_gpu *state,
  * 0.75 GB at 512 px. */
 static int q21_vae_gpu_decode(qzen_qwen21_vae *vae, q21_vae_gpu *state,
                               const float *latent, int height, int width,
-                              unsigned char *rgb, char *error,
-                              size_t error_size) {
+                              unsigned char *rgb, unsigned char *alpha,
+                              char *error, size_t error_size) {
     qzen_gpu *gpu = state->gpu;
     const uint32_t latent_h = (uint32_t)height, latent_w = (uint32_t)width;
     const size_t plane = (size_t)height * width;
@@ -1359,15 +1378,10 @@ static int q21_vae_gpu_decode(qzen_qwen21_vae *vae, q21_vae_gpu *state,
             goto done;
         }
         for (size_t index = 0; index < pixels; index++) {
-            for (int channel = 0; channel < 3; channel++) {
-                float value = tail[(size_t)channel * pixels + index];
-                value = value < -1.0f ? -1.0f : value > 1.0f ? 1.0f : value;
-                value = (value + 1.0f) * 127.5f;
-                int quantized = (int)(value + 0.5f);
-                if (quantized < 0) quantized = 0;
-                if (quantized > 255) quantized = 255;
-                rgb[(size_t)channel * pixels + index] = (unsigned char)quantized;
-            }
+            for (int channel = 0; channel < 3; channel++)
+                rgb[(size_t)channel * pixels + index] =
+                    q21_quantize(tail[(size_t)channel * pixels + index]);
+            if (alpha) alpha[index] = q21_quantize(tail[3u * pixels + index]);
         }
         free(tail);
     }

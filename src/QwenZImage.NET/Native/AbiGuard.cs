@@ -14,6 +14,8 @@ internal static unsafe class AbiGuard
     private static int _editState;
     // 0 = not probed, 1 = no ControlNet support, 2 = ControlNet support verified.
     private static int _controlState;
+    // 0 = not probed, 1 = no advanced editing, 2 = advanced editing verified.
+    private static int _advState;
 
     internal static void Verify()
     {
@@ -123,6 +125,44 @@ internal static unsafe class AbiGuard
 
         nuint nativeSize = ((delegate* unmanaged<nuint>)layout)();
         Check("qzi_zimage_control_request", nativeSize, sizeof(QziZImageControlRequest));
+        return true;
+    }
+
+    /// <summary>
+    /// True when the loaded library implements the third additive ABI v1
+    /// increment: advanced Qwen-Image 2.1 editing (Red Canvas outpainting,
+    /// LanPaint model modes, RGBA output). An older v1 library has neither
+    /// <c>qzi_generate_qwen21_edit_ex</c> nor the 0x4 feature bit, so export
+    /// discovery plus a sizeof check is the only safe probe. The basic edit
+    /// surface is required as well because the advanced request embeds it.
+    /// </summary>
+    internal static bool Qwen21EditAdvSupported
+    {
+        get
+        {
+            int state = Volatile.Read(ref _advState);
+            if (state != 0) return state == 2;
+            Verify();
+            bool supported = Qwen21EditSupported && ProbeEditAdvFeatures();
+            Volatile.Write(ref _advState, supported ? 2 : 1);
+            return supported;
+        }
+    }
+
+    private static bool ProbeEditAdvFeatures()
+    {
+        IntPtr handle = NativeLibraryLoader.Handle;
+        if (handle == IntPtr.Zero) return false;
+        if (!NativeLibrary.TryGetExport(handle, "qzi_abi_features", out IntPtr features) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_qwen21_edit_ex_layout", out IntPtr layout) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_generate_qwen21_edit_ex", out _))
+            return false;
+
+        uint bits = ((delegate* unmanaged<uint>)features)();
+        if ((bits & NativeMethods.FeatureQwen21EditAdv) == 0) return false;
+
+        nuint nativeSize = ((delegate* unmanaged<nuint>)layout)();
+        Check("qzi_qwen21_edit_ex_request", nativeSize, sizeof(QziQwen21EditExRequest));
         return true;
     }
 

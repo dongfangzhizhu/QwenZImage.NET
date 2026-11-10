@@ -21,6 +21,12 @@ internal static unsafe partial class NativeMethods
     /// <summary>Capability bit for Z-Image Turbo Fun ControlNet Union.</summary>
     internal const uint FeatureZImageControl = 0x2u;
 
+    /// <summary>
+    /// Capability bit for advanced Qwen-Image 2.1 editing (WanGP outpainting,
+    /// LanPaint model modes and RGBA output). Added without bumping the ABI.
+    /// </summary>
+    internal const uint FeatureQwen21EditAdv = 0x4u;
+
     [LibraryImport(LibraryName, EntryPoint = "qzi_abi_version")]
     internal static partial uint AbiVersion();
 
@@ -85,6 +91,20 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(LibraryName, EntryPoint = "qzi_generate_zimage_control")]
     internal static partial int GenerateZImageControl(IntPtr engine,
                                                       QziZImageControlRequest* request,
+                                                      QziCallbacks* callbacks,
+                                                      QziImage* image,
+                                                      byte* error, nuint errorCap);
+
+    /// <summary>
+    /// Additive in ABI v1, third increment. Older libraries do not export this
+    /// symbol, so never call it until
+    /// <see cref="AbiGuard.Qwen21EditAdvSupported"/> has confirmed the export
+    /// exists. The matching <c>qzi_qwen21_edit_ex_layout</c> is probed on
+    /// demand with <c>NativeLibrary.TryGetExport</c> in <see cref="AbiGuard"/>.
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "qzi_generate_qwen21_edit_ex")]
+    internal static partial int GenerateQwen21EditEx(IntPtr engine,
+                                                      QziQwen21EditExRequest* request,
                                                       QziCallbacks* callbacks,
                                                       QziImage* image,
                                                       byte* error, nuint errorCap);

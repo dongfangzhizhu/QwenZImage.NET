@@ -22,6 +22,12 @@ public static class RequestValidator
     /// <summary>Maximum LoRA adapter file name length, in UTF-8 bytes.</summary>
     public const int MaxLoraNameBytes = 255;
 
+    /// <summary>
+    /// WanGP <c>OUTPAINTING_ALIGNMENT</c>: outpainting margins and the residual
+    /// source rectangle must be multiples of 32 output-canvas pixels.
+    /// </summary>
+    public const uint OutpaintAlignment = 32;
+
     /// <summary>Validates any request kind.</summary>
     /// <exception cref="ArgumentException">A rule was violated.</exception>
     public static void Validate(GenerationOptions options)
@@ -30,7 +36,9 @@ public static class RequestValidator
         switch (options)
         {
             // Derived options must be matched before their base record or their
-            // extra rules would be skipped.
+            // extra rules would be skipped. Advanced editing derives from the
+            // ordinary edit options, so it must come first.
+            case Qwen21EditExOptions advanced: Validate(advanced); break;
             case Qwen21EditOptions edit: Validate(edit); break;
             case QwenImageOptions qwen: Validate(qwen); break;
             case ZImageControlOptions control: Validate(control); break;
@@ -135,6 +143,63 @@ public static class RequestValidator
                     "MaskingStrength requires Mask; otherwise it would be silently dropped.",
                     nameof(options));
         }
+    }
+
+    /// <summary>
+    /// Validates the third additive editing request. Mirrors
+    /// <c>qzi_validate_qwen21_edit_ex()</c>: the ordinary edit rules apply to
+    /// the embedded base request, then the Red Canvas margins, the LanPaint
+    /// mode and the reserved flags are checked. Rejecting an explicit strength
+    /// under LanPaint avoids silently overriding a caller's choice: WanGP (and
+    /// the native layer) force both strengths to 1.0 in that mode.
+    /// </summary>
+    public static void Validate(Qwen21EditExOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        Validate((Qwen21EditOptions)options);
+
+        uint[] margins = [options.MarginTop, options.MarginBottom,
+                          options.MarginLeft, options.MarginRight];
+        foreach (uint margin in margins)
+            if (margin % OutpaintAlignment != 0)
+                throw new ArgumentException(
+                    $"Outpainting margins must be multiples of {OutpaintAlignment} pixels.",
+                    nameof(options));
+
+        long sourceWidth = (long)options.Width - options.MarginLeft - options.MarginRight;
+        long sourceHeight = (long)options.Height - options.MarginTop - options.MarginBottom;
+        if (sourceWidth < OutpaintAlignment || sourceHeight < OutpaintAlignment)
+            throw new ArgumentException(
+                $"Outpainting must leave at least a {OutpaintAlignment}x{OutpaintAlignment} " +
+                "source rectangle inside the output canvas.", nameof(options));
+
+        if (!Enum.IsDefined(options.ModelMode))
+            throw new ArgumentException(
+                "ModelMode must be MaskedDenoising (0) or LanPaint2/5/10/15 (2/3/4/5).",
+                nameof(options));
+
+        if (options.IsLanPaint)
+        {
+            if (options.Mask is null)
+                throw new ArgumentException(
+                    "LanPaint requires Mask; it refines a masked edit region.",
+                    nameof(options));
+            if (options.HasOutpainting)
+                throw new ArgumentException(
+                    "LanPaint and outpainting are mutually exclusive (WanGP disables " +
+                    "LanPaint for Red Canvas outpainting).", nameof(options));
+            if (options.Strength is { } strength && strength != 1.0f)
+                throw new ArgumentException(
+                    "LanPaint forces denoising strength to 1.0; leave Strength unset.",
+                    nameof(options));
+            if (options.MaskingStrength is { } masking && masking != 1.0f)
+                throw new ArgumentException(
+                    "LanPaint forces masking strength to 1.0; leave MaskingStrength unset.",
+                    nameof(options));
+        }
+
+        if (options.Flags != 0)
+            throw new ArgumentException("Flags is reserved and must be 0.", nameof(options));
     }
 
     /// <summary>

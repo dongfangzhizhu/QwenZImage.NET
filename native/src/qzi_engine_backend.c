@@ -201,17 +201,19 @@ static void pack_planar_rgb8(const uint8_t *planar, uint32_t width,
  * canvas would change the composition before the model ever sees it.
  * `src` is planar [channels][sw*sh] uint8; `dst` is [channels][dw*dh].
  * Bilinear sampling keeps this dependency-free (no libpng / ffmpeg here). */
-static int resample_planar_cover(const uint8_t *src, uint32_t sw, uint32_t sh,
-                                 uint32_t dw, uint32_t dh, uint32_t channels,
-                                 uint8_t *dst)
+static int resample_planar_into(const uint8_t *src, uint32_t sw, uint32_t sh,
+                                uint8_t *dst, uint32_t canvas_w, uint32_t canvas_h,
+                                uint32_t dst_x, uint32_t dst_y,
+                                uint32_t dw, uint32_t dh, uint32_t channels)
 {
-    if (!src || !dst || !sw || !sh || !dw || !dh || !channels) return 0;
+    if (!src || !dst || !sw || !sh || !dw || !dh || !channels ||
+        dst_x + dw > canvas_w || dst_y + dh > canvas_h) return 0;
     const double scale = fmax((double)dw / (double)sw,
                               (double)dh / (double)sh);
     const double crop_x = ((double)sw * scale - (double)dw) * 0.5;
     const double crop_y = ((double)sh * scale - (double)dh) * 0.5;
     const size_t src_plane = (size_t)sw * sh;
-    const size_t dst_plane = (size_t)dw * dh;
+    const size_t dst_plane = (size_t)canvas_w * canvas_h;
 
     for (uint32_t y = 0; y < dh; y++) {
         double sy = ((double)y + crop_y + 0.5) / scale - 0.5;
@@ -231,7 +233,8 @@ static int resample_planar_cover(const uint8_t *src, uint32_t sw, uint32_t sh,
             const double w10 = fx * (1.0 - fy);
             const double w01 = (1.0 - fx) * fy;
             const double w11 = fx * fy;
-            const size_t dst_index = (size_t)y * dw + x;
+            const size_t dst_index =
+                (size_t)(dst_y + y) * canvas_w + dst_x + x;
             for (uint32_t c = 0; c < channels; c++) {
                 const uint8_t *plane = src + (size_t)c * src_plane;
                 const double value =
@@ -245,6 +248,14 @@ static int resample_planar_cover(const uint8_t *src, uint32_t sw, uint32_t sh,
         }
     }
     return 1;
+}
+
+/* Cover-fit into a canvas-filling buffer (the original edit path). */
+static int resample_planar_cover(const uint8_t *src, uint32_t sw, uint32_t sh,
+                                 uint32_t dw, uint32_t dh, uint32_t channels,
+                                 uint8_t *dst)
+{
+    return resample_planar_into(src, sw, sh, dst, dw, dh, 0, 0, dw, dh, channels);
 }
 
 /* WanGP downsamples the painted mask to (width/16, height/16) with LANCZOS
@@ -272,6 +283,19 @@ static int downsample_mask(const uint8_t *canvas_mask, uint32_t w, uint32_t h,
     return 1;
 }
 
+/* Planar RGB8 [3][H][W] + alpha plane [H][W] -> interleaved RGBA8. */
+static void pack_planar_rgba8(const uint8_t *planar, const uint8_t *alpha,
+                              uint32_t width, uint32_t height, uint8_t *packed)
+{
+    const size_t pixels = (size_t)width * height;
+    for (size_t i = 0; i < pixels; i++) {
+        packed[i * 4 + 0] = planar[i];
+        packed[i * 4 + 1] = planar[pixels + i];
+        packed[i * 4 + 2] = planar[2 * pixels + i];
+        packed[i * 4 + 3] = alpha[i];
+    }
+}
+
 /* Planar F32 [-1,1] [3][H][W] -> interleaved RGB8, matching
  * qzen_png_write_pixels_f32's clamp/round exactly. */
 static void pack_pixels_f32(const float *pixels, uint32_t width,
@@ -293,12 +317,14 @@ static void pack_pixels_f32(const float *pixels, uint32_t width,
     }
 }
 
-static qzi_status emit_png(const uint8_t *rgb, uint32_t width, uint32_t height,
-                           qzi_image *out, char *error, size_t error_cap)
+static qzi_status emit_png_ex(const uint8_t *pixels, uint32_t width,
+                              uint32_t height, uint32_t channels,
+                              qzi_image *out, char *error, size_t error_cap)
 {
     size_t size = 0;
-    uint8_t *png = qzi_png_encode_rgb8(rgb, width, height, &size,
-                                       error, error_cap);
+    uint8_t *png = channels == 4u
+        ? qzi_png_encode_rgba8(pixels, width, height, &size, error, error_cap)
+        : qzi_png_encode_rgb8(pixels, width, height, &size, error, error_cap);
     if (!png) return QZI_ERR_ENGINE;
     out->data = png;
     out->size = size;
@@ -306,6 +332,12 @@ static qzi_status emit_png(const uint8_t *rgb, uint32_t width, uint32_t height,
     out->height = height;
     out->token = (uint64_t)(uintptr_t)png;
     return QZI_OK;
+}
+
+static qzi_status emit_png(const uint8_t *rgb, uint32_t width, uint32_t height,
+                           qzi_image *out, char *error, size_t error_cap)
+{
+    return emit_png_ex(rgb, width, height, 3u, out, error, error_cap);
 }
 
 /* --------------------------------------------------------------- progress */
@@ -784,9 +816,27 @@ static void qzen_shutdown(void *context)
  * for WanGP's masked-denoising loop. One implementation keeps text encoding,
  * model residency, the sigma schedule, progress phases and PNG emission
  * identical between t2i and img2img. */
+/* WanGP models/qwen21/pipeline.py: RED_OUTPAINTING_PROMPT, appended to the
+ * user prompt whenever the Red Canvas border method is active. */
+#define QZEN_RED_OUTPAINTING_PROMPT \
+    "Remove the red paddings on the sides and show what's behind them."
+
+/* WanGP model_modes -> LanPaint NSteps ({2:2, 3:5, 4:10, 5:15}). */
+static int qzen_lanpaint_iterations(uint32_t model_mode)
+{
+    switch (model_mode) {
+    case QZI_EDIT_MODE_LANPAINT_2:  return 2;
+    case QZI_EDIT_MODE_LANPAINT_5:  return 5;
+    case QZI_EDIT_MODE_LANPAINT_10: return 10;
+    case QZI_EDIT_MODE_LANPAINT_15: return 15;
+    default:                        return 0;
+    }
+}
+
 static qzi_status qzen_generate_qwen21_impl(void *context,
                                             const qzi_qwen21_request *base,
                                             const qzi_qwen21_edit_request *edit,
+                                            const qzi_qwen21_edit_ex_request *adv,
                                             const qzi_callbacks *callbacks,
                                             qzi_image *out_image,
                                             char *error, size_t error_cap)
@@ -794,7 +844,8 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     qzen_state *s = (qzen_state *)context;
     progress_bridge bridge = {callbacks, qzi_now_seconds(), 0};
     char local[QZEN_ERR_CAP] = "";
-    const qzi_qwen21_request *request = edit ? &edit->base : base;
+    const qzi_qwen21_edit_request *edit_ref = adv ? &adv->base : edit;
+    const qzi_qwen21_request *request = edit_ref ? &edit_ref->base : base;
     const int turbo = !(request->tier && *request->tier &&
                         strcmp(request->tier, "base") == 0);
     /* qzi.c resolves the zero sentinels before calling a backend; repeat it
@@ -803,22 +854,31 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     const int steps = request->steps > 0 ? request->steps : (turbo ? 8 : 40);
     const float guidance = request->guidance > 0.0f
                                ? request->guidance : (turbo ? 1.0f : 4.0f);
-    const float strength = !edit ? 1.0f
-                           : (edit->strength > 0.0f ? edit->strength : 0.75f);
-    const float masking_strength = (!edit || !edit->mask) ? 0.0f
-        : (edit->masking_strength > 0.0f ? edit->masking_strength : 1.0f);
+    const int outpainting = adv && (adv->margin_top || adv->margin_bottom ||
+                                    adv->margin_left || adv->margin_right);
+    const int lanpaint_steps = adv ? qzen_lanpaint_iterations(adv->model_mode) : 0;
+    /* WanGP forces denoising_strength = masking_strength = 1.0 for LanPaint. */
+    const float strength = !edit_ref ? 1.0f
+                         : lanpaint_steps ? 1.0f
+                         : (edit_ref->strength > 0.0f ? edit_ref->strength : 0.75f);
+    const float masking_strength = (!edit_ref || !edit_ref->mask) ? 0.0f
+        : lanpaint_steps ? 1.0f
+        : (edit_ref->masking_strength > 0.0f ? edit_ref->masking_strength : 1.0f);
     float *text = NULL, *negative = NULL;
     int text_tokens = 0, negative_tokens = 0, negative_owned = 0;
     float *latent = NULL, *init_latent = NULL;
-    uint8_t *rgb = NULL, *packed = NULL;
+    uint8_t *rgb = NULL, *packed = NULL, *alpha = NULL;
     uint8_t *reference = NULL, *canvas_mask = NULL, *latent_mask = NULL;
+    uint8_t *red_canvas = NULL;
+    char *prompt_owned = NULL;
     qzi_status status = QZI_ERR_ENGINE;
 
     /* qzi.c validates on the way in, but the backend is also a public
      * native/native contract: never read caller-owned pixels before checking
      * the dimensions that describe them. */
-    status = edit ? qzi_validate_qwen21_edit(edit, error, error_cap)
-                  : qzi_validate_qwen21(request, error, error_cap);
+    status = adv ? qzi_validate_qwen21_edit_ex(adv, error, error_cap)
+          : edit_ref ? qzi_validate_qwen21_edit(edit_ref, error, error_cap)
+                     : qzi_validate_qwen21(request, error, error_cap);
     if (status != QZI_OK) return status;
 
     status = resolve_qwen21_pack(s, error, error_cap);
@@ -830,7 +890,27 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     if (status != QZI_OK) return status;
 
     bridge_emit(&bridge, "text", 0, 1);
-    if (!encode_text(s, request->prompt, &text, &text_tokens,
+    /* WanGP: input_prompt.rstrip().rstrip(".") + ". " +
+     * RED_OUTPAINTING_PROMPT, only when the instruction is not already there. */
+    const char *prompt = request->prompt;
+    if (outpainting && !strstr(prompt, QZEN_RED_OUTPAINTING_PROMPT)) {
+        size_t length = strlen(prompt);
+        while (length > 0 && (unsigned char)prompt[length - 1] <= ' ') length--;
+        while (length > 0 && prompt[length - 1] == '.') length--;
+        const char *suffix = ". " QZEN_RED_OUTPAINTING_PROMPT;
+        const size_t suffix_len = strlen(suffix);
+        prompt_owned = (char *)malloc(length + suffix_len + 1u);
+        if (!prompt_owned) {
+            qzi_set_error(error, error_cap,
+                          "out of memory for the outpainting prompt");
+            status = QZI_ERR_OUT_OF_MEMORY;
+            goto done;
+        }
+        memcpy(prompt_owned, prompt, length);
+        memcpy(prompt_owned + length, suffix, suffix_len + 1u);
+        prompt = prompt_owned;
+    }
+    if (!encode_text(s, prompt, &text, &text_tokens,
                      local, sizeof(local))) {
         qzi_set_error_fmt(error, error_cap, "text encode: %s", local);
         status = QZI_ERR_ENGINE;
@@ -877,21 +957,31 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     latent = (float *)malloc(QZEN_QWEN21_VAE_CHANNELS * plane *
                              sizeof(float));
     rgb = (uint8_t *)malloc(canvas_pixels * 3u);
-    if (!latent || !rgb) {
+    if (adv && adv->rgba) alpha = (uint8_t *)malloc(canvas_pixels);
+    if (!latent || !rgb || (adv && adv->rgba && !alpha)) {
         qzi_set_error(error, error_cap, "out of memory for the latent/RGB buffers");
         status = QZI_ERR_OUT_OF_MEMORY;
         goto done;
     }
 
-    if (edit) {
+    if (edit_ref) {
         /* The ABI hands over planar RGB8 at the reference's own size. WanGP
          * cover-fits it to the output canvas first; when the sizes already
          * match, pass the caller's buffer straight through so VAE encoding
-         * sees the original pixels without a resampling blur. */
-        const uint8_t *ref_planar = edit->reference_rgb;
-        const uint8_t *mask_canvas = edit->mask;
-        const int needs_fit = edit->reference_width != canvas_w ||
-                              edit->reference_height != canvas_h;
+         * sees the original pixels without a resampling blur. Red Canvas
+         * outpainting instead cover-fits into the INNER source rectangle and
+         * surrounds it with opaque red (FF0000). */
+        const uint32_t margin_left = outpainting ? adv->margin_left : 0u;
+        const uint32_t margin_top = outpainting ? adv->margin_top : 0u;
+        const uint32_t inner_w = outpainting
+            ? canvas_w - adv->margin_left - adv->margin_right : canvas_w;
+        const uint32_t inner_h = outpainting
+            ? canvas_h - adv->margin_top - adv->margin_bottom : canvas_h;
+        const uint8_t *ref_planar = edit_ref->reference_rgb;
+        const uint8_t *mask_canvas = edit_ref->mask;
+        const int needs_fit = outpainting ||
+                              edit_ref->reference_width != canvas_w ||
+                              edit_ref->reference_height != canvas_h;
 
         bridge_emit(&bridge, "image encode", 0, 1);
         if (bridge.cancelled || qzi_cancelled(callbacks)) {
@@ -908,7 +998,51 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
             status = QZI_ERR_OUT_OF_MEMORY;
             goto done;
         }
-        if (needs_fit) {
+        if (outpainting) {
+            /* The mask marks the red margins as "regenerate" (255) and the
+             * source rectangle as "keep" (0), except where the user painted a
+             * white brush stroke. Margins are 32-aligned by the ABI, so they
+             * land exactly on latent-cell boundaries after the /16 grid. */
+            red_canvas = (uint8_t *)malloc(canvas_pixels * 3u);
+            canvas_mask = (uint8_t *)malloc(canvas_pixels);
+            if (!red_canvas || !canvas_mask) {
+                qzi_set_error(error, error_cap,
+                              "out of memory for the red outpainting canvas");
+                status = QZI_ERR_OUT_OF_MEMORY;
+                goto done;
+            }
+            memset(red_canvas, 0, canvas_pixels * 3u);
+            memset(red_canvas, 255, canvas_pixels); /* planar R channel */
+            memset(canvas_mask, 255, canvas_pixels);
+            if (!resample_planar_into(edit_ref->reference_rgb,
+                                      edit_ref->reference_width,
+                                      edit_ref->reference_height,
+                                      red_canvas, canvas_w, canvas_h,
+                                      margin_left, margin_top,
+                                      inner_w, inner_h, 3u)) {
+                qzi_set_error(error, error_cap,
+                    "cannot cover-fit the reference into the outpainting source rectangle");
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            ref_planar = red_canvas;
+            for (uint32_t y = 0; y < inner_h; y++)
+                memset(canvas_mask + (size_t)(margin_top + y) * canvas_w +
+                       margin_left, 0, inner_w);
+            if (edit_ref->mask &&
+                !resample_planar_into(edit_ref->mask,
+                                      edit_ref->reference_width,
+                                      edit_ref->reference_height,
+                                      canvas_mask, canvas_w, canvas_h,
+                                      margin_left, margin_top,
+                                      inner_w, inner_h, 1u)) {
+                qzi_set_error(error, error_cap,
+                    "cannot cover-fit the edit mask into the outpainting source rectangle");
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            mask_canvas = canvas_mask;
+        } else if (needs_fit) {
             reference = (uint8_t *)malloc(canvas_pixels * 3u);
             if (!reference) {
                 qzi_set_error(error, error_cap,
@@ -916,9 +1050,9 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
                 status = QZI_ERR_OUT_OF_MEMORY;
                 goto done;
             }
-            if (!resample_planar_cover(edit->reference_rgb,
-                                       edit->reference_width,
-                                       edit->reference_height,
+            if (!resample_planar_cover(edit_ref->reference_rgb,
+                                       edit_ref->reference_width,
+                                       edit_ref->reference_height,
                                        canvas_w, canvas_h, 3u, reference)) {
                 qzi_set_error(error, error_cap,
                               "cannot cover-fit the reference image");
@@ -926,27 +1060,29 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
                 goto done;
             }
             ref_planar = reference;
-        }
-        if (edit->mask && needs_fit) {
-            /* The painted mask lives at reference resolution and must follow
-             * exactly the same crop as the reference, or the white "regenerate"
-             * region would be offset from what the user actually sees. */
-            canvas_mask = (uint8_t *)malloc(canvas_pixels);
-            if (!canvas_mask) {
-                qzi_set_error(error, error_cap,
-                              "out of memory for the resampled mask");
-                status = QZI_ERR_OUT_OF_MEMORY;
-                goto done;
+            if (edit_ref->mask) {
+                /* The painted mask lives at reference resolution and must follow
+                 * exactly the same crop as the reference, or the white "regenerate"
+                 * region would be offset from what the user actually sees. */
+                canvas_mask = (uint8_t *)malloc(canvas_pixels);
+                if (!canvas_mask) {
+                    qzi_set_error(error, error_cap,
+                                  "out of memory for the resampled mask");
+                    status = QZI_ERR_OUT_OF_MEMORY;
+                    goto done;
+                }
+                if (!resample_planar_cover(edit_ref->mask,
+                                           edit_ref->reference_width,
+                                           edit_ref->reference_height,
+                                           canvas_w, canvas_h, 1u,
+                                           canvas_mask)) {
+                    qzi_set_error(error, error_cap,
+                                  "cannot cover-fit the edit mask");
+                    status = QZI_ERR_ENGINE;
+                    goto done;
+                }
+                mask_canvas = canvas_mask;
             }
-            if (!resample_planar_cover(edit->mask, edit->reference_width,
-                                       edit->reference_height, canvas_w,
-                                       canvas_h, 1u, canvas_mask)) {
-                qzi_set_error(error, error_cap,
-                              "cannot cover-fit the edit mask");
-                status = QZI_ERR_ENGINE;
-                goto done;
-            }
-            mask_canvas = canvas_mask;
         }
 
         /* The VAE's 4th input channel is opaque alpha, not the inpainting
@@ -1001,10 +1137,18 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
         goto done;
     }
 
+    /* LanPaint's Langevin noise must be reproducible for a given seed and must
+     * not disturb fill_noise()'s stream, so it gets its own mixed seed. The
+     * four trailing fields are additive: a zeroed tail is exactly the old t2i
+     * / edit / ControlNet behaviour. */
+    const uint64_t lanpaint_seed =
+        ((uint64_t)request->seed * 0x9E3779B97F4A7C15ULL) ^
+        0x243F6A8885A308D3ULL;
     qzen_qwen21_sample sample = {
         text, text_tokens, negative, negative_tokens, latent,
         latent_h, latent_w, sigmas, steps, guidance,
-        init_latent, strength, latent_mask, masking_strength
+        init_latent, strength, latent_mask, masking_strength,
+        outpainting, lanpaint_steps, lanpaint_seed, alpha
     };
     local[0] = '\0';
     if (!qzen_qwen21_pipeline_run_ex(s->dit, s->vae, &sample, rgb,
@@ -1021,20 +1165,30 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     }
 
     bridge_emit(&bridge, "encode", 0, 1);
-    packed = (uint8_t *)malloc(canvas_pixels * 3u);
+    /* WanGP's rgba = Enabled keeps conv_out's 4th channel as model-generated
+     * alpha and writes PNG colour type 6; everything else stays RGB / type 2. */
+    const uint32_t channels = (adv && adv->rgba) ? 4u : 3u;
+    packed = (uint8_t *)malloc(canvas_pixels * channels);
     if (!packed) {
         qzi_set_error(error, error_cap, "out of memory for the PNG");
         status = QZI_ERR_OUT_OF_MEMORY;
         goto done;
     }
-    pack_planar_rgb8(rgb, canvas_w, canvas_h, packed);
-    status = emit_png(packed, canvas_w, canvas_h, out_image, error, error_cap);
+    if (channels == 4u)
+        pack_planar_rgba8(rgb, alpha, canvas_w, canvas_h, packed);
+    else
+        pack_planar_rgb8(rgb, canvas_w, canvas_h, packed);
+    status = emit_png_ex(packed, canvas_w, canvas_h, channels,
+                         out_image, error, error_cap);
     if (status == QZI_OK) s->served++;
 
 done:
     free(latent_mask);
     free(canvas_mask);
     free(reference);
+    free(red_canvas);
+    free(alpha);
+    free(prompt_owned);
     free(init_latent);
     free(packed);
     free(rgb);
@@ -1050,7 +1204,7 @@ static qzi_status qzen_generate_qwen21(void *context,
                                        qzi_image *out_image,
                                        char *error, size_t error_cap)
 {
-    return qzen_generate_qwen21_impl(context, request, NULL, callbacks,
+    return qzen_generate_qwen21_impl(context, request, NULL, NULL, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -1060,7 +1214,20 @@ static qzi_status qzen_generate_qwen21_edit(void *context,
                                             qzi_image *out_image,
                                             char *error, size_t error_cap)
 {
-    return qzen_generate_qwen21_impl(context, NULL, request, callbacks,
+    return qzen_generate_qwen21_impl(context, NULL, request, NULL, callbacks,
+                                     out_image, error, error_cap);
+}
+
+/* Third additive ABI v1 slot: advanced editing still goes through the very
+ * same qzen_generate_qwen21_impl orchestration -- no second pipeline, no
+ * second copy of the 7B weights. Only the request envelope differs. */
+static qzi_status qzen_generate_qwen21_edit_ex(void *context,
+                                               const qzi_qwen21_edit_ex_request *request,
+                                               const qzi_callbacks *callbacks,
+                                               qzi_image *out_image,
+                                               char *error, size_t error_cap)
+{
+    return qzen_generate_qwen21_impl(context, NULL, NULL, request, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -1413,7 +1580,8 @@ static const qzi_backend qzen_vtable = {
     /* Additive ABI v1 slots: MUST stay last and in this order so older vtable
      * initialisers keep every existing offset. */
     qzen_generate_qwen21_edit,
-    qzen_generate_zimage_control
+    qzen_generate_zimage_control,
+    qzen_generate_qwen21_edit_ex
 };
 
 const qzi_backend *qzi_real_backend(void)

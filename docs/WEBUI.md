@@ -4,8 +4,9 @@
 manually testing the library. It reproduces the functional surface of the
 original Go WebUI (health, presets, serial job queue, cancel, retry, progress,
 output gallery, trash/restore, unload, SSE) entirely in `.NET 10` — **no Go
-code and no Go process**. It also exposes the two additive ABI v1 features:
-Qwen-Image 2.1 image editing and Z-Image ControlNet Union.
+code and no Go process**. It also exposes the three additive ABI v1 features:
+Qwen-Image 2.1 image editing, Z-Image ControlNet Union, and advanced
+Qwen-Image 2.1 editing (outpainting / LanPaint / RGBA).
 
 The browser talks to this app; the app calls `QziClient`, which
 **directly P/Invokes the in-process `QwenZImageNative` shared library** via the
@@ -226,7 +227,7 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet` |
+| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet`, `supports_advanced_editing` |
 | `GET` | `/api/presets` | `{"presets":[...]}` — all `QziPresets` with a `model` discriminator |
 | `POST` | `/api/jobs` | Validate + enqueue; `202` with the job snapshot |
 | `GET` | `/api/jobs` | `{"jobs":[...]}` newest first; optional `?client=` filter |
@@ -304,11 +305,62 @@ decoded by `QziRasterImage` without any imaging dependency and stay owned by
 WebUI for the duration of the synchronous native call. Edit jobs appear in the
 job list / gallery with `"edit": true` and `"has_mask": true|false` because
 `Qwen21EditOptions` derives from `QwenImageOptions` and the `model` field alone
-cannot distinguish them. `/api/health` exposes `supports_image_editing`
+cannot distinguish them. Adding any advanced field (`margin_*`, `model_mode`,
+`rgba`) upgrades the request to `Qwen21EditExOptions` — see the
+[advanced-edit envelope](#advanced-edit-envelope-post-apijobs) below; omitting
+all of them keeps the ordinary edit export so older native libraries still
+work. `/api/health` exposes `supports_image_editing`
 (`QziClient.SupportsImageEditing`), which is `false` when the loaded native
 library predates the additive editing exports; the UI then disables the
 `qwen21-edit` option and switches an already-selected edit mode back to
 `qwen21`, so an unsupported job can never be submitted.
+
+### Advanced-edit envelope (`POST /api/jobs`)
+
+An ordinary `qwen21-edit` envelope is upgraded to the third additive ABI v1
+increment as soon as **any** advanced field is present. All advanced fields
+require `reference_image`; using them with `zimage` still fails with `400`.
+
+```json
+{
+  "model": "qwen21-edit",
+  "prompt": "a quiet mountain lake at dawn",
+  "width": 1024,
+  "height": 1024,
+  "seed": 42,
+  "client": "manual-test",
+  "reference_image": "data:image/png;base64,iVBORw0KGgo...",
+  "mask_image": "data:image/png;base64,iVBORw0KGgo...",
+  "margin_top": 128,
+  "margin_bottom": 128,
+  "margin_left": 128,
+  "margin_right": 128,
+  "model_mode": 0,
+  "rgba": 1
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `margin_top` / `margin_bottom` / `margin_left` / `margin_right` | Optional non-negative integers, **multiples of 32**. They enlarge the **output** canvas: `width` / `height` stay the final size and the reference is cover-fitted into the remaining inner rectangle. All zero / omitted = no outpainting. The inner rectangle must stay at least `32×32` |
+| `model_mode` | Optional `0` (masked denoising, default) or `2` / `3` / `4` / `5` (LanPaint with 2 / 5 / 10 / 15 inner Langevin iterations). The numbers are WanGP's combo-box indices, not iteration counts. Requires `mask_image` and is **mutually exclusive** with any nonzero margin; it also forces both strengths to `1.0` |
+| `rgba` | Optional `0` (RGB PNG, default) or `1` (RGBA PNG using the VAE decoder's generated 4th channel). Any other value fails with `400` |
+
+`RequestMapper` returns `Qwen21EditExOptions` when `HasAdvancedParameters()` is
+true and keeps returning `Qwen21EditOptions` otherwise, so an older native
+library without `qzi_generate_qwen21_edit_ex` can still serve ordinary edit
+jobs. `/api/health` exposes `supports_advanced_editing`
+(`QziClient.SupportsAdvancedEditing`); when `false`, submitting an advanced
+job returns `400` with `WebUiCapabilities.AdvancedEditingUnavailable` instead
+of failing minutes later inside the queue, and the front-end shows an
+"Unavailable" note in the panel. Job / gallery rows additionally carry
+`"advanced_edit"`, `"outpaint"` and `"rgba"` badges derived from
+`JobDto.AdvancedEditState()`.
+
+The three features need **no new checkpoint** — they are orchestration and
+sampling changes on the same 7B Qwen-Image 2.1 weights. Validation rules live
+in [PARAMETERS.md](PARAMETERS.md); the C contract is in
+[NATIVE_ABI.md](NATIVE_ABI.md).
 
 ### ControlNet envelope (`POST /api/jobs`)
 
@@ -392,6 +444,16 @@ do not close idle connections. `EventSource` reconnects automatically.
   pixels are regenerated from the prompt, black ones keep the reference. The
   option is disabled when `/api/health` reports
   `supports_image_editing: false`.
+- **Advanced edit panel** (inside `qwen21-edit`): top / bottom / left / right
+  outpainting margins (step 32, they **enlarge** the output canvas), a
+  `Model mode` selector (masked denoising or LanPaint with 2/5/10/15 inner
+  iterations) and an `Output channels` selector (RGB / RGBA). The fields are
+  sent only when at least one differs from its default, so an ordinary edit
+  job still uses the basic edit export. A note explains that LanPaint needs a
+  painted mask and cannot be combined with margins; when `/api/health` reports
+  `supports_advanced_editing: false` the panel shows an explicit
+  "Unavailable" warning while ordinary editing keeps working. Gallery / job
+  rows add `advanced_edit` / `outpaint` / `rgba` badges.
 - **ControlNet mode** (`zimage-control`): upload an already-preprocessed
   control image (PNG / JPEG / WebP, re-encoded by the canvas), preview it,
   choose a descriptive `control type` (`auto` / `pose` / `canny` / `depth` /

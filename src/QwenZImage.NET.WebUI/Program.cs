@@ -86,6 +86,9 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
     bool controlnet = false;
     try { controlnet = rt.Engine?.SupportsControlNet == true; }
     catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe ControlNet capability"); }
+    bool advancedEditing = false;
+    try { advancedEditing = rt.Engine?.SupportsAdvancedEditing == true; }
+    catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe advanced-edit capability"); }
 
     if (ok)
     {
@@ -127,6 +130,7 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         native_library_source = rt.Config.NativeLibrarySource,
         supports_image_editing = editing,
         supports_controlnet = controlnet,
+        supports_advanced_editing = advancedEditing,
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
     });
@@ -175,7 +179,8 @@ app.MapPost("/api/jobs", async (HttpContext context, WebUiRuntime rt) =>
         // queued job failing later (or silently degrading to t2i / noise).
         string? capabilityError = WebUiCapabilities.ErrorFor(options,
             rt.Engine?.SupportsImageEditing == true,
-            rt.Engine?.SupportsControlNet == true);
+            rt.Engine?.SupportsControlNet == true,
+            rt.Engine?.SupportsAdvancedEditing == true);
         if (capabilityError is not null) return BadRequest(capabilityError);
         job = rt.Queue.Submit(options);
     }

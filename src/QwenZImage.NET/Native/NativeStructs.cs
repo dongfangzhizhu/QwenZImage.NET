@@ -61,6 +61,26 @@ internal unsafe struct QziQwen21EditRequest
     public uint Flags;
 }
 
+/// <summary>
+/// Third additive ABI v1 request: the ordinary image-edit request followed by
+/// WanGP's Red Canvas margins, the LanPaint model mode, the RGBA switch and
+/// reserved flags. Field order and packing must match
+/// <c>qzi_qwen21_edit_ex_request</c> in native/include/qzi.h;
+/// <see cref="AbiGuard"/> verifies sizeof() against qzi_qwen21_edit_ex_layout().
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct QziQwen21EditExRequest
+{
+    public QziQwen21EditRequest Base;
+    public uint MarginTop;
+    public uint MarginBottom;
+    public uint MarginLeft;
+    public uint MarginRight;
+    public uint ModelMode;
+    public uint Rgba;
+    public uint Flags;
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct QziZImageRequest
 {

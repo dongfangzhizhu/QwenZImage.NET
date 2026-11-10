@@ -3,7 +3,7 @@
 本文件是 `QwenZImage.NET` 参数规则的唯一说明。规则在两处实现并保持完全一致：
 
 - 托管侧：`src/QwenZImage.NET/Validation/RequestValidator.cs`（先于 native 调用失败，避免分钟级模型加载）
-- native 侧：`native/src/qzi.c` 的 `qzi_validate_qwen21()` / `qzi_validate_qwen21_edit()` / `qzi_validate_zimage()`（保护直接从 C/C++ 调用 ABI 的集成方）
+- native 侧：`native/src/qzi.c` 的 `qzi_validate_qwen21()` / `qzi_validate_qwen21_edit()` / `qzi_validate_qwen21_edit_ex()` / `qzi_validate_zimage()` / `qzi_validate_zimage_control()`（保护直接从 C/C++ 调用 ABI 的集成方）
 
 两者不一致时以 `native/include/qzi.h` 的注释和本文件为准，并应视为缺陷修复。
 
@@ -85,6 +85,32 @@
 
 WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`reference_image` / `mask_image` / `strength` / `masking_strength`）。
 
+## Qwen-Image 2.1 高级编辑（`Qwen21EditExOptions`）
+
+`Qwen21EditExOptions` 继承 `Qwen21EditOptions`，因此上节所有编辑规则（`Reference` / `Mask` / `Strength` / `MaskingStrength`，以及 t2i 的尺寸、tier、steps、guidance、LoRA、prompt）继续适用。它是**第三个 ABI v1 增量扩展**：native 结构体 `qzi_qwen21_edit_ex_request`（把普通编辑请求作为首成员，再追加高级字段），入口 `qzi_generate_qwen21_edit_ex()`，`.NET` 侧 `GenerateQwen21EditEx(Async)`。三项能力都只用同一份 7B 权重，**不需要新的 checkpoint 或额外模型目录**。
+
+| 字段 | 默认值 | 规则 |
+| --- | --- | --- |
+| `Width` / `Height` | 1024 / 1024 | 语义变为**最终输出画布**（含外扩边距），其余约束与 `QwenImageOptions` 相同（32 的倍数、`≤ 2048`、面积 `≤ 2048×2048`） |
+| `MarginTop` / `MarginBottom` / `MarginLeft` / `MarginRight` | `0` | 输出画布四边各增加多少像素；必须是 **32 的倍数**（WanGP `OUTPAINTING_ALIGNMENT`），四者全 `0` 表示不外扩。扣掉左右 / 上下边距后的内部源矩形必须仍 ≥ `32×32` |
+| `ModelMode` | `MaskedDenoising` (`0`) | `Qwen21EditMode`：`MaskedDenoising` 或 `LanPaint2` / `LanPaint5` / `LanPaint10` / `LanPaint15`（数值 **2/3/4/5** 是 WanGP 下拉框索引，不是迭代次数，分别对应 2/5/10/15 次内嵌 Langevin 迭代）。`EffectiveModelMode` 是实际发送的 `uint` |
+| `Rgba` | `false` | `true` 输出 **PNG colour type 6**（RGBA），保留 VAE decoder `conv_out` 的第 4 通道作为模型生成的 alpha；`false` 仍是普通 RGB（colour type 2） |
+| `Flags` | `0` | 保留字段，必须为 `0` |
+
+`HasOutpainting` / `IsLanPaint` 是两个只读派生量。参数语义与 WanGP 对齐：
+
+- **Red Canvas 外扩**：参考图居中裁剪 cover-fit 到扣掉边距后的内部矩形，四周填不透明红色 `FF0000`；prompt 自动追加固定后缀 `Remove the red paddings on the sides and show what's behind them.`；红色边距**跑完整去噪调度**（`step_offset = 0`），`Strength` 只作用于内部绘制区。全零边距时与普通编辑完全等价。
+- **LanPaint**：训练-free 的 BiG-score Langevin 精修，插在每个 sampler 步之前，无需额外权重。它**必须有 `Mask`**、**与外扩互斥**（WanGP 对 instruction outpainting 会禁用 LanPaint），并把 `denoising_strength` 与 `masking_strength` 都强制为 `1.0`。为避免静默覆盖调用方意图，托管侧若显式传了非 `1.0` 的 `Strength` / `MaskingStrength` 就直接报 `ArgumentException`；native 侧 `qzi_normalize_qwen21_edit_ex()` 归一化时统一置 `1.0`，两个后端看到同一组有效值。
+- **RGBA**：VAE decoder 的 `conv_out` 本来就是 `144→4`，第 4 通道此前被丢弃；`rgba != 0` 时用与 RGB 相同的 `clamp + (x+1)*127.5` 量化保留它，写成 RGBA PNG。CPU 与 CUDA 两条解码路径共用同一个量化函数。
+
+native 侧 `qzi_validate_qwen21_edit_ex()` 先复用 `qzi_validate_qwen21_edit()` 校验内嵌的普通请求，再检查 `flags`、四边距的 32 像素对齐与残余源矩形、`model_mode` 白名单、LanPaint 的 mask 要求与外扩互斥、`rgba ∈ {0,1}`；非法值一律返回 `QZI_ERR_INVALID_ARGUMENT`，不静默 coerce。`.NET` 侧 `RequestValidator.Validate(Qwen21EditExOptions)` 在 native 之前执行同一套规则（含 `RequestValidator.OutpaintAlignment = 32`）；老 native 库缺第三个能力时 `SupportsAdvancedEditing == false`，调用抛 `NotSupportedException`（`QZI_ERR_UNSUPPORTED`）。
+
+能力探测比普通编辑多一层依赖：`Qwen21EditExOptions` 内嵌了普通编辑请求，因此 `AbiGuard` 要求 `SupportsImageEditing` **与** `qzi_abi_features() & 0x4`、`qzi_qwen21_edit_ex_layout()` 尺寸比对、`qzi_generate_qwen21_edit_ex` 导出四者全部通过才报告支持。WebUI 里只要出现任一高级字段（`margin_*` / `model_mode` / `rgba`），`RequestMapper` 就把普通编辑作业升级成 `Qwen21EditExOptions`；全部字段都省略时仍走第二个增量扩展，旧库照样可用。
+
+**保真度边界**：WanGP 的 Qwen-Image 编辑是 condition-prefix 模型（参考 latent 拼在带噪目标前面，DiT 通过注意力读取它），本引擎是 img2img sampler（参考图就是起点 latent）。因此 Red Canvas 外扩通过「边距 + 绘制区从全噪声起步、保留区 pin 到已知轨迹」来近似，**不是逐像素复刻 WanGP 的外扩效果**；详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。多参考图、20B edit / edit_plus / layered、Viggle / Pruna、prompt enhancer `EDITING` 仍不在本库范围内。
+
+WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`margin_*` / `model_mode` / `rgba`），C 契约见 [NATIVE_ABI.md](NATIVE_ABI.md)。
+
 ## Z-Image（`ZImageOptions`）
 
 | 字段 | 默认值 | 规则 |
@@ -131,6 +157,12 @@ WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`control_image` / `control_type`
 | 编辑：`strength = 1.5` | ❌ 超出 `0.05..1.0`，托管 / native 双侧都拒绝 |
 | 编辑：`masking_strength = 0.5` 但没有 `Mask` | ❌ 会被静默丢弃，直接报错 |
 | 编辑：`Mask` 尺寸与 `Reference` 不一致 | ❌ 笔刷无法对齐，直接报错 |
+| 高级编辑：`1024×1024` + 四边各 `128` 外扩 | ✅ 合法，内部源矩形 `768×768`，边距都是 32 的倍数 |
+| 高级编辑：上边距 `100` | ❌ `100` 不是 32 的倍数 |
+| 高级编辑：`1024×1024` + 左右各 `512` | ❌ 内部源宽度为 0，不足 `32×32` |
+| 高级编辑：LanPaint + 任意非零边距 | ❌ 两者互斥（WanGP 对 Red Canvas 禁用 LanPaint） |
+| 高级编辑：LanPaint 但无 `Mask` | ❌ LanPaint 只在遮罩编辑区做 Langevin 精修 |
+| 高级编辑：LanPaint 且 `Strength = 0.6` | ❌ 该模式强制两个 strength 为 `1.0`，显式传其它值直接报错 |
 
 ## 预设
 

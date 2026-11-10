@@ -376,6 +376,104 @@ static void qzi_normalize_qwen21_edit(const qzi_qwen21_edit_request *request,
     out->flags = 0;
 }
 
+/* Advanced editing validation. Everything in the embedded edit request is
+ * checked by qzi_validate_qwen21_edit() first, so the extras only need to
+ * validate their own invariants. Outpainting margins follow WanGP's
+ * OUTPAINTING_ALIGNMENT = 32 and its "keep at least a 32 px source" rule. */
+qzi_status qzi_validate_qwen21_edit_ex(const qzi_qwen21_edit_ex_request *request,
+                                       char *error, size_t error_cap)
+{
+    qzi_status s;
+    if (!request) {
+        qzi_set_error(error, error_cap, "qwen21 advanced edit request is NULL");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->flags != 0) {
+        qzi_set_error(error, error_cap,
+                      "qwen21 advanced edit request flags must be 0");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    s = qzi_validate_qwen21_edit(&request->base, error, error_cap);
+    if (s != QZI_OK) return s;
+
+    const uint32_t alignment = QZI_OUTPAINT_ALIGNMENT;
+    const uint32_t m[4] = {request->margin_top, request->margin_bottom,
+                           request->margin_left, request->margin_right};
+    for (int i = 0; i < 4; i++) {
+        if (m[i] % alignment != 0) {
+            qzi_set_error_fmt(error, error_cap,
+                "outpainting margins must be multiples of %u pixels",
+                (unsigned)alignment);
+            return QZI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    const int64_t source_w = (int64_t)request->base.base.width -
+                             (int64_t)request->margin_left -
+                             (int64_t)request->margin_right;
+    const int64_t source_h = (int64_t)request->base.base.height -
+                             (int64_t)request->margin_top -
+                             (int64_t)request->margin_bottom;
+    if (source_w < (int64_t)alignment || source_h < (int64_t)alignment) {
+        qzi_set_error_fmt(error, error_cap,
+            "outpainting must leave at least a %ux%u source rectangle",
+            (unsigned)alignment, (unsigned)alignment);
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    const int outpainting = request->margin_top || request->margin_bottom ||
+                            request->margin_left || request->margin_right;
+
+    if (request->model_mode != QZI_EDIT_MODE_MASKED &&
+        request->model_mode != QZI_EDIT_MODE_LANPAINT_2 &&
+        request->model_mode != QZI_EDIT_MODE_LANPAINT_5 &&
+        request->model_mode != QZI_EDIT_MODE_LANPAINT_10 &&
+        request->model_mode != QZI_EDIT_MODE_LANPAINT_15) {
+        qzi_set_error(error, error_cap,
+            "model_mode must be 0 (Masked Denoising) or 2/3/4/5 (LanPaint "
+            "2/5/10/15 steps)");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->model_mode != QZI_EDIT_MODE_MASKED) {
+        if (!request->base.mask) {
+            qzi_set_error(error, error_cap,
+                "LanPaint requires mask; it refines a masked edit region");
+            return QZI_ERR_INVALID_ARGUMENT;
+        }
+        if (outpainting) {
+            /* WanGP only constructs LanPaint when NOT instruction_outpainting.
+             * Reject instead of silently dropping the selected method. */
+            qzi_set_error(error, error_cap,
+                "LanPaint and outpainting are mutually exclusive (WanGP disables "
+                "LanPaint for Red Canvas outpainting)");
+            return QZI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    if (request->rgba > 1u) {
+        qzi_set_error(error, error_cap, "rgba must be 0 or 1");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    return QZI_OK;
+}
+
+/* Resolve the embedded edit sentinels, then apply WanGP's LanPaint override
+ * (denoising_strength = masking_strength = 1.0) so both backends see the same
+ * effective values. */
+static void qzi_normalize_qwen21_edit_ex(const qzi_qwen21_edit_ex_request *request,
+                                         qzi_qwen21_edit_ex_request *out)
+{
+    qzi_normalize_qwen21_edit(&request->base, &out->base);
+    out->margin_top = request->margin_top;
+    out->margin_bottom = request->margin_bottom;
+    out->margin_left = request->margin_left;
+    out->margin_right = request->margin_right;
+    out->model_mode = request->model_mode;
+    out->rgba = request->rgba;
+    out->flags = 0;
+    if (out->model_mode != QZI_EDIT_MODE_MASKED) {
+        out->base.strength = 1.0f;
+        out->base.masking_strength = 1.0f;
+    }
+}
+
 qzi_status qzi_validate_zimage(const qzi_zimage_request *request,
                                char *error, size_t error_cap)
 {
@@ -529,7 +627,8 @@ QZI_API uint32_t qzi_abi_version(void)
 
 QZI_API uint32_t qzi_abi_features(void)
 {
-    return QZI_FEATURE_QWEN21_EDIT | QZI_FEATURE_ZIMAGE_CONTROL;
+    return QZI_FEATURE_QWEN21_EDIT | QZI_FEATURE_ZIMAGE_CONTROL |
+           QZI_FEATURE_QWEN21_EDIT_ADV;
 }
 
 QZI_API size_t qzi_qwen21_edit_layout(void)
@@ -540,6 +639,11 @@ QZI_API size_t qzi_qwen21_edit_layout(void)
 QZI_API size_t qzi_zimage_control_layout(void)
 {
     return sizeof(qzi_zimage_control_request);
+}
+
+QZI_API size_t qzi_qwen21_edit_ex_layout(void)
+{
+    return sizeof(qzi_qwen21_edit_ex_request);
 }
 
 QZI_API const char *qzi_status_text(qzi_status status)
@@ -842,6 +946,38 @@ QZI_API qzi_status qzi_generate_zimage_control(qzi_engine *engine,
                                                      callbacks, out_image, error,
                                                      error_cap);
     return generation_leave(engine, status, out_image, QZI_MODEL_ZIMAGE,
+                            error, error_cap);
+}
+
+QZI_API qzi_status qzi_generate_qwen21_edit_ex(qzi_engine *engine,
+                                               const qzi_qwen21_edit_ex_request *request,
+                                               const qzi_callbacks *callbacks,
+                                               qzi_image *out_image,
+                                               char *error, size_t error_cap)
+{
+    qzi_status status;
+    qzi_qwen21_edit_ex_request normalized;
+    if (!engine || !out_image || !error || error_cap == 0) {
+        qzi_set_error(error, error_cap,
+                      "engine, out_image and error buffer are required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_image, 0, sizeof(*out_image));
+    error[0] = '\0';
+    status = qzi_validate_qwen21_edit_ex(request, error, error_cap);
+    if (status != QZI_OK) { engine->rejected++; return status; }
+    if (!engine->backend.generate_qwen21_edit_ex) {
+        engine->rejected++;
+        qzi_set_error(error, error_cap,
+            "the registered native backend does not implement advanced image editing");
+        return QZI_ERR_UNSUPPORTED;
+    }
+    qzi_normalize_qwen21_edit_ex(request, &normalized);
+    if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
+    status = engine->backend.generate_qwen21_edit_ex(engine->context, &normalized,
+                                                     callbacks, out_image, error,
+                                                     error_cap);
+    return generation_leave(engine, status, out_image, QZI_MODEL_QWEN21,
                             error, error_cap);
 }
 

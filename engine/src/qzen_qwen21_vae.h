@@ -35,6 +35,15 @@ void qzen_qwen21_vae_close(qzen_qwen21_vae *vae);
 int qzen_qwen21_vae_decode(qzen_qwen21_vae *vae, const float *latent, int height, int width,
                          unsigned char *rgb, char *error, size_t error_size);
 
+/* Same decode, but also expose conv_out's 4th channel as an 8-bit alpha plane
+ * [1][16*height][16*width]. WanGP's "rgba = Enabled" keeps this channel; it
+ * needs no weights or extra passes because conv_out is already 144->4.
+ * alpha may be NULL, in which case this is identical to the RGB-only call.
+ * The alpha undergoes the same clamp + (x + 1) * 127.5 quantisation as RGB. */
+int qzen_qwen21_vae_decode_ex(qzen_qwen21_vae *vae, const float *latent, int height, int width,
+                            unsigned char *rgb, unsigned char *alpha,
+                            char *error, size_t error_size);
+
 /* Encode RGB8 [3][height][width] into the sampler's normalised latent
  * [64][height/16][width/16]: the encoder is the mirror of the decoder and
  * lives in the same checkpoint, loaded on the first call. The 4th input

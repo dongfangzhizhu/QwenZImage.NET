@@ -167,6 +167,54 @@
           </div>
         </div>
       </div>
+
+      <!-- Advanced WanGP editing (third additive ABI v1 increment). These
+           fields are only sent when at least one differs from its default, so
+           an ordinary qwen21-edit job still uses the basic edit export. -->
+      <div id="advanced-edit" class="advanced-edit">
+        <h4 class="section-title">Advanced edit <span class="hint">outpainting / LanPaint / RGBA</span></h4>
+        <p id="advanced-unavailable" class="note edit-note" hidden><strong>Unavailable:</strong> the loaded native library does not export <code>qzi_generate_qwen21_edit_ex</code>. Ordinary image editing still works.</p>
+        <p class="note edit-note">Margins <strong>enlarge the output canvas</strong> (width / height stay the final size); the reference is fitted into the remaining inner rectangle. Every margin must be a multiple of 32 px and leave at least a 32×32 source. LanPaint needs a painted mask and cannot be combined with margins.</p>
+        <div class="grid-2">
+          <div class="field">
+            <label for="margin-top">Top margin <span class="hint">px · step 32</span></label>
+            <input id="margin-top" type="number" min="0" max="2048" step="32" value="0">
+          </div>
+          <div class="field">
+            <label for="margin-bottom">Bottom margin <span class="hint">px · step 32</span></label>
+            <input id="margin-bottom" type="number" min="0" max="2048" step="32" value="0">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="margin-left">Left margin <span class="hint">px · step 32</span></label>
+            <input id="margin-left" type="number" min="0" max="2048" step="32" value="0">
+          </div>
+          <div class="field">
+            <label for="margin-right">Right margin <span class="hint">px · step 32</span></label>
+            <input id="margin-right" type="number" min="0" max="2048" step="32" value="0">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="model-mode">Model mode</label>
+            <select id="model-mode">
+              <option value="0">Masked denoising</option>
+              <option value="2">LanPaint · 2 iterations</option>
+              <option value="3">LanPaint · 5 iterations</option>
+              <option value="4">LanPaint · 10 iterations</option>
+              <option value="5">LanPaint · 15 iterations</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="rgba">Output channels</label>
+            <select id="rgba">
+              <option value="0">RGB (default)</option>
+              <option value="1">RGBA · generated alpha</option>
+            </select>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="field" data-only="zimage">
