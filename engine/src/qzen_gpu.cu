@@ -1241,6 +1241,19 @@ __global__ static void qzen_add_bf16_kernel(const uint16_t *left,
     }
 }
 
+/* ControlNet skip connection: hidden_states += alpha * after_proj(control). */
+__global__ static void qzen_scale_add_bf16_kernel(const uint16_t *left,
+                                                  const uint16_t *right,
+                                                  uint16_t *output,
+                                                  size_t count, float alpha) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        float sum = qzen_bf16_bits_to_f32(left[index]) +
+                    alpha * qzen_bf16_bits_to_f32(right[index]);
+        output[index] = qzen_f32_to_bf16_bits(sum);
+    }
+}
+
 /* QZEN_SM_ARCH / QZEN_SM_ARCH_LIST describe the architectures this build
  * emitted -- CMakeLists' QZEN_CUDA_ARCH (a fat binary for NuGet) or
  * Makefile.linux's SM_ARCH (one value). CMake writes qzen_arch_config.h; the
@@ -1434,6 +1447,24 @@ int qzen_gpu_add_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
         (uint16_t *)output->device, elements);
     gpu->stats.direct_dispatches++;
     return qzen_cuda_check(gpu, cudaGetLastError(), "qzen_add_bf16");
+}
+
+int qzen_gpu_scale_add_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
+                            const qzen_gpu_tensor *left,
+                            const qzen_gpu_tensor *right,
+                            uint32_t elements, float alpha) {
+    if (!gpu || !output || !left || !right || output->dtype != QZEN_GPU_BF16 ||
+        left->dtype != QZEN_GPU_BF16 || right->dtype != QZEN_GPU_BF16 ||
+        output->elements < elements || left->elements < elements ||
+        right->elements < elements || !isfinite(alpha))
+        return qzen_gpu_fail(gpu, "invalid BF16 scaled add request");
+    unsigned threads = 256;
+    unsigned blocks = (unsigned)(((size_t)elements + threads - 1) / threads);
+    qzen_scale_add_bf16_kernel<<<blocks, threads, 0, gpu->stream>>>(
+        (const uint16_t *)left->device, (const uint16_t *)right->device,
+        (uint16_t *)output->device, elements, alpha);
+    gpu->stats.direct_dispatches++;
+    return qzen_cuda_check(gpu, cudaGetLastError(), "qzen_scale_add_bf16");
 }
 
 int qzen_gpu_sub_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,

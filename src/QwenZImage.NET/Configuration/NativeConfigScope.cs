@@ -38,6 +38,7 @@ internal sealed class NativeConfigScope : IDisposable
         (QziConfig.ZImageDirectoryVariable, o => o.ZImageDirectory),
         (QziConfig.LoraDirectoryVariable, o => o.Qwen21LoraDirectory),
         (QziConfig.NunchakuDirectoryVariable, o => o.ZImageNunchakuDirectory),
+        (QziConfig.ZImageControlDirectoryVariable, o => o.ZImageControlDirectory),
         (QziConfig.ModelCacheVariable, o => o.CacheDirectory),
     ];
 

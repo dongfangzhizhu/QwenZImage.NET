@@ -25,6 +25,8 @@ typedef struct qzen_config {
     char qwen21_lora_dir[QZEN_CONFIG_PATH_MAX];
     char zimage_dir[QZEN_CONFIG_PATH_MAX];
     char zimage_nunchaku_dir[QZEN_CONFIG_PATH_MAX];
+    /* Z-Image Turbo Fun ControlNet Union checkpoint (file or directory). */
+    char zimage_control_dir[QZEN_CONFIG_PATH_MAX];
     char text_cache_dir[QZEN_CONFIG_PATH_MAX];
     char source[QZEN_CONFIG_PATH_MAX];
 } qzen_config;

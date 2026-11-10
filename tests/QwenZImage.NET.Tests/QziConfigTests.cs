@@ -127,12 +127,14 @@ public class QziConfigTests : IDisposable
     {
         QziConfig config = Write("""
             { "qwen21_lora_dir": "/packs/loras",
-              "zimage_nunchaku_dir": "/packs/svdq" }
+              "zimage_nunchaku_dir": "/packs/svdq",
+              "zimage_control_dir": "/packs/control-union" }
             """);
 
         QziClientOptions options = config.ToClientOptions();
         Assert.Equal("/packs/loras", options.Qwen21LoraDirectory);
         Assert.Equal("/packs/svdq", options.ZImageNunchakuDirectory);
+        Assert.Equal("/packs/control-union", options.ZImageControlDirectory);
     }
 
     [Fact]
@@ -143,11 +145,13 @@ public class QziConfigTests : IDisposable
         // must survive all the way into QziClientOptions.
         QziConfig config = new QziConfig()
             .With("qwen21_lora_dir", "/overridden/loras")
-            .With("zimage_nunchaku_dir", "/overridden/svdq");
+            .With("zimage_nunchaku_dir", "/overridden/svdq")
+            .With("zimage_control_dir", "/overridden/control-union");
 
         QziClientOptions options = config.ToClientOptions();
         Assert.Equal("/overridden/loras", options.Qwen21LoraDirectory);
         Assert.Equal("/overridden/svdq", options.ZImageNunchakuDirectory);
+        Assert.Equal("/overridden/control-union", options.ZImageControlDirectory);
     }
 
     [Fact]

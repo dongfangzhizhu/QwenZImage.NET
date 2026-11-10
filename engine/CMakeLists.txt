@@ -88,6 +88,7 @@ set(QZEN_C_SOURCES
     src/qzen_qwen21_vae.c
     src/qzen_qwen21_pipeline.c
     src/qzen_zimage_dit.c
+    src/qzen_zimage_control.c
     src/qzen_zimage_text.c
     src/qzen_zimage_vae.c
     src/qzen_zimage_pipeline.c

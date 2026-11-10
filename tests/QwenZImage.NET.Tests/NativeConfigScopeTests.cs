@@ -40,6 +40,7 @@ public sealed class NativeConfigScopeTests : IDisposable
         CacheDirectory = $"/cache/{suffix}",
         Qwen21LoraDirectory = $"/packs/loras-{suffix}",
         ZImageNunchakuDirectory = $"/packs/nunchaku-{suffix}",
+        ZImageControlDirectory = $"/packs/zimage-control-{suffix}",
     };
 
     private static void SetAmbient(string prefix)
@@ -91,6 +92,8 @@ public sealed class NativeConfigScopeTests : IDisposable
                 Environment.GetEnvironmentVariable(QziConfig.LoraDirectoryVariable));
             Assert.Equal("/packs/nunchaku-scoped",
                 Environment.GetEnvironmentVariable(QziConfig.NunchakuDirectoryVariable));
+            Assert.Equal("/packs/zimage-control-scoped",
+                Environment.GetEnvironmentVariable(QziConfig.ZImageControlDirectoryVariable));
             Assert.Equal("/cache/scoped",
                 Environment.GetEnvironmentVariable(QziConfig.ModelCacheVariable));
         }

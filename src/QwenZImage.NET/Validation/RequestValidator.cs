@@ -29,7 +29,11 @@ public static class RequestValidator
         ArgumentNullException.ThrowIfNull(options);
         switch (options)
         {
+            // Derived options must be matched before their base record or their
+            // extra rules would be skipped.
+            case Qwen21EditOptions edit: Validate(edit); break;
             case QwenImageOptions qwen: Validate(qwen); break;
+            case ZImageControlOptions control: Validate(control); break;
             case ZImageOptions zimage: Validate(zimage); break;
             default: throw new ArgumentException(
                 $"Unsupported request type {options.GetType().FullName}.", nameof(options));
@@ -89,6 +93,50 @@ public static class RequestValidator
         }
     }
 
+    /// <summary>Validates a Qwen-Image 2.1 image-edit request.</summary>
+    public static void Validate(Qwen21EditOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        Validate((QwenImageOptions)options);
+
+        QziRasterImage? reference = options.Reference;
+        if (reference is null)
+            throw new ArgumentException("Reference is required for image editing.",
+                                        nameof(options));
+        if (reference.Channels != 3)
+            throw new ArgumentException(
+                "Reference must be a 3-channel planar RGB image.", nameof(options));
+
+        if (options.Mask is { } mask)
+        {
+            if (mask.Channels != 1)
+                throw new ArgumentException(
+                    "Mask must be a single-channel 8-bit raster.", nameof(options));
+            if (mask.Width != reference.Width || mask.Height != reference.Height)
+                throw new ArgumentException(
+                    "Mask dimensions must match the reference image, otherwise the " +
+                    "painted region would be offset.", nameof(options));
+        }
+
+        if (options.Strength is { } strength &&
+            (!float.IsFinite(strength) || strength < 0.05f || strength > 1.0f))
+            throw new ArgumentException(
+                "Strength must be finite and in 0.05..1.0 (or null for 0.75).",
+                nameof(options));
+
+        if (options.MaskingStrength is { } masking)
+        {
+            if (!float.IsFinite(masking) || masking < 0.05f || masking > 1.0f)
+                throw new ArgumentException(
+                    "MaskingStrength must be finite and in 0.05..1.0.",
+                    nameof(options));
+            if (options.Mask is null)
+                throw new ArgumentException(
+                    "MaskingStrength requires Mask; otherwise it would be silently dropped.",
+                    nameof(options));
+        }
+    }
+
     /// <summary>
     /// Mirrors <c>qzi.c</c>'s <c>no_path_separators()</c>: the name is joined
     /// onto <c>qwen21_lora_dir</c> by the engine, so it must never be able to
@@ -124,6 +172,47 @@ public static class RequestValidator
             throw new ArgumentException(
                 $"Unknown Z-Image checkpoint '{checkpoint}'. Use bf16, nunchaku, " +
                 "or an id listed by the engine's pack scan.", nameof(options));
+    }
+
+    /// <summary>
+    /// Validates a Z-Image Turbo Fun ControlNet Union request. Mirrors
+    /// <c>qzi_validate_zimage_control()</c>: the ordinary Z-Image rules apply to
+    /// the base request, plus the control image, type, scale and reserved flags.
+    /// </summary>
+    public static void Validate(ZImageControlOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        Validate((ZImageOptions)options);
+
+        QziRasterImage? control = options.ControlImage;
+        if (control is null)
+            throw new ArgumentException(
+                "ControlImage is required for ControlNet generation.", nameof(options));
+        if (control.Channels != 3)
+            throw new ArgumentException(
+                "ControlImage must be a 3-channel planar RGB image.", nameof(options));
+        if (control.Width <= 0 || control.Height <= 0 ||
+            control.Width > QziRasterImage.MaxSide ||
+            control.Height > QziRasterImage.MaxSide ||
+            (long)control.Width * control.Height > QziRasterImage.MaxPixels)
+            throw new ArgumentException(
+                $"ControlImage dimensions must be 1..{QziRasterImage.MaxSide} per side and " +
+                "at most 2048*2048 total pixels.", nameof(options));
+
+        string? type = options.EffectiveControlType;
+        if (!ZImageControlOptions.IsValidControlType(type))
+            throw new ArgumentException(
+                "ControlType must be null/auto/pose/canny/depth/scribble/raw " +
+                "(case-insensitive).", nameof(options));
+
+        float scale = options.ControlScale;
+        if (!float.IsFinite(scale) || (scale != 0.0f && (scale < 0.05f || scale > 2.0f)))
+            throw new ArgumentException(
+                "ControlScale must be 0 (engine default 0.65) or finite and in 0.05..2.0.",
+                nameof(options));
+
+        if (options.Flags != 0)
+            throw new ArgumentException("Flags is reserved and must be 0.", nameof(options));
     }
 
     private static void ValidatePrompt(string? prompt)

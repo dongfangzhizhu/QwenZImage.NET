@@ -43,13 +43,13 @@ Your app (.NET 10)                     Browser (manual testing only)
                  └─ qzi_backend vtable（编译期由 QZI_HAS_REAL_BACKEND 选择）
                       ├─ OFF：qzi_stub.c 参考后端（确定性噪点，CI / 测试）
                       └─ ON ：qzi_engine_backend.c → engine/ 真实 C/CUDA 推理引擎
-                                Qwen21 DiT / text tower / VAE
-                                ZImage DiT / text tower / VAE / CUDA kernels
+                                Qwen21 DiT / text tower / VAE / edit
+                                ZImage DiT / text tower / VAE / ControlNet / CUDA kernels
                           ▲
               QwenZImage.config.json（模型权重路径，QZI_CONFIG / --config）
 ```
 
-**D10 边界**：`QziClient` 直接 P/Invoke 同一个进程内的 `QwenZImageNative`；WebUI 与用户应用处于同一层，都只走 `QziClient`。**没有任何外部服务、HTTP transport、sidecar 或 Go 进程**。`QZI_CONFIG` 让 native backend 读取 ABI 里没有的 `qwen21_lora_dir` / `zimage_nunchaku_dir` 等字段；`QziClient` 通过 `NativeConfigScope` 在 `qzi_engine_create()` 期间**作用域发布** `QZI_CONFIG` 与五个 `QZI_*` 目录变量（含 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR`），构造结束即还原，构造期间由 `EngineCreateGate` 串行化。native 侧 `qzen_config_apply_environment()` 在文件加载后应用，显式传值优先；所有 native 配置读取统一走 `qzi_getenv()`（Windows 用 Win32 API 读实时环境，绕过 CRT 的启动快照）。每个 engine 因此快照自己的配置，多实例互不串扰，且 ABI v1 的导出符号与结构体布局不变。
+**D10 边界**：`QziClient` 直接 P/Invoke 同一个进程内的 `QwenZImageNative`；WebUI 与用户应用处于同一层，都只走 `QziClient`。**没有任何外部服务、HTTP transport、sidecar 或 Go 进程**。`QZI_CONFIG` 让 native backend 读取 ABI 里没有的 `qwen21_lora_dir` / `zimage_nunchaku_dir` / `zimage_control_dir` 等字段；`QziClient` 通过 `NativeConfigScope` 在 `qzi_engine_create()` 期间**作用域发布** `QZI_CONFIG` 与六个 `QZI_*` 目录变量（含 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_ZIMAGE_CONTROL_DIR`），构造结束即还原，构造期间由 `EngineCreateGate` 串行化。native 侧 `qzen_config_apply_environment()` 在文件加载后应用，显式传值优先；所有 native 配置读取统一走 `qzi_getenv()`（Windows 用 Win32 API 读实时环境，绕过 CRT 的启动快照）。每个 engine 因此快照自己的配置，多实例互不串扰，且 ABI v1 的导出符号与结构体布局不变。
 
 **为什么保留两种构建**：CI 与托管测试必须在无 GPU 环境运行，且真实 CUDA 库依赖 cudart / cuBLAS 与 GPU 驱动，不适合塞进默认包。因此 `QZI_WITH_CUDA_ENGINE=OFF` 的参考后端仍是默认打包形态；`ON` 的构建默认生成覆盖 sm_80 → sm_121 的 **fat binary**（CMake 查询 `nvcc --list-gpu-arch` 并按工具链能力自动过滤），一个同名 DLL/SO 即可适配常见显卡，不必按 GPU 重编译。用 `QZI_NATIVE_LIBRARY` 覆盖或替换 `runtimes/<rid>/native/` 即可，托管 API 不变。CI 不含 GPU，所以发布 workflow 里打包的仍是参考后端。
 
@@ -64,7 +64,7 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 2 | C ABI v1：`qzi.h` / `qzi_backend.h`、`qzi.c` 控制层、参考后端、无依赖 PNG 编码器、CMake、C smoke test | ✅ |
 | 3 | `.NET 10` 封装：Native 层 + 公开模型 / 校验 / 结果 / 客户端；同步 + 异步 + 零拷贝 `WriteTo` | ✅ |
 | 4 | 纯 `.NET` 队列与预设：`Channels` 串行分发、取消、重试、事件流、9 个预设 | ✅ |
-| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12f 后 69 项，阶段 14 后 73 项）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
+| 5 | 测试：46 个 xUnit（42 库 + 4 WebUI，阶段 5 当时；阶段 12f 后 69 项，阶段 14 后 73 项，阶段 15 后 94 项 = 72 库 + 22 WebUI，**阶段 16 后 119 项 = 86 库 + 33 WebUI**）+ `ctest` native smoke（阶段 5 时各 1/1；阶段 12e 后 Windows 1 项 / Linux 3 项） | ✅ 全绿 |
 | 6 | 开源文档：README / LICENSE / THIRD_PARTY_NOTICES / NATIVE_ABI / PARAMETERS / ENGINE_INTEGRATION / WEBUI / 本计划 / 后端模板 | ✅ |
 | 7 | CI 与发布工作流：`ci.yml`、`release.yml`、`scripts/build-native.*` | ✅ |
 | 8 | `git init` + 本地提交 | ✅（按 D6 当时只做本地，后续由 D11 推送） |
@@ -79,6 +79,8 @@ Your app (.NET 10)                     Browser (manual testing only)
 | 12f | **消除 `QZI_*` 进程级环境变量多实例串扰**（用户指定节奏第 3 项）：`NativeConfigScope` 只在 `qzi_engine_create()` 期间发布 6 个变量并逆序还原（含构造失败回滚），`QziClient` 用静态锁串行化构造；`QziConfig` 补齐变量名常量；参考后端把 create 时配置指纹混入确定性 PNG；新增 8 项 xUnit（作用域发布/精确还原/未设选项/仅托管变量/失败回滚/双 engine 快照/并发构造隔离/Dispose 幂等）。**审计发现 Windows CRT `getenv()` 看不到 .NET 设置的环境变量**，新增内部 `qzi_getenv()`（Win32 `GetEnvironmentVariableA` / POSIX `getenv`），`qzen_config.c`、`qzi_stub.c` 与 C smoke 统一改用它，修复真实后端与参考后端的配置读取；文档与 PLAN 同步 | ✅ |
 | 13 | **推送 GitHub 开源 + NuGet Trusted Publishing**（D11） | ✅ 仓库整理、地址同步、OIDC 发布工作流已就绪；命令与一次性前置条件见第 5 节 |
 | 14 | **WebUI 不再默认产出噪点图**（用户反馈「生成图像依然是没有加载模型的无意义图像」）：`NativeLibraryLoader` 显式路径改为 fail-fast（不再静默回退到参考后端）；`WebUiConfig` 自动探测本机 `-cuda` 产物并支持 `QZI_WEBUI_NATIVE=reference` 与 `QZI_REQUIRE_REAL_BACKEND=1`（后者让 WebUI 拒绝生成而不是交付噪点图）；`/api/health` 暴露 `native_library` / `native_library_source`；新增 `start-webui-cuda.ps1` / `.sh` 一键启动；修正页面横幅与 README / WEBUI.md 的误导性指引；新增 4 项选择逻辑测试 | ✅ |
+| 15 | **Qwen-Image 2.1 图像编辑 / 对齐 WanGP**（用户要求「Qwen-Image 2.1功能不完整，应该还可以编辑图像，对齐wangp版本的功能」）：参考图 img2img、局部 mask 重绘、`denoising_strength` / `masking_strength`、白色重绘 / 黑色保持参考轨迹。ABI **v1 增量扩展**（`qzi_qwen21_edit_request` + `qzi_abi_features()` 能力位 + `qzi_qwen21_edit_layout()` + `qzi_generate_qwen21_edit()`，既有结构体 / 导出 / 6 个 layout 槽位不变）；`qzi.c` 新增 `qzi_validate_qwen21_edit()` / 归一化；`qzi_backend` 末尾追加可选 `generate_qwen21_edit` 槽位；真实 CUDA 后端复用 `qzen_generate_qwen21()`，只多参考图 cover fit + `qzen_qwen21_vae_encode()` + 1/16 latent mask + `qzen_qwen21_edit_start()` 与 WanGP 式遮罩恢复；引擎层 `qzen_qwen21_pipeline` 增加 `init_latent` / `strength` / `latent_mask` / `masking_strength`；参考后端按同一 `first_step` 规则缩短 `dit` 步并把编辑参数纳入确定性哈希；.NET 新增 `QziRasterImage`（无依赖 PNG 解码）/ `Qwen21EditOptions` / `GenerateQwen21Edit(Async)` / `SupportsImageEditing` / `GenerationPhase.ImageEncode` 与 `AbiGuard` 增量探测；WebUI 新增 `qwen21-edit` 模式、参考图上传与 canvas 笔刷 mask、4 个 snake_case 字段、`supports_image_editing` 与 job `edit` / `has_mask`；补 21 项托管测试、C smoke 编辑校验 / 能力位 / legacy backend、5 份文档 + 本计划 + backend 模板同步；真实 CUDA 双轮真图验证通过（见下方「阶段 15 本机验证结果」） | ✅ |
+| 16 | **Z-Image Turbo Fun ControlNet Union 2.1 / 对齐 WanGP**（用户要求「Z-image 应该也支持 controlnet，对齐wangp版本的功能」）：第二个 **ABI v1 增量扩展**——`qzi_zimage_control_request`（`base` + 控制图 / type / scale）、`QZI_FEATURE_ZIMAGE_CONTROL = 0x2`、`qzi_zimage_control_layout()`、`qzi_generate_zimage_control()`，`qzi_abi_features()` 返回 `0x3`；`qzi_backend` 末尾再追加可选 `generate_zimage_control` 槽位，旧槽位偏移与 6 个 layout 槽不变。`engine/src/qzen_zimage_control.c/.h` 加载 33 通道 Union 2.x 权重（15 control layers + 2 独立 noise refiner、明确拒绝 v1）；`engine/src/qzen_zimage_pipeline.c` 补齐此前**只有声明没有实现**的 `qzen_zpipe_denoise_control()` 与 CPU/GPU hint 注入，按 WanGP `control_layers_places = [0,2,...,28]` 在偶数 main layer 与两个 noise refiner 后以 `hidden_states += control_scale * skip` 注入，普通 t2i 传 `NULL` hints 保持逐位一致。真实 CUDA 后端 `qzi_engine_backend.c` 把 t2i / ControlNet 合成一个 `qzen_generate_zimage_impl()`：懒加载 Union 权重、控制图 cover fit + `qzen_zvae_encode()`、拼 33 通道 context、逐步重算 hints、复用 VAE 解码；`release_zimage()` 与 `done:` 统一释放。配置链补 `zimage_control_dir` / `QZI_ZIMAGE_CONTROL_DIR` / `QziConfig` / `NativeConfigScope`。.NET 新增 `ZImageControlOptions` / `GenerateZImageControl(Async)` / `SupportsControlNet` / `AbiGuard` 第二能力探测；WebUI 新增 `zimage-control` 模式、控制图上传、`control_image` / `control_type` / `control_scale`、`supports_controlnet` 与 job `control` / `has_control`，并与编辑模式互斥；参考后端把控制字段纳入确定性哈希并模拟 `"image encode"`。补 25 项托管测试、C smoke 双能力位 / 双 layout / 参数边界 / legacy backend、backend 模板第二个 `NULL` 槽，以及 5 份文档 + 本计划同步 | ✅ |
 
 本机验证结果（D10 完成度）：
 
@@ -151,6 +153,30 @@ Your app (.NET 10)                     Browser (manual testing only)
 - **拒绝噪点实测**：`QZI_WEBUI_NATIVE=reference` + `QZI_REQUIRE_REAL_BACKEND=1` 时 health 为 `ok=false` 并说明原因，`POST /api/jobs` 同样 **503**。
 - `git diff --check` 干净；`dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误（5 项目）；`dotnet test` **62 + 11 = 73** 全绿（新增 4 项：自动探测 / 显式优先 / 强制 reference / 拒绝噪点开关）。RID staging 仍保持参考后端，NuGet 包内容与 CI 的 GPU-free 假设未被改动。
 
+阶段 15 本机验证结果（本轮新增）：
+
+- `dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误；`dotnet test` **72 + 22 = 94** 全绿（新增 21 项编辑相关托管测试）。Windows 参考后端 `ctest` **1/1**；全新目录 `native/build-verify` 从零 configure + build + `ctest` **1/1**；真实 CUDA fat binary `ctest` **1/1**。
+- `objdump` 确认 CUDA `QwenZImageNative.dll` 导出新增的 `qzi_abi_features()`、`qzi_generate_qwen21_edit()`、`qzi_qwen21_edit_layout()` 三个符号；`gcc -std=c11 -Wall -Wextra -c integration/custom_backend_template.c` 通过（模板末尾编辑槽显式留 `NULL`，旧 backend 仍可编译）。`git diff --check` 干净（仅 CRLF 提示）。
+- WebUI 以 CUDA 后端启动（`QZI_NATIVE_LIBRARY` 指向 `artifacts/native/Windows-AMD64-cuda/QwenZImageNative.dll`、`QZI_REQUIRE_REAL_BACKEND=1`），`/api/health` 返回 `ok=true`、`transport=native-pinvoke`、`native_library_source=QZI_NATIVE_LIBRARY`、`supports_image_editing=true`、`engine.backend=QwenZImageNative`、`reference_backend=false`。
+- **真实 CUDA 编辑验证（512×512 / turbo / seed 42 / prompt「a red fox walking through fresh snow, cinematic light」）**：参考图为「左半蓝色底 + 白圆，右半纯橙色」，mask 为「左半纯黑、右半纯白」，`masking_strength=1.0`。两轮均走 `POST /api/jobs` 的 `model=qwen21-edit` + `reference_image` / `mask_image` 上传，输出 787,072 B 的 512×512 RGB PNG，非噪点。
+  - `strength=0.6`：phase 序列 `ModelLoad(0s) → Text(78.2s) → ImageEncode(159.5s) → Encode(192.7s done)`，出现 `"image encode"` 证明 VAE 编码参考图的路径真实执行；输出 `state=done`、`error=null`。参考图 vs 输出的半幅平均绝对差（MAD）为 **左半 0.541 / 右半 17.115**——黑 mask 区几乎逐像素锁定，白 mask 区开始变化但重绘幅度受 `strength` 限制。
+  - `strength=1.0`：MAD **左半 0.981 / 右半 88.468**。左半 RGB 均值从参考的 `(62.2, 87.6, 155.3)` 到输出的 `(61.4, 87.5, 155.7)`，蓝色底与白圆完整保留；右半从 `(220.0, 120.0, 40.0)` 变为 `(171.0, 180.0, 193.2)`，橙色被完全替换成雪地场景与红狐，`comparison_strength1.png` 目视确认。
+  - 两组数据由同一脚本按 2 像素步长采样计算，构成 mask 语义（白区重绘 / 黑区保持参考轨迹）与 WanGP `denoising_strength` 步数比例语义的直接证据：右半 MAD 随 `strength` 从 0.6 → 1.0 放大约 5.2 倍，左半始终 < 1。
+- 验证产物落在 `artifacts/edit-verify/`（被 `.gitignore` 忽略），验证后清理；`native/build-verify/` 同样为一次性构建目录，不进版本库。真实编辑效果仍需要 CUDA 构建 + 权重，参考后端只做确定性字节对照。
+
+阶段 16 本机验证结果（本轮新增）：
+
+- `dotnet build QwenZImage.NET.sln -c Release` 0 警告 0 错误（5 项目）；`dotnet test` **86 + 33 = 119** 全绿。Windows 参考后端 `ctest` **1/1**；`scripts\build-native-cuda.bat 89`（默认 `native/build-cuda`，单 SM 8.9）23/23 链接 + `ctest` **1/1**；`gcc -std=c11 -Wall -Wextra -Inative/include -c integration/custom_backend_template.c` 通过；`git diff --check` 干净（仅 CRLF 提示）。
+- `objdump -p artifacts/native/Windows-AMD64-cuda/QwenZImageNative.dll` 确认导出 `qzi_abi_features` / `qzi_generate_qwen21_edit` / `qzi_generate_zimage_control` / `qzi_qwen21_edit_layout` / `qzi_zimage_control_layout` 五个增量符号；`dotnet pack` 产出 16 项 `.nupkg` 与 `.snupkg`，包内两个 RID native 仍为参考后端（115,875 B DLL / 38,440 B SO）。
+- WebUI 以 CUDA 后端启动（`QZI_NATIVE_LIBRARY` 指向 `artifacts/native/Windows-AMD64-cuda/QwenZImageNative.dll`、`QZI_REQUIRE_REAL_BACKEND=1`、`--urls http://127.0.0.1:17860`），`/api/health` 返回 `ok=true`、`supports_image_editing=true`、`supports_controlnet=true`、`reference_backend=false`、`native_library_source=QZI_NATIVE_LIBRARY`。
+- **真实 CUDA ControlNet 真图矩阵（512×512 / bf16 / seed 42 / 8 steps / prompt「a red fox walking through fresh snow, cinematic light」）**：控制图为脚本生成的 8 位非隔行 RGB PNG（A = pose 风格火柴人 2,352 B；B = canny 风格网格 6,545 B），经 `POST /api/jobs` 的 `model=zimage-control` + `control_image` / `control_type` / `control_scale` 提交。四例均产出 787,072 B 的 512×512 RGB PNG、`state=done`、`error=null`，phase 含 `ImageEncode`（控制图 VAE 编码）与 `Dit`。
+  - `control_a`（pose / 0.65）SHA-256 `bbe49c89…`；`control_b`（canny / 0.65）`fad022be…`，两者 MAD **61.108** —— 不同控制图得到不同结果，hint 确实进入主 DiT。
+  - `control_a_lowscale`（同图 / 0.05）`b42698e3…`，对 `control_a` MAD **99.296** —— `control_scale` 生效。
+  - `t2i_baseline`（`model=zimage`、无控制图）`57bc5d16…`，对 `control_a` MAD **99.140**；其 SHA-256 与修复前单独跑的 t2i 探针完全一致，`control_a` 的 SHA-256 也与修复前成功复跑的结果完全一致 —— 普通 t2i 路径与 hint 注入的数值均未被改动。
+  - 两次**全新进程冷启动**（停掉 WebUI 后重启，`resident_model=none`）把 ControlNet 作为第一个请求提交，均一次成功；修复前该场景在首个 `Dit` 步报 `denoise: cannot stage Z-Image GPU input`。
+- **修复的根因与改动**：`engine/src/qzen_zimage_dit.c` 的 `qzen_zimage_block_forward_gpu_host()` 每次调用都 `malloc(seq*dim*2)` 再 `free`，而 ControlNet 每个去噪步要跑约 50 次 block forward（15 control layers 两遍 + 2+2 refiner + 主 DiT）；叠加常驻 DiT / Union 2.1 双份主机与设备权重后进程私有提交量约 45 GiB，CRT 堆上的大块分配在首次冷启动时偶发返回 `NULL`。改为让 `qzen_zimage_gpu` 持有一个 grow-only 的 `host_stage` 缓冲：在 `qzen_zimage_gpu_reserve()` 中按 `plane = seq*dim` 一次性分配并给出带行数 / MiB 的明确错误，`zimg_read_bf16_f32()` 与 `qzen_zimage_t_embedder_forward_gpu()` 复用同一缓冲，`qzen_zimage_gpu_free()` 统一释放。`qzen_gpu_tensor_from_bf16()` / `qzen_gpu_tensor_read_bf16()` 都是同步 `cudaMemcpy`，因此 H2D 上传与 D2H 下载复用同一主机缓冲是安全的。修复后首个请求 phase 为 `ModelLoad → Text → ModelLoad → ImageEncode → Dit → Encode`，无失败。
+- 验证产物（控制图 / 输出 PNG、`report.json`、一次性 `verify.py` / `finish.py`）落在 `artifacts/control-verify/`，被 `.gitignore` 忽略；`native/build-cuda/` 为本地构建目录，同样不进版本库。验证完成后 RID staging 已用 `scripts/stage-native.sh` 恢复为参考后端。
+
 ## 4. 交付物清单
 
 ```
@@ -168,14 +194,17 @@ QwenZImage.NET/
 │   ├─ src/qzi_env.c              Win32 实时环境 / POSIX getenv 双实现
 │   ├─ src/qzi_engine_backend.c   真实引擎 in-process 适配器
 │   └─ tests/                     C ABI smoke（含作用域环境断言）+ POSIX ICU 双路径检查
-├─ engine/                       vendored + 改名的真实 C/CUDA 推理引擎（64 文件）
+├─ engine/                       vendored + 改名的真实 C/CUDA 推理引擎
 │   ├─ src/, platform/win32/, platform/posix/, third_party/, cmake/, CMakeLists.txt
+│   ├─ src/qzen_zimage_control.c/.h  ControlNet Union 2.x 权重加载 / GPU 上传
 │   └─ LICENSE / UPSTREAM.md     上游 MIT 许可与来源说明
 ├─ src/QwenZImage.NET/            NuGet 包体
-│   ├─ Configuration/QziConfig.cs         配置文件加载器
-│   └─ Configuration/NativeConfigScope.cs  QZI_* 作用域发布 / 还原
-├─ src/QwenZImage.NET.WebUI/      跨平台手动测试 WebUI（不打包）
-├─ tests/                         73 个 xUnit 测试（62 库 + 11 WebUI）
+│   ├─ Configuration/QziConfig.cs         配置文件加载器（含 zimage_control_dir）
+│   ├─ Configuration/NativeConfigScope.cs  QZI_* 作用域发布 / 还原（6 个目录变量）
+│   ├─ Models/QziRasterImage.cs            无依赖 PNG 解码 / 平面 RGB8 栅格（编辑 / 控制图）
+│   └─ Models/GenerationOptions.cs        Qwen21EditOptions / ZImageControlOptions
+├─ src/QwenZImage.NET.WebUI/      跨平台手动测试 WebUI（不打包，含编辑与 ControlNet 模式）
+├─ tests/                         119 个 xUnit 测试（86 库 + 33 WebUI）
 ├─ samples/                       端到端示例
 ├─ integration/                   自定义 qzi_backend 模板
 ├─ tools/RealImageRegression/     真图回归 harness（需 GPU + 权重，不进 sln / CI）
@@ -247,7 +276,9 @@ git push origin v0.1.0
 - [ ] `artifacts/` 下所有产物均被 `.gitignore` 忽略；待推送的 tree 只含源码、文档、配置、脚本与 CI 定义
 - [ ] `docs/NATIVE_ABI.md` 与 `AbiGuard` 的版本号一致（v1；`QZI_LORA_NAME_MAX` 只是输入校验常量，不升版本）
 - [ ] LoRA 契约在 `qzi.h` / `qzi.c` / `RequestValidator.cs` / `docs/PARAMETERS.md` / WebUI 五处一致：两个 tier 均可用、≤ 255 字节裸文件名、`lora_scale == 0.0f` sentinel、scale finite 且 `0.05..4`
-- [ ] `QZI_*` 作用域契约在 `NativeConfigScope.Variables` / `qzen_config.c:env_overrides[]` / `qzi_stub.c:config_fingerprint()` 三处变量表一致；native 配置读取统一用 `qzi_getenv()`，不出现裸 `getenv("QZI_...")`
+- [ ] 两个增量能力在 `qzi.h`（feature 位 / request 布局）/ `qzi.c`（归一化）/ `qzi_backend.h`（末尾槽位顺序）/ `AbiGuard.cs` / `RequestValidator.cs` / WebUI `RequestMapper.cs` 六处一致；`qzi_abi_features()` 返回 `0x3`，`integration/custom_backend_template.c` 末尾两个槽都是 `NULL`
+- [ ] `control_type` 白名单、`control_scale` sentinel（0 → 0.65，`0.05..2.0`）与 `zimage_control_dir` 配置链在 `qzi.c` / `QziConfig.cs` / `NativeConfigScope.Variables` / `qzen_config.c:env_overrides[]` / `docs/PARAMETERS.md` / WebUI 六处一致
+- [ ] `QZI_*` 作用域契约在 `NativeConfigScope.Variables` / `qzen_config.c:env_overrides[]` / `qzi_stub.c:config_fingerprint()` 三处变量表一致（现为 6 个目录变量）；native 配置读取统一用 `qzi_getenv()`，不出现裸 `getenv("QZI_...")`
 - [ ] `dotnet pack` 包内包含 `README.md` / `LICENSE` / `THIRD_PARTY_NOTICES.md` / `engine/LICENSE` / `docs/*.md`
 - [ ] 包内同时包含 `lib/net10.0/QwenZImage.NET.dll`、`runtimes/win-x64/native/QwenZImageNative.dll`、`runtimes/linux-x64/native/libQwenZImageNative.so`
 - [ ] `.snupkg` 符号包可上传、SourceLink 指向公开仓库
@@ -260,8 +291,11 @@ git push origin v0.1.0
 2. **真实引擎已实现**：`native/src/qzi_engine_backend.c` 完整实现 `qzi_backend`，编排参考上游 `serve_execute_qwen21()` / `serve_execute_zimage()`，PNG 直接在内存里编码而非临时文件。多 checkpoint（Z-Image bf16 / Nunchaku r32 / r256）、LoRA scale 变化、base tier 与 1024×1024 已在阶段 12d 用 `tools/RealImageRegression` 10-case 矩阵回归通过；该工具需要 GPU + 权重，**不进 CI**，CI 仍只跑参考后端。
 3. **平台**：参考库 Windows / Linux 均已构建、`ctest` 通过；真实 CUDA 后端也已在 Windows（MSVC 19.51 + CUDA 13.3）与 Linux（WSL Debian 12 / GCC 12.2 + CUDA 13.0）双平台实测，默认 fat binary 各 11 个 SM，`ctest` Windows 1/1、Linux 3/3（含 POSIX ICU 双路径测试）。WSL 自带 CUDA 13.0，但 `nvcc` 不在默认 PATH，构建前需 `export PATH=/usr/local/cuda/bin:$PATH`。Linux 产物不再依赖版本化 ICU。**按用户明确要求「不需要适配 macOS」，macOS 不在开发范围内**（POSIX 兼容层虽可探测 `libicuuc.N.dylib`，但 CMake 仍链接 `stdc++`，若将来启用需换成 `c++`）。
 4. **CI 不含 GPU**：CI 只构建参考后端；真实后端由使用方或带 GPU 的自托管 runner 构建。
-5. **ABI 演进**：任何结构体/签名/所有权变化都必须升 `QZI_ABI_VERSION`，并同步 `NativeStructs.cs` 与 `AbiGuard`。
+5. **ABI 演进**：任何**既有**结构体 / 签名 / 所有权 / phase 语义变化都必须升 `QZI_ABI_VERSION`，并同步 `NativeStructs.cs` 与 `AbiGuard`。新增可选能力优先用独立导出 + 能力位表达（阶段 15 的图像编辑、阶段 16 的 ControlNet 均如此，仍为 v1）；新增一个仅伴随新能力出现的可选 phase 字面量（`"image encode"`）也属于 additive，因为托管侧把未知字面量降级为 `GenerationPhase.Unknown`，旧库根本不会上报它。
 6. **异步语义**：native 调用本质同步长任务，`Generate*Async` 是 `Task.Run` 外壳；高并发行走 `QziGenerationQueue`，不要用多个 `QziClient` 抢同一张 GPU。
 7. **配置通道的平台差异**：`QZI_*` 仍靠进程级环境变量传递（ABI v1 没有这些字段），但已通过作用域发布 + create 时快照消除串扰。Windows 上 **CRT 的 `getenv()` 读不到 .NET 之后设置的值**，所有 native 配置读取必须走 `qzi_getenv()`；自定义 backend 若直接 `getenv("QZI_*")`，在 Windows 上会静默失效。Windows 路径字节沿用进程 ANSI 代码页（与 `fopen` 一致），含非 ASCII 的路径建议写进配置文件。
 8. **进程级 GPU 资源仍未隔离**：`CUDA_VISIBLE_DEVICES`、CUDA 上下文与常驻权重是进程/设备级资源；作用域配置不能让两个 `QziClient` 安全共享同一张卡，仍须按 #6 串行化。彻底的 per-client GPU 隔离需要独立进程，当前不在范围内。
 9. **Trusted Publishing 依赖外部配置**：OIDC 换 key 依赖 nuget.org 上的 policy 与 GitHub 仓库 secret `NUGET_USER`；policy 的 owner / repo / workflow file / environment 必须与 `dongfangzhizhu/QwenZImage.NET` 和 `release.yml` 精确一致，改仓库归属或工作流文件名都要同步更新 policy，否则发布会在 login 步骤失败。仓库内不保存长期密钥，因此本机手动 push 需要另备个人 API key。
+10. **图像编辑的已知边界**：只支持 8 位非隔行灰阶 / RGB / RGBA PNG（含 base64 data URL）作为参考图 / mask，透明参考像素按白底合成、透明 mask 像素按 0 处理；参考图每边 ≤ 4096、总像素 ≤ `2048×2048`。mask 是**硬笔刷**语义（16×16 面积均值收缩到 1/16 latent 网格后 `> 64` 二值化），不做羽化 / 抗锯齿；`strength` 采用 WanGP 的**步数比例**规则而非 sigma 阈值。编辑只作用于 Qwen-Image 2.1，且**一张参考图 + 可选 mask**：WanGP `qwen21_handler.py` 还支持最多 10 张有序参考图与 `<image1>...<imageN>` prompt 模板、outpainting、RGBA 边界、编辑 LoRA、LanPaint `model_modes`、prompt enhancer `EDITING` 以及 20B edit / edit_plus / layered 等变体，这些尚未纳入本库（都需 ABI 再扩展与模型权重）。Z-Image 的对应增量能力是 **ControlNet（见 #11）**，不提供 mask 重绘 / inpaint / outpainting 入口；参考后端只做确定性字节对照，**不产出可看的编辑效果**，真实效果验证仍需 CUDA 构建 + 权重。
+11. **Z-Image ControlNet 的已知边界**：仅支持 Union **v2 / v2.1**（33 通道 `[control_latent(16) | keep_mask(1) | inpaint_latent(16)]`、15 control layers + 2 独立 noise refiner），v1（16 通道）在权重加载时明确拒绝；`keep_mask` 与 `inpaint_latent` 恒为 0，因此没有 inpaint / outpainting 能力（WanGP v2/v2.1 的 mask inpaint 同样标注 "disabled for the moment"）。`control_type` 只是描述性元数据，**不运行** pose / canny / depth / scribble 预处理器，对齐 WanGP `guide_preprocessing = "V"`；`control_scale` 默认 `0.65`（WanGP Union 2.1 的 `control_net_weight_alt`，v1/v2 习惯 `0.75`，可显式覆盖）。Union 2.1 权重约 3.7 GiB，叠加常驻 DiT / 文本塔后 24 GiB 卡可能 GPU 上传失败并回退 CPU hint 路径（正确但更慢）；双份主机 / 设备权重使 WebUI 进程私有提交量在本机（32 GiB RAM + RTX 4090）约 45 GiB，内存较小的机器仍需留意。未配置 `zimage_control_dir` 时真实后端返回 `QZI_ERR_NOT_CONFIGURED`，参考后端只做确定性字节对照。阶段 16 已把逐 block 的主机 staging 改为 `qzen_zimage_gpu` 内 grow-only 的共享缓冲，消除了冷启动首个 ControlNet 请求偶发的 `cannot stage Z-Image GPU input`（详见「阶段 16 本机验证结果」）。
+12. **能力探测与降级**：`qzi_abi_features()` 当前内置两个后端都返回 `0x3`（`QZI_FEATURE_QWEN21_EDIT | QZI_FEATURE_ZIMAGE_CONTROL`）。旧 native 库缺导出时 `AbiGuard` 让 `SupportsImageEditing` / `SupportsControlNet` 为 `false`，WebUI 会禁用对应模式并在提交前返回 `400`；自定义 backend 把 vtable 末尾两个槽留 `NULL` 时得到 `QZI_ERR_UNSUPPORTED`。要注意 `supports_controlnet == true` 只说明**符号与布局存在**，不等于权重已配置——真实后端仍可能因缺 `zimage_control_dir` 返回 `QZI_ERR_NOT_CONFIGURED`。

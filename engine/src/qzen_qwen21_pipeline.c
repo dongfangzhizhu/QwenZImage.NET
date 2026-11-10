@@ -28,20 +28,24 @@ int qzen_qwen21_sigmas_turbo(float *sigmas) {
     return QZEN_QWEN21_TURBO_STEPS + 1;
 }
 
-/* Edit start: the first schedule point at or below `strength`. strength 1.0
- * lands on sigmas[0] == 1.0, where the blend below is exactly the noise, so a
- * text-to-image request takes the same path with nothing added to the result.
- * When no sigma is low enough (a strength below the last step's sigma) the
- * answer is the last step: an edit that starts at the last step is one step of
- * work, which is the closest thing to "change almost nothing" the schedule can
- * offer. Returning 0 there would silently run the whole schedule instead. */
+/* Edit start = WanGP's denoising_strength rule:
+ *     first_step = min(int(steps * (1 - strength)), steps - 1)
+ * strength 1.0 is text-to-image (no step skipped); smaller values start that
+ * many steps closer to the end. The earlier upstream rule searched for the
+ * first sigma <= strength, which is NOT equivalent: the turbo schedule is
+ * highly non-linear, so strength 0.75 landed on step 6 of 8 (only two steps
+ * of work) instead of WanGP's step 2. Keeping the step-based rule also makes
+ * the reference backend's phase trace agree with the real engine.
+ * `sigmas` is kept in the signature for source compatibility with the vendored
+ * upstream API; the schedule is still used for the blend and the Euler loop. */
 int qzen_qwen21_edit_start(const float *sigmas, int steps, float strength) {
-    if (!sigmas || steps <= 0) return 0;
+    (void)sigmas;
+    if (steps <= 0) return 0;
     if (!(strength > 0.0f) || strength > 1.0f) strength = 1.0f;
-    for (int step = 0; step < steps; step++) {
-        if (sigmas[step] <= strength) return step;
-    }
-    return steps - 1;
+    int first_step = (int)((double)steps * (1.0 - (double)strength));
+    if (first_step >= steps) first_step = steps - 1;
+    if (first_step < 0) first_step = 0;
+    return first_step;
 }
 
 int qzen_qwen21_sigmas_base(int steps, int image_tokens, float *sigmas) {
@@ -81,8 +85,13 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
                               char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!dit || !vae || !sample || !rgb || !sample->text || !sample->latent || !sample->sigmas ||
-        sample->steps <= 0 || sample->height <= 0 || sample->width <= 0) {
-        snprintf(error, error_size, "invalid Qwen-Image 2.1 sampling request");
+        sample->steps <= 0 || sample->height <= 0 || sample->width <= 0 ||
+        (sample->latent_mask && !sample->init_latent)) {
+        if (sample && sample->latent_mask && !sample->init_latent)
+            snprintf(error, error_size,
+                     "a latent mask requires an encoded reference image");
+        else
+            snprintf(error, error_size, "invalid Qwen-Image 2.1 sampling request");
         return 0;
     }
     const int tokens = sample->height * sample->width;
@@ -102,11 +111,11 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
         goto done;
     }
     memcpy(grid, sample->latent, (size_t)Q21_LATENT_CHANNELS * tokens * sizeof(float));
-    /* Edit start: pick the first schedule point at or below `strength`, then
-     * blend the reference latent into the noise at that sigma. strength 1.0
-     * lands on sigmas[0] == 1.0, where the blend is exactly the noise, so a
-     * text-to-image request takes the same code path with no arithmetic added
-     * to the result (0 * init + 1 * noise). */
+    /* Edit start is WanGP's step ratio (qzen_qwen21_edit_start), not a sigma
+     * threshold: blend the reference latent into the noise at that schedule
+     * point. strength 1.0 starts at step 0 where sigmas[0] == 1.0, so the blend
+     * is exactly the noise and a text-to-image request takes the same code
+     * path with no arithmetic added (0 * init + 1 * noise). */
     int first_step = 0;
     if (sample->init_latent) {
         first_step = qzen_qwen21_edit_start(sample->sigmas, sample->steps, sample->strength);
@@ -115,6 +124,20 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
             grid[index] = (1.0f - sigma) * sample->init_latent[index] +
                           sigma * sample->latent[index];
         }
+    }
+    /* WanGP masked_steps = ceil((steps - first_step) * masking_strength):
+     * for that many steps the BLACK (mask == 0) latent cells are pinned to the
+     * reference trajectory, while the WHITE cells are free to be regenerated.
+     * The ABI layer normalises masking_strength to 1.0 when a mask is present;
+     * the fallback keeps direct engine callers from silently dropping it. */
+    int masked_steps = 0;
+    if (sample->latent_mask) {
+        float fraction = sample->masking_strength;
+        if (!(fraction > 0.0f) || fraction > 1.0f) fraction = 1.0f;
+        const int remaining = sample->steps - first_step;
+        masked_steps = (int)ceil((double)remaining * (double)fraction);
+        if (masked_steps > remaining) masked_steps = remaining;
+        if (masked_steps < 1) masked_steps = 1;
     }
     for (int step = first_step; step < sample->steps; step++) {
         const float sigma = sample->sigmas[step];
@@ -147,6 +170,22 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
             for (int channel = 0; channel < Q21_LATENT_CHANNELS; channel++) {
                 const size_t index = (size_t)token * Q21_LATENT_CHANNELS + channel;
                 grid[(size_t)channel * tokens + token] += delta * positive[index];
+            }
+        }
+        /* WanGP: known = original * (1 - sigma_next) + noise * sigma_next;
+         * latents = known * (1 - mask) + latents * mask. The grid is channel
+         * major, the mask is token major [height*width]. Only the first
+         * masked_steps iterations pin the unmasked cells; after that the whole
+         * image evolves freely so the regenerated area blends in. */
+        if (sample->latent_mask && step < first_step + masked_steps) {
+            const float keep = 1.0f - next;
+            for (int token = 0; token < tokens; token++) {
+                if (sample->latent_mask[token]) continue;
+                for (int channel = 0; channel < Q21_LATENT_CHANNELS; channel++) {
+                    const size_t index = (size_t)channel * tokens + token;
+                    grid[index] = keep * sample->init_latent[index] +
+                                  next * sample->latent[index];
+                }
             }
         }
     }

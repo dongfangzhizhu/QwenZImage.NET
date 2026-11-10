@@ -113,6 +113,47 @@ input:disabled, select:disabled, textarea:disabled { opacity: .5; cursor: not-al
 .btn-icon { padding: 6px 9px; }
 .note { color: var(--muted); font-size: 11.5px; margin: 12px 0 0; line-height: 1.55; }
 
+/* Author display rules (.grid-2, .edit-block, ...) would otherwise beat the
+ * UA [hidden] rule, so model-specific field groups must be forced hidden. */
+[hidden] { display: none !important; }
+
+/* Qwen-Image 2.1 image editing: reference preview + paint-to-mask overlay. */
+.section-title { margin: 2px 0 12px; font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
+.edit-block { border-top: 1px solid var(--border); padding-top: 14px; margin: 4px 0 16px; }
+.edit-empty { margin: 0; }
+.edit-note { margin: 10px 0 12px; }
+input[type="range"] { width: 100%; padding: 0; accent-color: var(--accent); }
+input[type="file"] { width: 100%; font-size: 12px; color: var(--muted); }
+.button-row { display: flex; gap: 6px; flex-wrap: wrap; margin: -4px 0 12px; }
+.mask-stage {
+  position: relative; width: 100%; border: 1px solid var(--border);
+  border-radius: 8px; overflow: hidden; background: var(--panel-soft); line-height: 0;
+}
+.mask-stage img { display: block; width: 100%; height: auto; }
+.mask-stage canvas {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: .6; cursor: crosshair; touch-action: none;
+}
+.job-edit-badge {
+  display: inline-block; margin-left: 5px; padding: 1px 5px; border-radius: 4px;
+  background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 650;
+}
+.job-control-badge {
+  display: inline-block; margin-left: 5px; padding: 1px 5px; border-radius: 4px;
+  background: var(--ok-soft); color: var(--ok); font-size: 10px; font-weight: 650;
+}
+
+/* Z-Image Turbo Fun ControlNet Union: preprocessed control image preview and
+   inline config hints (reuses .edit-block for the section chrome). */
+.control-preview {
+  display: block; width: 100%; height: auto; max-height: 240px; object-fit: contain;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel-soft); line-height: 0; margin: 0 0 10px;
+}
+.control-block code {
+  background: rgba(127, 127, 127, .16); padding: 1px 4px; border-radius: 3px; font-size: 11px;
+}
+
 .pill {
   display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 11.5px;
   font-weight: 650; border: 1px solid var(--border); background: var(--panel-soft);

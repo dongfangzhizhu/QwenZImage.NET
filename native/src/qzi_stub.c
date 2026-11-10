@@ -34,6 +34,9 @@ typedef struct stub_state {
     char   tier[16];
     char   lora[QZI_LORA_NAME_MAX + 1];
     float  lora_scale;
+    /* Switching between plain Z-Image and the ControlNet Union pack reloads
+     * the DiT on the real backend; mirror that phase here. */
+    int    zimage_control;
     /* Snapshot of the process-wide QZI_* config as seen at create time, so a
      * reference engine behaves like the real one: changing the environment
      * afterwards must not change this engine's output. */
@@ -80,7 +83,8 @@ static uint64_t config_fingerprint(const qzi_engine_config *config)
 {
     static const char *const names[] = {
         "QZI_CONFIG", "QZI_QWEN21_DIR", "QZI_ZIMAGE_DIR",
-        "QZI_QWEN21_LORA_DIR", "QZI_ZIMAGE_NUNCHAKU_DIR", "QZI_MODEL_CACHE"
+        "QZI_QWEN21_LORA_DIR", "QZI_ZIMAGE_NUNCHAKU_DIR",
+        "QZI_ZIMAGE_CONTROL_DIR", "QZI_MODEL_CACHE"
     };
     uint64_t tag = 0x434F4E464947ULL; /* "CONFIG" */
     char value[2048];
@@ -110,10 +114,11 @@ static uint64_t next_rand(uint64_t *state)
 }
 
 /* Runs the same coarse phase sequence as the real backend: model load (when the
- * resident model changes), text, dit (step/steps), vae, encode. */
+ * resident model changes), text, [image encode for edits / ControlNet], dit
+ * (step/steps), vae, encode. */
 static qzi_status run_phases(const qzi_callbacks *callbacks, double start,
                              qzi_model_kind model, int switched,
-                             int32_t steps, stub_state *state,
+                             int32_t steps, int editing, stub_state *state,
                              char *error, size_t error_cap)
 {
     int32_t i;
@@ -129,6 +134,17 @@ static qzi_status run_phases(const qzi_callbacks *callbacks, double start,
     if (qzi_cancelled(callbacks)) {
         qzi_set_error(error, error_cap, "cancelled during text encoding");
         return QZI_ERR_CANCELLED;
+    }
+    if (editing) {
+        /* VAE-encoding the reference / control image is a distinct,
+         * minute-scale stage on the real backend; report it so the UI does
+         * not look stuck. */
+        qzi_emit_progress(callbacks, "image encode", 0, 1, start);
+        if (qzi_cancelled(callbacks)) {
+            qzi_set_error(error, error_cap, "cancelled during image encoding");
+            return QZI_ERR_CANCELLED;
+        }
+        qzi_emit_progress(callbacks, "image encode", 1, 1, start);
     }
     for (i = 0; i < steps; i++) {
         qzi_emit_progress(callbacks, "dit", i, steps, start);
@@ -249,17 +265,37 @@ static void stub_release_image(void *context, qzi_image *image)
     if (image && image->data) free((void *)image->data);
 }
 
-static qzi_status stub_generate_qwen21(void *context,
-                                       const qzi_qwen21_request *request,
-                                       const qzi_callbacks *callbacks,
-                                       qzi_image *out_image,
-                                       char *error, size_t error_cap)
+/* Hash a whole caller-owned pixel buffer into the deterministic tag. Editing
+ * must be observable without a GPU: two different reference images, two masks
+ * or two strengths have to produce different bytes. */
+static uint64_t hash_bytes(const uint8_t *data, size_t size)
+{
+    uint64_t h = 14695981039346656037ULL;
+    size_t i;
+    for (i = 0; i < size; i++) {
+        h ^= (uint64_t)data[i];
+        h *= 1099511628211ULL;
+    }
+    return h ^ (uint64_t)size;
+}
+
+/* Shared qwen21 implementation. `edit` is NULL for plain text-to-image; when
+ * present, the deterministic tag mixes in the reference/mask/strength and the
+ * dit phase only reports the steps actually re-run (WanGP's first_step). */
+static qzi_status stub_generate_qwen21_impl(void *context,
+                                            const qzi_qwen21_request *base,
+                                            const qzi_qwen21_edit_request *edit,
+                                            const qzi_callbacks *callbacks,
+                                            qzi_image *out_image,
+                                            char *error, size_t error_cap)
 {
     stub_state *s = (stub_state *)context;
     qzi_status status;
     uint8_t *rgb, *png;
     size_t png_size = 0;
+    const qzi_qwen21_request *request = edit ? &edit->base : base;
     int32_t steps = request->steps > 0 ? request->steps : 8;
+    int32_t run_steps = steps;
     const char *tier = request->tier && *request->tier ? request->tier : "turbo";
     const char *lora = request->lora ? request->lora : "";
     int switched = (s->resident != QZI_MODEL_QWEN21) ||
@@ -276,20 +312,137 @@ static qzi_status stub_generate_qwen21(void *context,
     tag ^= float_bits(request->lora_scale) * 0x94D049BB133111EBULL;
     tag ^= s->config_tag;
 
-    status = qzi_validate_qwen21(request, error, error_cap);
+    /* Validate BEFORE touching any caller-owned pixel buffer: even though the
+     * ABI layer already validated this request, a backend can also be called
+     * directly by an integrator, and a bogus reference_width must not turn
+     * into an out-of-bounds read in hash_bytes(). */
+    status = edit ? qzi_validate_qwen21_edit(edit, error, error_cap)
+                  : qzi_validate_qwen21(request, error, error_cap);
     if (status != QZI_OK) return status;
+
+    if (edit) {
+        const size_t ref_pixels = (size_t)edit->reference_width *
+                                  (size_t)edit->reference_height;
+        /* Mirror WanGP's first_step = int(steps * (1 - denoising_strength))
+         * so the reference backend's progress trace matches the edit semantics
+         * even on GPU-less CI. The real engine uses the same step-based rule
+         * (qzen_qwen21_edit_start), so both agree on every strength. */
+        int32_t first_step = (int32_t)((double)steps *
+                                       (1.0 - (double)edit->strength));
+        if (first_step >= steps) first_step = steps - 1;
+        if (first_step < 0) first_step = 0;
+        run_steps = steps - first_step;
+        tag ^= 0x45444954494E4731ULL; /* "EDITING1" */
+        tag ^= hash_bytes(edit->reference_rgb, 3u * ref_pixels) *
+               0x9E3779B97F4A7C15ULL;
+        if (edit->mask)
+            tag ^= hash_bytes(edit->mask, ref_pixels) * 0xBF58476D1CE4E5B9ULL;
+        tag ^= float_bits(edit->strength) * 0x94D049BB133111EBULL;
+        tag ^= float_bits(edit->masking_strength) * 0xD6E8FEB86659FD93ULL;
+        tag ^= (uint64_t)edit->reference_width << 32 ^
+               (uint64_t)edit->reference_height;
+    }
     if (!s->qwen21_dir) {
         qzi_set_error(error, error_cap,
                       "qwen21 model pack is not configured (qwen21_dir)");
         return QZI_ERR_NOT_CONFIGURED;
     }
-    status = run_phases(callbacks, start, QZI_MODEL_QWEN21, switched, steps, s,
-                        error, error_cap);
+    status = run_phases(callbacks, start, QZI_MODEL_QWEN21, switched, run_steps,
+                        edit != NULL, s, error, error_cap);
     if (status != QZI_OK) return status;
 
     snprintf(s->tier, sizeof(s->tier), "%s", tier);
     snprintf(s->lora, sizeof(s->lora), "%s", lora);
     s->lora_scale = request->lora_scale;
+
+    rgb = make_rgb(request->prompt, (uint32_t)request->width,
+                   (uint32_t)request->height, request->seed, tag,
+                   error, error_cap);
+    if (!rgb) return QZI_ERR_OUT_OF_MEMORY;
+    png = qzi_png_encode_rgb8(rgb, (uint32_t)request->width,
+                              (uint32_t)request->height, &png_size,
+                              error, error_cap);
+    free(rgb);
+    if (!png) return QZI_ERR_ENGINE;
+
+    memset(out_image, 0, sizeof(*out_image));
+    out_image->data = png;
+    out_image->size = png_size;
+    out_image->width = (uint32_t)request->width;
+    out_image->height = (uint32_t)request->height;
+    return QZI_OK;
+}
+
+static qzi_status stub_generate_qwen21(void *context,
+                                       const qzi_qwen21_request *request,
+                                       const qzi_callbacks *callbacks,
+                                       qzi_image *out_image,
+                                       char *error, size_t error_cap)
+{
+    return stub_generate_qwen21_impl(context, request, NULL, callbacks,
+                                     out_image, error, error_cap);
+}
+
+static qzi_status stub_generate_qwen21_edit(void *context,
+                                            const qzi_qwen21_edit_request *request,
+                                            const qzi_callbacks *callbacks,
+                                            qzi_image *out_image,
+                                            char *error, size_t error_cap)
+{
+    return stub_generate_qwen21_impl(context, NULL, request, callbacks,
+                                     out_image, error, error_cap);
+}
+
+/* Shared Z-Image implementation. `control` is NULL for plain text-to-image;
+ * when present, the deterministic tag mixes in the control image pixels, the
+ * canonical control type and the context scale, and the phase trace gains the
+ * "image encode" stage (the real backend VAE-encodes the control image). */
+static qzi_status stub_generate_zimage_impl(void *context,
+                                            const qzi_zimage_request *base,
+                                            const qzi_zimage_control_request *control,
+                                            const qzi_callbacks *callbacks,
+                                            qzi_image *out_image,
+                                            char *error, size_t error_cap)
+{
+    stub_state *s = (stub_state *)context;
+    qzi_status status;
+    uint8_t *rgb, *png;
+    size_t png_size = 0;
+    const qzi_zimage_request *request = control ? &control->base : base;
+    int switched = (s->resident != QZI_MODEL_ZIMAGE) ||
+                   s->zimage_control != (control != NULL);
+    double start = qzi_now_seconds();
+    uint64_t tag = 0x5A494D4147ULL ^
+                   qzi_fnv1a(request->checkpoint ? request->checkpoint : "bf16") ^
+                   s->config_tag;
+
+    /* Validate BEFORE hashing any caller-owned pixel buffer (an integrator may
+     * call the backend directly with a bogus control_width). */
+    status = control ? qzi_validate_zimage_control(control, error, error_cap)
+                     : qzi_validate_zimage(request, error, error_cap);
+    if (status != QZI_OK) return status;
+    if (!s->zimage_dir) {
+        qzi_set_error(error, error_cap,
+                      "zimage model pack is not configured (zimage_dir)");
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    if (control) {
+        const size_t pixels = (size_t)control->control_width *
+                              (size_t)control->control_height;
+        tag ^= 0x4354524C32315F31ULL; /* "CTRL21_1" */
+        tag ^= hash_bytes(control->control_rgb, 3u * pixels) *
+               0x9E3779B97F4A7C15ULL;
+        tag ^= qzi_fnv1a(control->control_type ? control->control_type : "auto") *
+               0xBF58476D1CE4E5B9ULL;
+        tag ^= float_bits(control->control_scale) * 0x94D049BB133111EBULL;
+        tag ^= (uint64_t)control->control_width << 32 ^
+               (uint64_t)control->control_height;
+    }
+    /* Turbo: fixed 8-step schedule, no user-supplied steps/guidance. */
+    status = run_phases(callbacks, start, QZI_MODEL_ZIMAGE, switched, 8,
+                        control != NULL, s, error, error_cap);
+    if (status != QZI_OK) return status;
+    s->zimage_control = control != NULL;
 
     rgb = make_rgb(request->prompt, (uint32_t)request->width,
                    (uint32_t)request->height, request->seed, tag,
@@ -315,44 +468,18 @@ static qzi_status stub_generate_zimage(void *context,
                                       qzi_image *out_image,
                                       char *error, size_t error_cap)
 {
-    stub_state *s = (stub_state *)context;
-    qzi_status status;
-    uint8_t *rgb, *png;
-    size_t png_size = 0;
-    int switched = (s->resident != QZI_MODEL_ZIMAGE);
-    double start = qzi_now_seconds();
-    uint64_t tag = 0x5A494D4147ULL ^
-                   qzi_fnv1a(request->checkpoint ? request->checkpoint : "bf16") ^
-                   s->config_tag;
+    return stub_generate_zimage_impl(context, request, NULL, callbacks,
+                                     out_image, error, error_cap);
+}
 
-    status = qzi_validate_zimage(request, error, error_cap);
-    if (status != QZI_OK) return status;
-    if (!s->zimage_dir) {
-        qzi_set_error(error, error_cap,
-                      "zimage model pack is not configured (zimage_dir)");
-        return QZI_ERR_NOT_CONFIGURED;
-    }
-    /* Turbo: fixed 8-step schedule, no user-supplied steps/guidance. */
-    status = run_phases(callbacks, start, QZI_MODEL_ZIMAGE, switched, 8, s,
-                        error, error_cap);
-    if (status != QZI_OK) return status;
-
-    rgb = make_rgb(request->prompt, (uint32_t)request->width,
-                   (uint32_t)request->height, request->seed, tag,
-                   error, error_cap);
-    if (!rgb) return QZI_ERR_OUT_OF_MEMORY;
-    png = qzi_png_encode_rgb8(rgb, (uint32_t)request->width,
-                              (uint32_t)request->height, &png_size,
-                              error, error_cap);
-    free(rgb);
-    if (!png) return QZI_ERR_ENGINE;
-
-    memset(out_image, 0, sizeof(*out_image));
-    out_image->data = png;
-    out_image->size = png_size;
-    out_image->width = (uint32_t)request->width;
-    out_image->height = (uint32_t)request->height;
-    return QZI_OK;
+static qzi_status stub_generate_zimage_control(void *context,
+                                              const qzi_zimage_control_request *request,
+                                              const qzi_callbacks *callbacks,
+                                              qzi_image *out_image,
+                                              char *error, size_t error_cap)
+{
+    return stub_generate_zimage_impl(context, NULL, request, callbacks,
+                                     out_image, error, error_cap);
 }
 
 const qzi_backend qzi_reference_vtable = {
@@ -364,7 +491,9 @@ const qzi_backend qzi_reference_vtable = {
     stub_generate_zimage,
     stub_health,
     stub_unload,
-    stub_release_image
+    stub_release_image,
+    stub_generate_qwen21_edit,
+    stub_generate_zimage_control
 };
 
 /* The vtable's context pointer must be per-engine, not a global: qzi.c copies

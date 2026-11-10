@@ -15,6 +15,12 @@ internal static unsafe partial class NativeMethods
     internal const uint ExpectedAbiVersion = 1;
     internal const int ErrorCapacity = 512;
 
+    /// <summary>Capability bit for Qwen-Image 2.1 image editing.</summary>
+    internal const uint FeatureQwen21Edit = 0x1u;
+
+    /// <summary>Capability bit for Z-Image Turbo Fun ControlNet Union.</summary>
+    internal const uint FeatureZImageControl = 0x2u;
+
     [LibraryImport(LibraryName, EntryPoint = "qzi_abi_version")]
     internal static partial uint AbiVersion();
 
@@ -53,6 +59,35 @@ internal static unsafe partial class NativeMethods
                                                QziCallbacks* callbacks,
                                                QziImage* image,
                                                byte* error, nuint errorCap);
+
+    /// <summary>
+    /// Additive in ABI v1. Older libraries do not export this symbol, so the
+    /// source-generated stub is resolved lazily: never call it until
+    /// <see cref="AbiGuard.Qwen21EditSupported"/> has confirmed the export
+    /// exists (otherwise an EntryPointNotFoundException escapes).
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "qzi_generate_qwen21_edit")]
+    internal static partial int GenerateQwen21Edit(IntPtr engine,
+                                                   QziQwen21EditRequest* request,
+                                                   QziCallbacks* callbacks,
+                                                   QziImage* image,
+                                                   byte* error, nuint errorCap);
+
+    /// <summary>
+    /// Additive in ABI v1. Older libraries do not export this symbol, so the
+    /// source-generated stub is resolved lazily: never call it until
+    /// <see cref="AbiGuard.ZImageControlSupported"/> has confirmed the export
+    /// exists (otherwise an EntryPointNotFoundException escapes). The layout
+    /// export <c>qzi_zimage_control_layout</c> is probed on demand with
+    /// <c>NativeLibrary.TryGetExport</c> in <see cref="AbiGuard"/> rather than
+    /// bound here, matching the image-edit capability probe.
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "qzi_generate_zimage_control")]
+    internal static partial int GenerateZImageControl(IntPtr engine,
+                                                      QziZImageControlRequest* request,
+                                                      QziCallbacks* callbacks,
+                                                      QziImage* image,
+                                                      byte* error, nuint errorCap);
 
     [LibraryImport(LibraryName, EntryPoint = "qzi_image_release")]
     internal static partial void ImageRelease(IntPtr engine, QziImage* image);

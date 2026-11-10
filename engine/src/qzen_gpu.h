@@ -836,6 +836,14 @@ int qzen_gpu_gqa_causal_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
 int qzen_gpu_add_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
                     const qzen_gpu_tensor *left, const qzen_gpu_tensor *right,
                     uint32_t elements);
+/* output = left + alpha * right, BF16 in / BF16 out with F32 accumulation.
+ * `output` may alias `left` (the ControlNet hint injection adds a skip
+ * connection to the hidden states in place). alpha is the WanGP
+ * control_context_scale (0.65 for Union2.1). */
+int qzen_gpu_scale_add_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
+                            const qzen_gpu_tensor *left,
+                            const qzen_gpu_tensor *right,
+                            uint32_t elements, float alpha);
 int qzen_gpu_sub_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
                     const qzen_gpu_tensor *left, const qzen_gpu_tensor *right,
                     uint32_t elements);

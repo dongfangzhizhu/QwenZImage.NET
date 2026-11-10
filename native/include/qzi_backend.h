@@ -56,6 +56,27 @@ typedef struct qzi_backend {
     /* Free the buffer behind out_image->data. The ABI layer zeroes the struct
      * afterwards. */
     void       (*release_image)(void *context, qzi_image *image);
+
+    /* Optional, additive in ABI v1: Qwen-Image 2.1 image editing. A backend
+     * that leaves this NULL reports QZI_ERR_UNSUPPORTED from
+     * qzi_generate_qwen21_edit() while t2i keeps working unchanged. This field
+     * was LAST before ControlNet; both optional fields stay at the END of the
+     * vtable so an integrator that recompiles against this header (required)
+     * keeps every existing slot at the same offset. */
+    qzi_status (*generate_qwen21_edit)(void *context,
+                                       const qzi_qwen21_edit_request *request,
+                                       const qzi_callbacks *callbacks,
+                                       qzi_image *out_image,
+                                       char *error, size_t error_cap);
+
+    /* Optional, additive in ABI v1: Z-Image Turbo Fun ControlNet Union. NULL
+     * makes qzi_generate_zimage_control() report QZI_ERR_UNSUPPORTED while the
+     * three older generate paths keep working unchanged. */
+    qzi_status (*generate_zimage_control)(void *context,
+                                          const qzi_zimage_control_request *request,
+                                          const qzi_callbacks *callbacks,
+                                          qzi_image *out_image,
+                                          char *error, size_t error_cap);
 } qzi_backend;
 
 /* Filled in by the built-in deterministic reference backend. Exposed so an

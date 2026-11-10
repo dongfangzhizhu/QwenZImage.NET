@@ -1101,17 +1101,22 @@ static uint16_t zimg_f32_to_bf16(float value) {
     return (uint16_t)(bits >> 16);
 }
 
-/* Download a BF16 tensor into an F32 host buffer. */
-static int zimg_read_bf16_f32(const qzen_gpu_tensor *tensor, float *out,
+/* Defined with the GPU context below; shared by the block and t_embedder
+ * H2D/D2H round trips. */
+static uint16_t *zgu_host_stage(qzen_zimage_gpu *zgu, size_t elements);
+
+/* Download a BF16 tensor into an F32 host buffer, using the GPU context's
+ * reusable staging buffer. */
+static int zimg_read_bf16_f32(qzen_zimage_gpu *zgu,
+                              const qzen_gpu_tensor *tensor, float *out,
                               size_t count) {
-    uint16_t *staged = malloc(count * 2);
+    uint16_t *staged = zgu_host_stage(zgu, count);
     if (!staged) return 0;
     int ok = qzen_gpu_tensor_read_bf16(tensor, staged, count);
     if (ok) {
         for (size_t index = 0; index < count; index++)
             out[index] = zimg_bf16_to_f32(staged[index]);
     }
-    free(staged);
     return ok;
 }
 
@@ -1149,7 +1154,29 @@ struct qzen_zimage_gpu {
     /* [rows, rank] scratch for the SVDQuant low-rank branch. */
     qzen_gpu_tensor *lora;
     size_t lora_elements;
+    /* Reusable BF16 host staging for the per-block H2D/D2H round trips.
+     * qzen_zimage_block_forward_gpu_host() is called ~50 times per ControlNet
+     * denoise step; a fresh seq*dim malloc on every call fragments the CRT
+     * heap next to the ~20 GiB of resident DiT + Union 2.1 weights and can
+     * fail transiently with "cannot stage Z-Image GPU input". Grown only when
+     * the reserved row count grows, never freed in the hot path. */
+    uint16_t *host_stage;
+    size_t host_stage_elements;
 };
+
+/* Grow the shared BF16 staging buffer to `elements`. All the GPU tensor
+ * upload/read helpers below use synchronous cudaMemcpy, so the buffer can be
+ * reused for an upload and then for a download within the same block. */
+static uint16_t *zgu_host_stage(qzen_zimage_gpu *zgu, size_t elements) {
+    if (!zgu || !elements) return NULL;
+    if (elements <= zgu->host_stage_elements) return zgu->host_stage;
+    uint16_t *grown = (uint16_t *)malloc(elements * sizeof(*grown));
+    if (!grown) return NULL;
+    free(zgu->host_stage);
+    zgu->host_stage = grown;
+    zgu->host_stage_elements = elements;
+    return grown;
+}
 
 qzen_zimage_gpu *qzen_zimage_gpu_create(const qzen_zimage_config *config,
                                     char *error, size_t error_size) {
@@ -1226,6 +1253,9 @@ void qzen_zimage_gpu_free(qzen_zimage_gpu *zgu) {
     if (zgu->lora) qzen_gpu_tensor_free(zgu->lora);
     zgu->lora = NULL;
     zgu->lora_elements = 0;
+    free(zgu->host_stage);
+    zgu->host_stage = NULL;
+    zgu->host_stage_elements = 0;
     if (zgu->gpu) qzen_gpu_free(zgu->gpu);
     free(zgu);
 }
@@ -1270,6 +1300,15 @@ int qzen_zimage_gpu_reserve(qzen_zimage_gpu *zgu, uint32_t seq,
     zimg_gpu_release_scratch(zgu);
     size_t plane = (size_t)seq * dim;
     size_t wide = (size_t)seq * config->ffn_dim;
+    /* Allocate the host staging buffer once, up front, while the failure is
+     * still attributable to scratch reservation rather than to a random
+     * block forward in the middle of a denoise step. */
+    if (!zgu_host_stage(zgu, plane)) {
+        zimg_fail(error, error_size,
+                  "cannot allocate Z-Image host staging buffer for %u rows "
+                  "(%.1f MiB)", seq, (double)(plane * 2) / 1048576.0);
+        return 0;
+    }
     zgu->normed = qzen_gpu_tensor_new_bf16(zgu->gpu, plane);
     zgu->q = qzen_gpu_tensor_new_bf16(zgu->gpu, plane);
     zgu->k = qzen_gpu_tensor_new_bf16(zgu->gpu, plane);
@@ -1865,16 +1904,17 @@ int qzen_zimage_block_forward_gpu_host(const qzen_zimage_block *block,
         return 0;
     }
     free(mod_raw);
-    uint16_t *staged = malloc(count * 2);
+    uint16_t *staged = zgu_host_stage(zgu, count);
     if (!staged) {
-        zimg_fail(error, error_size, "cannot stage Z-Image GPU input");
+        zimg_fail(error, error_size,
+                  "cannot stage Z-Image GPU input (%u rows x %u dim, %.1f MiB)",
+                  seq, dim, (double)(count * 2) / 1048576.0);
         return 0;
     }
     for (size_t index = 0; index < count; index++)
         staged[index] = zimg_f32_to_bf16(x[index]);
     qzen_gpu_tensor *x_gpu =
         qzen_gpu_tensor_from_bf16(zgu->gpu, staged, count);
-    free(staged);
     if (!x_gpu) {
         zimg_fail(error, error_size, "cannot upload Z-Image GPU input: %s",
                   qzen_gpu_error(zgu->gpu));
@@ -1886,7 +1926,7 @@ int qzen_zimage_block_forward_gpu_host(const qzen_zimage_block *block,
                                                           : NULL,
                                          zgu->rope_cos, zgu->rope_sin,
                                          error, error_size) &&
-             zimg_read_bf16_f32(x_gpu, x, count) &&
+             zimg_read_bf16_f32(zgu, x_gpu, x, count) &&
              qzen_gpu_submit(zgu->gpu);
     qzen_gpu_tensor_free(x_gpu);
     if (!ok && (!error || !*error))
@@ -1906,7 +1946,7 @@ int qzen_zimage_t_embedder_forward_gpu(const qzen_zimage_t_embedder *embedder,
     size_t in_count = (size_t)rows * embedder->fc1.in;
     size_t mid_count = (size_t)rows * mid;
     size_t out_count = (size_t)rows * out;
-    uint16_t *in_bf16 = malloc(in_count * 2);
+    uint16_t *in_bf16 = zgu_host_stage(zgu, in_count);
     if (!in_bf16) {
         zimg_fail(error, error_size, "cannot stage t_embedder input");
         return 0;
@@ -1914,7 +1954,6 @@ int qzen_zimage_t_embedder_forward_gpu(const qzen_zimage_t_embedder *embedder,
     for (size_t index = 0; index < in_count; index++)
         in_bf16[index] = zimg_f32_to_bf16(input[index]);
     qzen_gpu_tensor *input_gpu = qzen_gpu_tensor_from_bf16(zgu->gpu, in_bf16, in_count);
-    free(in_bf16);
     qzen_gpu_tensor *hidden = qzen_gpu_tensor_new_bf16(zgu->gpu, mid_count);
     qzen_gpu_tensor *out_gpu = qzen_gpu_tensor_new_bf16(zgu->gpu, out_count);
     if (!input_gpu || !hidden || !out_gpu) {
@@ -1928,7 +1967,7 @@ int qzen_zimage_t_embedder_forward_gpu(const qzen_zimage_t_embedder *embedder,
              zimg_linear_gpu(zgu, hidden, input_gpu, &embedder->fc1, rows) &&
              qzen_gpu_silu_bf16(zgu->gpu, hidden, hidden, mid_count) &&
              zimg_linear_gpu(zgu, out_gpu, hidden, &embedder->fc2, rows) &&
-             zimg_read_bf16_f32(out_gpu, output, out_count) &&
+             zimg_read_bf16_f32(zgu, out_gpu, output, out_count) &&
              qzen_gpu_submit(zgu->gpu);
     qzen_gpu_tensor_free(input_gpu);
     qzen_gpu_tensor_free(hidden);

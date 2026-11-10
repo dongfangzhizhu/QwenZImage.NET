@@ -46,6 +46,7 @@ typedef struct {
 qzen_zpipe_config qzen_zpipe_default_config(void);
 
 typedef struct qzen_zimage_pipeline qzen_zimage_pipeline;
+typedef struct qzen_zimage_control qzen_zimage_control;
 
 /* Load the quanto qint8 DiT checkpoint (plus its plain-BF16 refiners,
  * embedders, pad tokens and final layer) from the single-file directory
@@ -104,6 +105,39 @@ void qzen_zpipe_init_latents(uint64_t seed, uint32_t channels, uint32_t lh,
 int qzen_zpipe_denoise(const qzen_zimage_pipeline *pipe, const float *cap_feats,
                      uint32_t cap_len, float *latents, uint32_t latent_h,
                      uint32_t latent_w,
+                     void (*progress)(uint32_t step, uint32_t steps),
+                     char *error, size_t error_size);
+
+/* --- Z-Image Turbo Fun ControlNet Union (additive ABI v1, stage 16) -------
+ *
+ * Prepare the ControlNet weights for this pipeline. On a GPU build this
+ * uploads them into the DiT's GPU context; on failure (e.g. not enough VRAM)
+ * the hint path falls back to the CPU block forward. Host weights always stay
+ * resident. `control` is owned by the caller and must outlive every
+ * qzen_zpipe_denoise_control() call. */
+int qzen_zpipe_control_prepare(qzen_zimage_pipeline *pipe,
+                               qzen_zimage_control *control,
+                               char *error, size_t error_size);
+
+/* Build the 33-channel (v2.x) or 16-channel (v1) ControlNet context from a
+ * VAE-encoded, normalized control latent [16, lh, lw]. Returns a malloc-ed
+ * [in_dim, lh, lw] F32 array, or NULL. v2.x concatenates
+ * [control_latent(16) | keep_mask(1, all zeros) | inpaint_latent(16, zeros)],
+ * exactly like WanGP pipeline_z_image.py with no inpaint mask. */
+float *qzen_zpipe_control_context(const qzen_zimage_control *control,
+                                  const float *control_latent,
+                                  uint32_t latent_h, uint32_t latent_w,
+                                  char *error, size_t error_size);
+
+/* Denoise with ControlNet conditioning. `control_context` is the array above
+ * (caller-owned); `context_scale` scales every skip connection (WanGP's
+ * control_context_scale, 0.65 for Union2.1). Plain t2i uses
+ * qzen_zpipe_denoise() and never pays for any of this. */
+int qzen_zpipe_denoise_control(const qzen_zimage_pipeline *pipe,
+                     qzen_zimage_control *control,
+                     const float *control_context, float context_scale,
+                     const float *cap_feats, uint32_t cap_len,
+                     float *latents, uint32_t latent_h, uint32_t latent_w,
                      void (*progress)(uint32_t step, uint32_t steps),
                      char *error, size_t error_size);
 

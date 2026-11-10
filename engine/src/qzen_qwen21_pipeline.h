@@ -28,9 +28,10 @@ int qzen_qwen21_sigmas_base(int steps, int image_tokens, float *sigmas);
 /* The eight released turbo sigmas plus the trailing zero. */
 int qzen_qwen21_sigmas_turbo(float *sigmas);
 
-/* Index of the first schedule point at or below `strength`, i.e. where an edit
- * starts. strength 1.0 gives 0 (text-to-image); a strength below the last
- * sigma gives steps - 1 (one step of work), never 0. */
+/* WanGP denoising_strength -> first denoise step to re-run:
+ * min(int(steps * (1 - strength)), steps - 1). strength 1.0 gives 0
+ * (text-to-image), the smallest strengths still leave one step of work.
+ * `sigmas` is accepted for upstream source compatibility but not used here. */
 int qzen_qwen21_edit_start(const float *sigmas, int steps, float strength);
 
 typedef struct {
@@ -52,6 +53,17 @@ typedef struct {
      * parameterisation the Euler loop integrates. */
     const float *init_latent;
     float strength;
+    /* WanGP-style masked inpainting (mode 0, "Masked Denoising"). The mask is
+     * one byte per LATENT cell [height*width]: 1 = regenerate (white in the
+     * user's mask), 0 = keep the reference trajectory (black). During the
+     * first ceil((steps - first_step) * masking_strength) denoise steps the
+     * 0 cells are reset to
+     *     known = (1 - sigmas[step+1]) * init_latent + sigmas[step+1] * noise,
+     * exactly like models/qwen21/pipeline.py. Requires init_latent.
+     * Both fields are appended, so existing positional initialisers keep their
+     * meaning and a NULL / 0 pair is a plain img2img edit. */
+    const uint8_t *latent_mask;
+    float masking_strength;
 } qzen_qwen21_sample;
 
 /* Phase progress for the resident service: "dit" with (step, steps) before each
@@ -59,7 +71,8 @@ typedef struct {
 typedef void (*qzen_qwen21_progress)(const char *phase, int completed, int total,
                                    void *opaque);
 
-/* Denoise and decode; rgb is [3][4*height][4*width]. on_progress may be NULL. */
+/* Denoise and decode; rgb is [3][16*height][16*width] (the DiT grid is already
+ * at 1/16 resolution, so this is the requested canvas). on_progress may be NULL. */
 int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
                               const qzen_qwen21_sample *sample, unsigned char *rgb,
                               qzen_qwen21_progress on_progress, void *opaque,

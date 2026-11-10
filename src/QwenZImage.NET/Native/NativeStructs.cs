@@ -42,6 +42,25 @@ internal unsafe struct QziQwen21Request
     public uint Flags;
 }
 
+/// <summary>
+/// Additive ABI v1 image-edit request: the ordinary qwen21 request followed by
+/// the reference/mask pointers and the two WanGP strengths. Field order and
+/// packing must match <c>qzi_qwen21_edit_request</c> in native/include/qzi.h;
+/// <see cref="AbiGuard"/> verifies sizeof() against qzi_qwen21_edit_layout().
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct QziQwen21EditRequest
+{
+    public QziQwen21Request Base;
+    public byte* ReferenceRgb;
+    public uint ReferenceWidth;
+    public uint ReferenceHeight;
+    public byte* Mask;
+    public float Strength;
+    public float MaskingStrength;
+    public uint Flags;
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct QziZImageRequest
 {
@@ -50,6 +69,25 @@ internal unsafe struct QziZImageRequest
     public int Width;
     public int Height;
     public ulong Seed;
+    public uint Flags;
+}
+
+/// <summary>
+/// Additive ABI v1 Z-Image Turbo Fun ControlNet Union request: the ordinary
+/// zimage request followed by the planar control image, its dimensions, the
+/// control type string, the control scale and reserved flags. Field order and
+/// packing must match <c>qzi_zimage_control_request</c> in native/include/qzi.h;
+/// <see cref="AbiGuard"/> verifies sizeof() against qzi_zimage_control_layout().
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct QziZImageControlRequest
+{
+    public QziZImageRequest Base;
+    public byte* ControlRgb;
+    public uint ControlWidth;
+    public uint ControlHeight;
+    public byte* ControlType;
+    public float ControlScale;
     public uint Flags;
 }
 

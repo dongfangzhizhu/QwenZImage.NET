@@ -33,6 +33,11 @@ typedef pthread_mutex_t qzi_mutex;
 #define QZI_MAX_PROMPT_BYTES 16384u
 #define QZI_MAX_CANVAS_SIDE  2048
 #define QZI_MAX_PIXELS       (2048LL * 2048LL)
+#define QZI_MAX_REFERENCE_SIDE 4096u
+#define QZI_EDIT_DEFAULT_STRENGTH 0.75f
+#define QZI_CONTROL_DEFAULT_SCALE 0.65f
+#define QZI_CONTROL_MAX_SCALE    2.0f
+#define QZI_CONTROL_MIN_SCALE    0.05f
 
 struct qzi_engine {
     qzi_backend     backend;
@@ -301,6 +306,76 @@ static void qzi_normalize_qwen21(const qzi_qwen21_request *request,
         out->lora_scale = 1.0f;
 }
 
+qzi_status qzi_validate_qwen21_edit(const qzi_qwen21_edit_request *request,
+                                    char *error, size_t error_cap)
+{
+    qzi_status s;
+    if (!request) {
+        qzi_set_error(error, error_cap, "qwen21 edit request is NULL");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->flags != 0) {
+        qzi_set_error(error, error_cap, "qwen21 edit request flags must be 0");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    s = qzi_validate_qwen21(&request->base, error, error_cap);
+    if (s != QZI_OK) return s;
+    if (!request->reference_rgb) {
+        qzi_set_error(error, error_cap,
+                      "reference_rgb is required for image editing");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->reference_width == 0 || request->reference_height == 0 ||
+        request->reference_width > QZI_MAX_REFERENCE_SIDE ||
+        request->reference_height > QZI_MAX_REFERENCE_SIDE ||
+        (int64_t)request->reference_width * (int64_t)request->reference_height >
+            QZI_MAX_PIXELS) {
+        qzi_set_error_fmt(error, error_cap,
+            "reference image must be 1..%u pixels per side and at most 2048*2048 total pixels",
+            (unsigned)QZI_MAX_REFERENCE_SIDE);
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    /* NaN/Inf fail both comparisons and are rejected, not coerced. */
+    if (request->strength != 0.0f &&
+        !(request->strength >= 0.05f && request->strength <= 1.0f)) {
+        qzi_set_error(error, error_cap,
+            "strength must be finite and in 0.05..1.0 (or 0 for the engine default 0.75)");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->masking_strength != 0.0f &&
+        !(request->masking_strength >= 0.05f &&
+          request->masking_strength <= 1.0f)) {
+        qzi_set_error(error, error_cap,
+            "masking_strength must be finite and in 0.05..1.0 (or 0 for 1.0)");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (!request->mask && request->masking_strength != 0.0f) {
+        qzi_set_error(error, error_cap,
+            "masking_strength requires mask; otherwise it would be silently dropped");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    return QZI_OK;
+}
+
+/* Resolve the two edit sentinels once, before any backend sees the request,
+ * so C and .NET callers agree on the effective values. */
+static void qzi_normalize_qwen21_edit(const qzi_qwen21_edit_request *request,
+                                      qzi_qwen21_edit_request *out)
+{
+    qzi_normalize_qwen21(&request->base, &out->base);
+    out->reference_rgb = request->reference_rgb;
+    out->reference_width = request->reference_width;
+    out->reference_height = request->reference_height;
+    out->mask = request->mask;
+    out->strength = request->strength == 0.0f
+                        ? QZI_EDIT_DEFAULT_STRENGTH : request->strength;
+    out->masking_strength = request->mask
+                                ? (request->masking_strength == 0.0f
+                                       ? 1.0f : request->masking_strength)
+                                : 0.0f;
+    out->flags = 0;
+}
+
 qzi_status qzi_validate_zimage(const qzi_zimage_request *request,
                                char *error, size_t error_cap)
 {
@@ -337,6 +412,94 @@ qzi_status qzi_validate_zimage(const qzi_zimage_request *request,
     return QZI_OK;
 }
 
+/* ---- Z-Image ControlNet Union (additive ABI v1) -------------------------- */
+
+/* The Union checkpoint is trained on pre-processed control images; the type
+ * is descriptive metadata. Normalising it here (case-insensitively) means a
+ * C caller, the .NET wrapper and the reference backend all agree on one
+ * canonical string, so "PoSe" and "pose" produce byte-identical results. */
+static int qzi_ascii_ieq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++, cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+        if (ca != cb) return 0;
+    }
+    return *a == *b;
+}
+
+static const char *qzi_normalize_control_type(const char *type)
+{
+    static const char *const names[] = {
+        "auto", "pose", "canny", "depth", "scribble", "raw"
+    };
+    if (!type || !*type) return names[0];
+    if (strlen(type) > 32) return NULL;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (qzi_ascii_ieq(type, names[i])) return names[i];
+    }
+    return NULL;
+}
+
+qzi_status qzi_validate_zimage_control(const qzi_zimage_control_request *request,
+                                       char *error, size_t error_cap)
+{
+    qzi_status s;
+    if (!request) {
+        qzi_set_error(error, error_cap, "zimage control request is NULL");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->flags != 0) {
+        qzi_set_error(error, error_cap, "zimage control request flags must be 0");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    s = qzi_validate_zimage(&request->base, error, error_cap);
+    if (s != QZI_OK) return s;
+    if (!request->control_rgb) {
+        qzi_set_error(error, error_cap,
+                      "control_rgb is required for ControlNet generation");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->control_width == 0 || request->control_height == 0 ||
+        request->control_width > QZI_MAX_REFERENCE_SIDE ||
+        request->control_height > QZI_MAX_REFERENCE_SIDE ||
+        (int64_t)request->control_width * (int64_t)request->control_height >
+            QZI_MAX_PIXELS) {
+        qzi_set_error_fmt(error, error_cap,
+            "control image must be 1..%u pixels per side and at most 2048*2048 total pixels",
+            (unsigned)QZI_MAX_REFERENCE_SIDE);
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (!qzi_normalize_control_type(request->control_type)) {
+        qzi_set_error(error, error_cap,
+            "control_type must be null/auto/pose/canny/depth/scribble/raw");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    /* NaN/Inf fail both comparisons and are rejected, not coerced. */
+    if (request->control_scale != 0.0f &&
+        !(request->control_scale >= QZI_CONTROL_MIN_SCALE &&
+          request->control_scale <= QZI_CONTROL_MAX_SCALE)) {
+        qzi_set_error(error, error_cap,
+            "control_scale must be finite and in 0.05..2.0 (or 0 for the engine default 0.65)");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    return QZI_OK;
+}
+
+/* Resolve the scale sentinel and canonicalise the type once, before any
+ * backend sees the request, so C and .NET callers agree on effective values. */
+static void qzi_normalize_zimage_control(const qzi_zimage_control_request *request,
+                                         qzi_zimage_control_request *out)
+{
+    *out = *request;
+    out->control_type = qzi_normalize_control_type(request->control_type);
+    out->control_scale = request->control_scale == 0.0f
+                             ? QZI_CONTROL_DEFAULT_SCALE
+                             : request->control_scale;
+    out->flags = 0;
+}
+
 /* ---- backend registration ---------------------------------------------- */
 
 #ifdef QZI_HAS_REAL_BACKEND
@@ -362,6 +525,21 @@ static void ensure_backend(void)
 QZI_API uint32_t qzi_abi_version(void)
 {
     return QZI_ABI_VERSION;
+}
+
+QZI_API uint32_t qzi_abi_features(void)
+{
+    return QZI_FEATURE_QWEN21_EDIT | QZI_FEATURE_ZIMAGE_CONTROL;
+}
+
+QZI_API size_t qzi_qwen21_edit_layout(void)
+{
+    return sizeof(qzi_qwen21_edit_request);
+}
+
+QZI_API size_t qzi_zimage_control_layout(void)
+{
+    return sizeof(qzi_zimage_control_request);
 }
 
 QZI_API const char *qzi_status_text(qzi_status status)
@@ -599,6 +777,70 @@ QZI_API qzi_status qzi_generate_zimage(qzi_engine *engine,
     if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
     status = engine->backend.generate_zimage(engine->context, request, callbacks,
                                              out_image, error, error_cap);
+    return generation_leave(engine, status, out_image, QZI_MODEL_ZIMAGE,
+                            error, error_cap);
+}
+
+QZI_API qzi_status qzi_generate_qwen21_edit(qzi_engine *engine,
+                                             const qzi_qwen21_edit_request *request,
+                                             const qzi_callbacks *callbacks,
+                                             qzi_image *out_image,
+                                             char *error, size_t error_cap)
+{
+    qzi_status status;
+    qzi_qwen21_edit_request normalized;
+    if (!engine || !out_image || !error || error_cap == 0) {
+        qzi_set_error(error, error_cap,
+                      "engine, out_image and error buffer are required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_image, 0, sizeof(*out_image));
+    error[0] = '\0';
+    status = qzi_validate_qwen21_edit(request, error, error_cap);
+    if (status != QZI_OK) { engine->rejected++; return status; }
+    if (!engine->backend.generate_qwen21_edit) {
+        engine->rejected++;
+        qzi_set_error(error, error_cap,
+                      "the registered native backend does not implement image editing");
+        return QZI_ERR_UNSUPPORTED;
+    }
+    qzi_normalize_qwen21_edit(request, &normalized);
+    if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
+    status = engine->backend.generate_qwen21_edit(engine->context, &normalized,
+                                                  callbacks, out_image, error,
+                                                  error_cap);
+    return generation_leave(engine, status, out_image, QZI_MODEL_QWEN21,
+                            error, error_cap);
+}
+
+QZI_API qzi_status qzi_generate_zimage_control(qzi_engine *engine,
+                                                const qzi_zimage_control_request *request,
+                                                const qzi_callbacks *callbacks,
+                                                qzi_image *out_image,
+                                                char *error, size_t error_cap)
+{
+    qzi_status status;
+    qzi_zimage_control_request normalized;
+    if (!engine || !out_image || !error || error_cap == 0) {
+        qzi_set_error(error, error_cap,
+                      "engine, out_image and error buffer are required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_image, 0, sizeof(*out_image));
+    error[0] = '\0';
+    status = qzi_validate_zimage_control(request, error, error_cap);
+    if (status != QZI_OK) { engine->rejected++; return status; }
+    if (!engine->backend.generate_zimage_control) {
+        engine->rejected++;
+        qzi_set_error(error, error_cap,
+                      "the registered native backend does not implement Z-Image ControlNet");
+        return QZI_ERR_UNSUPPORTED;
+    }
+    qzi_normalize_zimage_control(request, &normalized);
+    if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
+    status = engine->backend.generate_zimage_control(engine->context, &normalized,
+                                                     callbacks, out_image, error,
+                                                     error_cap);
     return generation_leave(engine, status, out_image, QZI_MODEL_ZIMAGE,
                             error, error_cap);
 }

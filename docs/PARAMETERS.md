@@ -3,7 +3,7 @@
 本文件是 `QwenZImage.NET` 参数规则的唯一说明。规则在两处实现并保持完全一致：
 
 - 托管侧：`src/QwenZImage.NET/Validation/RequestValidator.cs`（先于 native 调用失败，避免分钟级模型加载）
-- native 侧：`native/src/qzi.c` 的 `qzi_validate_qwen21()` / `qzi_validate_zimage()`（保护直接从 C/C++ 调用 ABI 的集成方）
+- native 侧：`native/src/qzi.c` 的 `qzi_validate_qwen21()` / `qzi_validate_qwen21_edit()` / `qzi_validate_zimage()`（保护直接从 C/C++ 调用 ABI 的集成方）
 
 两者不一致时以 `native/include/qzi.h` 的注释和本文件为准，并应视为缺陷修复。
 
@@ -51,6 +51,40 @@
 
 `qzen_qwen21_apply_lora()` 会把 adapter 就地合并进 INT8 权重。因此**切换 adapter、改变 scale、或去掉 LoRA 都需要重新加载 DiT**（分钟级），并上报一次 `"model load"` phase。真实后端在加载多 GB 权重**之前**先校验裸文件名与 `qwen21_lora_dir`；合并失败会关闭并清空 DiT，避免半合并权重被下一个无 LoRA 请求复用。参考后端同样跟踪 tier / adapter / scale 变化，让无 GPU 的测试也能验证这条状态机。
 
+## Qwen-Image 2.1 图像编辑（`Qwen21EditOptions`）
+
+`Qwen21EditOptions` 继承 `QwenImageOptions`，因此上表所有 t2i 规则（尺寸、tier、steps、guidance、LoRA、prompt）都继续适用；它用同一份 7B 权重编辑一张参考图，对齐 WanGP 的 img2img / 局部重绘语义。对应 native 结构体 `qzi_qwen21_edit_request`（`base` + 编辑字段），入口 `qzi_generate_qwen21_edit()`。
+
+| 字段 | 默认值 | 规则 |
+| --- | --- | --- |
+| `Reference` | **必填** | `QziRasterImage`，3 通道**平面** RGB8（`[R][G][B]` 三个 `W*H` 平面）。每边 `1..4096`，总像素 `≤ 2048×2048`。可用 `FromPlanar` / `FromInterleavedRgb` / `FromPng` / `FromPngBase64` 构造；PNG 支持 8 位非隔行灰阶 / RGB / RGBA，透明像素按白底合成 |
+| `Mask` | `null` | 可选，`QziRasterImage`，1 通道、尺寸必须与 `Reference` 完全一致（`FromPngMask` / `FromPngBase64(..., mask: true)` 把亮度×alpha 转成灰度）。**白色区域按 prompt 重绘，黑色区域保持参考轨迹**；native 侧缩放到 1/16 latent 网格并以 `> 64` 二值化 |
+| `Strength` | `null` → `0.75` | WanGP 的 `denoising_strength`：`0.05..1.0` 且必须有限。`1.0` 从纯噪声开始（≈ t2i），越小越贴近参考图。`EffectiveStrength` 是实际发送值 |
+| `MaskingStrength` | `null` → 有 mask 时 `1.0`，无 mask 时 `0` | `0.05..1.0` 且必须有限；表示剩余调度中把未遮罩 latent 恢复到参考轨迹的比例。**必须有 `Mask`**，否则会被静默丢弃，托管与 native 双侧都直接报错。`EffectiveMaskingStrength` 是实际发送值 |
+
+参考图与 mask 会先经过**居中裁剪的 cover fit** 缩放到 `Width × Height` 输出画布，所以不要求与输出同尺寸；两者用同一套裁剪，保证笔刷与像素对齐。若尺寸本来就一致，则不做重采样。
+
+### 编辑参数归一化（C 调用方必读）
+
+`qzi_generate_qwen21_edit()` 校验后复制一份请求并归一化，再把**副本**交给 backend；调用方结构体不变。两个后端看到的有效参数因此一致：
+
+| 字段 | 输入 sentinel | 归一化结果 |
+| --- | --- | --- |
+| `strength` | `0.0f` | `0.75f`（`QZI_EDIT_DEFAULT_STRENGTH`） |
+| `masking_strength`（有 `mask`） | `0.0f` | `1.0f` |
+| `masking_strength`（无 `mask`） | 必须恰好 `0.0f` | 保持 `0.0f`（不做遮罩恢复） |
+
+**非法值一律拒绝，不静默 coerce**：负数、NaN / Inf、`> 1.0`、`< 0.05`、无 mask 却带 `masking_strength`、`flags != 0`、缺 `reference_rgb`、参考图超限，均返回 `QZI_ERR_INVALID_ARGUMENT`。`.NET` 侧 `RequestValidator.Validate(Qwen21EditOptions)` 先于 native 调用执行同一套规则，避免把非法请求送进分钟级模型加载；能力探测失败（`SupportsImageEditing == false`）抛 `NotSupportedException`。
+
+### 编辑语义与对齐 WanGP
+
+- **强度 → 起点步**：`first_step = int(steps * (1 - strength))`，只重跑剩余步数；turbo 8 步下 `strength=0.75` 从第 2 步起跑。参考后端也按此规则缩短 `dit` 步，让无 GPU 测试的 phase 序列与真实引擎一致。
+- **图像编辑唯一多出的一步是把参考图 VAE 编码成 latents**：真实后端用 `qzen_qwen21_vae_encode()` 编码（`qzen_qwen21_edit_start()` 以此为去噪起点），期间上报 `"image encode"` phase；文本编码、DiT 去噪、VAE 解码、PNG 编码全部复用 t2i 常驻管线。
+- **mask 恢复**：mask 白色区域自由重绘，黑色区域在 `masking_strength` 比例的剩余调度内被拉回参考轨迹，等价于 WanGP 的 `masking_strength` / `latent_mask` 语义。无 mask 时整张图按 `Strength` 编辑。
+- **确定性**：参考后端把参考图、mask、两个 strength 与参考尺寸一起纳入哈希，因此改任一参数都会改变输出字节；C smoke 用这一点验证参数是否真正贯通。
+
+WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`reference_image` / `mask_image` / `strength` / `masking_strength`）。
+
 ## Z-Image（`ZImageOptions`）
 
 | 字段 | 默认值 | 规则 |
@@ -61,6 +95,29 @@
 
 Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**没有** `steps`、`guidance`、`negative_prompt` 字段——这不是遗漏，而是模型本身的约束。对应 native 结构体 `qzi_zimage_request`。
 
+## Z-Image ControlNet Union（`ZImageControlOptions`）
+
+`ZImageControlOptions` 继承 `ZImageOptions`，因此上表所有 t2i 规则（16 的倍数、checkpoint）继续适用；它用 Z-Image Turbo Fun **ControlNet Union 2.1** 的一张控制图条件化生成，对齐 WanGP 的 `z_image_control2_1`。对应 native 结构体 `qzi_zimage_control_request`（`base` + 控制字段），入口 `qzi_generate_zimage_control()`，`.NET` 侧 `GenerateZImageControl(Async)`；老 native 库缺该能力时 `SupportsControlNet == false`，调用抛 `NotSupportedException`。
+
+| 字段 | 默认值 | 规则 |
+| --- | --- | --- |
+| `ControlImage` | **必填** | `QziRasterImage`，3 通道**平面** RGB8。每边 `1..4096`，总像素 `≤ 2048×2048`。与 `Reference` 共用 `FromPng` / `FromPngBase64` 等解码器；输出到画布时做**居中裁剪 cover fit** |
+| `ControlType` | `null` → `auto` | 大小写不敏感，合法值 `auto` / `pose` / `canny` / `depth` / `scribble` / `raw`；`EffectiveControlType` 返回规范后的小写值。**描述性元数据**：本库不运行姿态 / 边缘 / 深度估计器，对齐 WanGP `guide_preprocessing = "V"`，调用方需提供已预处理的控制图 |
+| `ControlScale` | `0`（sentinel）→ `0.65` | WanGP 的 `control_context_scale`（Union 2.1 默认 `0.65`；v1/v2 权重习惯 `0.75`）。`0.05..2.0` 且必须有限；`0` 与不设等价。`EffectiveControlScale` 是实际发送值 |
+
+归一化与校验：native 侧 `qzi_validate_zimage_control()` 先复用 `qzi_validate_zimage()` 校验 `base`，再校验控制图与两个控制字段；非法值（NaN / Inf、越界、未知 `control_type`、`flags != 0`、缺 `control_rgb`、尺寸超限）一律返回 `QZI_ERR_INVALID_ARGUMENT`，不静默 coerce。`.NET` 侧 `RequestValidator.Validate(ZImageControlOptions)` 先于 native 执行同一套规则。
+
+真实后端流程：懒加载 Union 2.1 权重（`zimage_control_dir`）→ VAE 编码控制图为 16 通道 1/8 latent → 拼成 **33 通道 control context**（`control_latent | keep_mask(全 0) | inpaint_latent(全 0)`）→ 每个去噪步重算 15 条 control layer skip + 2 条 noise refiner skip，并在主 DiT 对应层之后以 `control_scale` 注入。普通 t2i 完全不走这条路径。参考后端把控制图像素、规范后的 `control_type`、`control_scale` 与尺寸纳入确定性哈希，并多上报一个 `"image encode"` phase。
+
+边界：仅支持 Union **v2 / v2.1**（33 通道、15 control layers + 2 个独立 control noise refiner），v1（16 通道）在权重加载时明确拒绝；无 inpaint mask / outpainting 入口；约 3.7 GiB 权重叠加常驻 DiT + 文本塔，24 GiB 卡上可能触发 GPU 上传失败并回退 CPU hint 路径（结果正确但更慢）。未配置 `zimage_control_dir` 时真实后端返回 `QZI_ERR_NOT_CONFIGURED`。
+
+**与 WanGP 的两处取值核对**（避免把 UI 标签误当推理参数）：
+
+- `ControlScale = 0.65` 对应 WanGP `defaults/z_image_control2_1.json` 与 `settings/z_image_control2_1_settings.json` 的 `control_net_weight_alt`。实际传参链是 `wgp.py` 把该 UI 值装进 `context_scale[0]` → `z_image_main.py` 赋给 `control_context_scale` → `pipeline_z_image.py` 用作 hint 的缩放系数；后者函数签名里的 `0.75` 只是未被覆盖时的兜底（v1 / v2 的习惯值，`defaults/z_image_control*.json` 也确为 `0.75`）。本库只支持 33 通道权重且配置指向 **Union 2.1**，故默认取 `0.65`；若要复现 v2 的 `0.75`，显式传 `ControlScale = 0.75f` 即可，范围 `0.05..2.0` 已覆盖。
+- `control_type` 保留 `pose` / `canny` / `depth` / `scribble` / `raw`（`auto` 为默认别名）。WanGP 三份 `defaults/z_image_control*.json` 的 description 都写「Pose, Canny, Depth, and Scribble」；`z_image_handler.py` 的 `guide_preprocessing.selection = ["", "PV", "DV", "EV", "V"]` 描述的是**预处理方式**（姿态 / 深度 / 边缘 / 原始格式），不是控制类型枚举。本库固定走 `"V"`（Use Z-Image Raw Format），不运行任何预处理器，因此 `control_type` 只作为描述性元数据参与参数校验与确定性哈希，保留 `scribble` 不会造成推理行为偏差。
+
+WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`control_image` / `control_type` / `control_scale`，`model = "zimage-control"`）。
+
 ## 画布示例
 
 | 请求 | 结果 |
@@ -70,6 +127,10 @@ Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**�
 | Qwen21 `100×64` | ❌ 100 不是 32 的倍数 |
 | ZImage `1008×1008` | ❌ 1008 不是 16 的倍数 |
 | ZImage `1536×1536` | ✅ 合法，见 `QziPresets.ZImage` |
+| 编辑：参考图 `768×512` + 输出 `1024×1024`、无 mask | ✅ 合法，cover fit 后整图按 `Strength` 编辑 |
+| 编辑：`strength = 1.5` | ❌ 超出 `0.05..1.0`，托管 / native 双侧都拒绝 |
+| 编辑：`masking_strength = 0.5` 但没有 `Mask` | ❌ 会被静默丢弃，直接报错 |
+| 编辑：`Mask` 尺寸与 `Reference` 不一致 | ❌ 笔刷无法对齐，直接报错 |
 
 ## 预设
 
@@ -89,10 +150,11 @@ native 侧通过 `qzi_progress_fn` 上报的 `phase` 是**静态字面量**，�
 | --- | --- | --- |
 | `"model load"` | `ModelLoad` | 权重加载阶段 |
 | `"text"` | `Text` | 文本编码 |
-| `"dit"` | `Dit` | 去噪步数（Turbo 为 8 步） |
+| `"image encode"` | `ImageEncode` | **图像编辑 / Z-Image ControlNet**：把参考图或控制图 VAE 编码成 latents（0/1 → 1/1） |
+| `"dit"` | `Dit` | 去噪步数（Turbo 为 8 步；编辑时只跑 `steps - first_step` 步） |
 | `"vae"` | `Vae` | VAE 解码 |
 | `"encode"` | `Encode` | PNG 编码 |
 
-切换模型、tier、LoRA adapter 或 LoRA scale 都会触发一次 `"model load"`；参考后端也模拟这一行为，因此无 GPU 的测试能验证参数与重载的贯通。
+未识别的字面量会被托管侧降级为 `GenerationPhase.Unknown`，不会抛异常。切换模型、tier、LoRA adapter 或 LoRA scale 都会触发一次 `"model load"`；参考后端也模拟这一行为，因此无 GPU 的测试能验证参数与重载的贯通。
 
 取消通过 `qzi_cancel_fn` 在阶段/去噪步之间轮询；返回非零 ⇒ `QZI_ERR_CANCELLED`，`.NET` 侧转换成 `OperationCanceledException`。

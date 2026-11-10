@@ -64,6 +64,7 @@ internal sealed unsafe class CallbackScope : IDisposable
         ReadOnlySpan<byte> text = MemoryMarshal.CreateReadOnlySpanFromNullTerminated(phase);
         if (text.SequenceEqual("model load"u8)) return GenerationPhase.ModelLoad;
         if (text.SequenceEqual("text"u8)) return GenerationPhase.Text;
+        if (text.SequenceEqual("image encode"u8)) return GenerationPhase.ImageEncode;
         if (text.SequenceEqual("dit"u8)) return GenerationPhase.Dit;
         if (text.SequenceEqual("vae"u8)) return GenerationPhase.Vae;
         if (text.SequenceEqual("encode"u8)) return GenerationPhase.Encode;

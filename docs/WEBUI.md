@@ -4,7 +4,8 @@
 manually testing the library. It reproduces the functional surface of the
 original Go WebUI (health, presets, serial job queue, cancel, retry, progress,
 output gallery, trash/restore, unload, SSE) entirely in `.NET 10` — **no Go
-code and no Go process**.
+code and no Go process**. It also exposes the two additive ABI v1 features:
+Qwen-Image 2.1 image editing and Z-Image ControlNet Union.
 
 The browser talks to this app; the app calls `QziClient`, which
 **directly P/Invokes the in-process `QwenZImageNative` shared library** via the
@@ -197,6 +198,7 @@ unchanged.
 | `QZI_MODEL_DIR` | from config | `QziClientOptions.Qwen21Directory` / `ZImageDirectory` |
 | `QZI_QWEN21_DIR` / `QZI_ZIMAGE_DIR` | from config | Per-model directory overrides |
 | `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_QWEN21_LORA_DIR` | from config | Pack directories for LoRA / Nunchaku weights. Read by both `QziConfig` and the native config loader; code-level `QziClientOptions` values are scoped through these variables during engine creation so the engine sees them |
+| `QZI_ZIMAGE_CONTROL_DIR` | from config | `zimage_control_dir`: path to the Z-Image Turbo Fun ControlNet Union 2.1 `.safetensors`. Only needed for `zimage-control` jobs; missing → `QZI_ERR_NOT_CONFIGURED` |
 | `QZI_MODEL_CACHE` | from config | Text-encoder cache directory |
 | `QZI_NATIVE_LIBRARY` | auto-probe | Full path to `QwenZImageNative.dll` / `libQwenZImageNative.so`. When set, it is authoritative — a missing/unloadable file is an error, never a silent fallback to the reference build |
 | `QZI_WEBUI_NATIVE` | `auto` | `auto` (detect a local `-cuda` build), `reference` (force the bundled stub), or an explicit library path |
@@ -224,7 +226,7 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime |
+| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet` |
 | `GET` | `/api/presets` | `{"presets":[...]}` — all `QziPresets` with a `model` discriminator |
 | `POST` | `/api/jobs` | Validate + enqueue; `202` with the job snapshot |
 | `GET` | `/api/jobs` | `{"jobs":[...]}` newest first; optional `?client=` filter |
@@ -254,8 +256,10 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 }
 ```
 
-`model` accepts `qwen21` (aliases `qwen`, `qwen-image`) or `zimage`
-(aliases `z-image`, `z_image`). Qwen21 adds `tier` (`turbo`/`base`);
+`model` accepts `qwen21` (aliases `qwen`, `qwen-image`), `qwen21-edit`
+(aliases `qwen21_edit`, `qwen-image-edit`), `zimage`
+(aliases `z-image`, `z_image`) or `zimage-control`
+(aliases `zimage_control`, `z-image-control`). Qwen21 adds `tier` (`turbo`/`base`);
 `lora` and `lora_scale` are valid on **both** tiers, while `steps`,
 `guidance` and `negative_prompt` are `base` only. The browser form keeps the
 LoRA fields enabled for both tiers and sends them outside the base-only branch;
@@ -263,6 +267,90 @@ changing the adapter or its scale reloads the DiT.
 Z-Image adds `checkpoint` (`bf16`, `nunchaku`, `nunchaku-r<rank>`).
 The full validation rules are in [PARAMETERS.md](PARAMETERS.md); invalid
 envelopes fail with `400` **before** any native model loading.
+
+### Image-edit envelope (`POST /api/jobs`)
+
+An envelope enters edit mode either by using `model: "qwen21-edit"` **or** by
+adding `reference_image` to a plain `qwen21` request (both spellings are
+accepted, so existing scripts only need one extra field). Editing is a
+Qwen-Image 2.1 feature: using an edit field with `zimage` fails with `400`.
+
+```json
+{
+  "model": "qwen21-edit",
+  "prompt": "replace the sky with an aurora, keep the mountains",
+  "width": 1024,
+  "height": 1024,
+  "seed": 42,
+  "tier": "turbo",
+  "client": "manual-test",
+  "reference_image": "data:image/png;base64,iVBORw0KGgo...",
+  "mask_image": "data:image/png;base64,iVBORw0KGgo...",
+  "strength": 0.6,
+  "masking_strength": 1.0
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `reference_image` | **Required for edit mode.** Base64 PNG, optionally a `data:image/png;base64,...` URL. The browser canvas re-encodes uploads, so JPEG / WebP files also work. Decoded to planar RGB8; each side `1..4096`, total pixels `≤ 2048×2048` |
+| `mask_image` | Optional base64 PNG at the **reference** resolution, one channel. White brush strokes are regenerated, untouched / transparent pixels (0) follow the reference trajectory. `masking_strength` requires it |
+| `strength` | Denoising strength `0.05..1.0`, default `0.75`. `1.0` ≈ text-to-image, smaller values stay closer to the reference |
+| `masking_strength` | `0.05..1.0`, default `1.0`; only meaningful with `mask_image`, and rejected without it (it would otherwise be silently dropped) |
+
+The reference (and its mask) is centre-crop **cover-fitted** to the output
+canvas, so the upload need not match `width`/`height`. Both buffers are
+decoded by `QziRasterImage` without any imaging dependency and stay owned by
+WebUI for the duration of the synchronous native call. Edit jobs appear in the
+job list / gallery with `"edit": true` and `"has_mask": true|false` because
+`Qwen21EditOptions` derives from `QwenImageOptions` and the `model` field alone
+cannot distinguish them. `/api/health` exposes `supports_image_editing`
+(`QziClient.SupportsImageEditing`), which is `false` when the loaded native
+library predates the additive editing exports; the UI then disables the
+`qwen21-edit` option and switches an already-selected edit mode back to
+`qwen21`, so an unsupported job can never be submitted.
+
+### ControlNet envelope (`POST /api/jobs`)
+
+An envelope enters ControlNet mode either with `model: "zimage-control"` **or**
+by adding `control_image` to a plain `zimage` request. It is the Z-Image
+counterpart of edit mode: using an edit field with `zimage-control` (or a
+control field with `qwen21`) fails with `400`, and combining the two feature
+sets in one envelope is rejected explicitly.
+
+```json
+{
+  "model": "zimage-control",
+  "prompt": "a red fox walking through fresh snow, cinematic light",
+  "width": 1024,
+  "height": 1024,
+  "seed": 42,
+  "checkpoint": "bf16",
+  "client": "manual-test",
+  "control_image": "data:image/png;base64,iVBORw0KGgo...",
+  "control_type": "pose",
+  "control_scale": 0.65
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `control_image` | **Required for ControlNet mode.** Base64 PNG, optionally a `data:image/png;base64,...` URL. The browser canvas re-encodes uploads, so JPEG / WebP files also work. Decoded to planar RGB8; each side `1..4096`, total pixels `≤ 2048×2048`. Must be **already preprocessed** — the library does not run pose / edge / depth estimation |
+| `control_type` | Optional, `auto` / `pose` / `canny` / `depth` / `scribble` / `raw` (case-insensitive), default `auto`. Descriptive metadata only; it does not change inference. WanGP's weights support all four control types, and `guide_preprocessing = "V"` means the raster is consumed as-is |
+| `control_scale` | Optional `0.05..2.0`, `0` / omitted → engine default `0.65` (WanGP Union 2.1 `control_net_weight_alt`). Must be finite |
+
+`control_type` / `control_scale` **without** `control_image` is rejected with
+`400` rather than being silently dropped. The control image is centre-crop
+cover-fitted to the output canvas, VAE-encoded into a 16-channel latent, and
+padded with zero `keep_mask` / `inpaint_latent` planes into the 33-channel
+Union 2.x control context. Control jobs appear in the job list / gallery with
+`"control": true` and `"has_control": true`. `/api/health` exposes
+`supports_controlnet` (`QziClient.SupportsControlNet`); when `false` the UI
+disables the `zimage-control` option and switches an already-selected control
+mode back to plain `zimage`. Real inference additionally requires
+`zimage_control_dir` (or `QZI_ZIMAGE_CONTROL_DIR`); with the reference backend
+the request still succeeds but only produces the deterministic byte-comparison
+image.
 
 ### SSE (`/api/events`)
 
@@ -279,9 +367,11 @@ data: {"job_id":1,"phase":"Dit","completed":3,"total":8,"fraction":0.375, ...}
 ```
 
 `job` events are emitted on every state transition and progress tick. While a
-job is running, a matching `progress` event is emitted as well. The stream
-sends a comment heartbeat every 15 seconds so proxies do not close idle
-connections. `EventSource` reconnects automatically.
+job is running, a matching `progress` event is emitted as well. `phase` is the
+`GenerationPhase` enum name (`ModelLoad` / `Text` / `ImageEncode` / `Dit` /
+`Vae` / `Encode`); `ImageEncode` appears for edit jobs (VAE-encoding the
+reference) and ControlNet jobs (VAE-encoding the control image). The stream sends a comment heartbeat every 15 seconds so proxies
+do not close idle connections. `EventSource` reconnects automatically.
 
 ## Front-end features
 
@@ -293,6 +383,24 @@ connections. `EventSource` reconnects automatically.
 - Live job table with state badge, progress bar, elapsed time, cancel / retry.
 - Output gallery with lazy thumbnails, multi-select, batch delete, "Undo
   delete" (restore), lightbox, and direct link to the original PNG.
+- **Image edit mode** (`qwen21-edit`): upload a reference image (PNG / JPEG /
+  WebP, re-encoded by the canvas), preview it, and paint a white brush mask on
+  a transparent overlay. Buttons clear the mask, paint it all white, or remove
+  the image. `Denoising strength` (default 0.75) and `Masking strength`
+  (default 1.00, enabled only when a mask exists) are live sliders. Without a
+  painted mask the whole image is edited at the denoising strength; white mask
+  pixels are regenerated from the prompt, black ones keep the reference. The
+  option is disabled when `/api/health` reports
+  `supports_image_editing: false`.
+- **ControlNet mode** (`zimage-control`): upload an already-preprocessed
+  control image (PNG / JPEG / WebP, re-encoded by the canvas), preview it,
+  choose a descriptive `control type` (`auto` / `pose` / `canny` / `depth` /
+  `scribble` / `raw`) and a live `Control scale` slider (`0..2`, default
+  0.65). The upload note states explicitly that no edge / pose / depth
+  estimator runs, and that real Union 2.1 weights must be configured via
+  `zimage_control_dir`. Edit mode and ControlNet mode are mutually exclusive;
+  the option is disabled when `/api/health` reports
+  `supports_controlnet: false`.
 - Health pill showing resident model / backend (`reference backend (noise)`
   vs `QwenZImageNative`), with `transport`, `config_path` and directories in
   the tooltip, plus an "Unload model" action.

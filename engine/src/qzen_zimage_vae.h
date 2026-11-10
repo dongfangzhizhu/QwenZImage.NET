@@ -6,7 +6,9 @@
 
 /* Conv AutoencoderKL decoder for Z-Image Turbo (Wan2GP
  * models/z_image/autoencoder_kl.py, a thin wrapper over diffusers'
- * AutoencoderKL).  Decoder side only: the pipeline never encodes.
+ * AutoencoderKL).  The decoder serves every text-to-image request; the
+ * encoder is an additional, lazily loaded path used only to turn a ControlNet
+ * guide image into its normalized latent (qzen_zvae_encode).
  *
  * Architecture (ZImageTurbo_VAE_bf16_config.json):
  *   conv_in    Conv2d(16 -> 512, 3x3, pad 1)
@@ -66,5 +68,20 @@ void qzen_zvae_free(qzen_zvae *vae);
 int qzen_zvae_decode(const qzen_zvae *vae, const float *latents,
                    uint32_t latent_h, uint32_t latent_w, float *pixels,
                    char *error, size_t error_size);
+
+/* Encoder side (ControlNet). Planar RGB8 [3, height, width] in 0..255 ->
+ * normalized latent [latent_channels, height/8, width/8] in DiT space:
+ *
+ *   pixels = (rgb / 255) * 2 - 1
+ *   mean   = encoder(pixels)  (posterior mean, first 16 of the 32 channels)
+ *   latent = (mean - shift_factor) * scaling_factor
+ *
+ * The encoder weights live in the same vae.safetensors as the decoder and are
+ * loaded lazily on the first encode, so decoding an ordinary text-to-image
+ * request costs nothing extra. width/height must be non-zero multiples of 8.
+ * `latent` is caller-owned and holds 16 * (width/8) * (height/8) floats. */
+int qzen_zvae_encode(qzen_zvae *vae, const uint8_t *rgb,
+                     uint32_t width, uint32_t height, float *latent,
+                     char *error, size_t error_size);
 
 #endif

@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../QwenZImage.NET/QwenZImage.NET.csproj" />
+    <InternalsVisibleTo Include="QwenZImage.NET.WebUI.Tests" />
   </ItemGroup>
 
   <!-- A ProjectReference does not flow the NuGet runtime assets, so copy the

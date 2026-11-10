@@ -34,6 +34,15 @@ public sealed class QziClientOptions
     public string? ZImageNunchakuDirectory { get; init; }
 
     /// <summary>
+    /// Directory holding Z-Image Turbo Fun ControlNet Union weights. The C ABI
+    /// has no field for it, so the client scopes <c>QZI_ZIMAGE_CONTROL_DIR</c>
+    /// around engine creation for the native backend (the real engine reads it
+    /// in its ControlNet init path). Code-level values win over the config file;
+    /// the variable is restored afterwards, so clients can differ.
+    /// </summary>
+    public string? ZImageControlDirectory { get; init; }
+
+    /// <summary>
     /// Path to <c>QwenZImage.config.json</c>. When set, it is scoped as the
     /// <c>QZI_CONFIG</c> environment variable around engine creation so the
     /// native backend reads the very same file (including platform overrides

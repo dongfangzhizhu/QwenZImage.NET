@@ -8,6 +8,7 @@
     "qwen21_lora_dir": "D:/AI/convert/minimax/h3-models/qwen21/loras",
     "zimage_dir": "D:/AI/convert/minimax/h3-models/zimage",
     "zimage_nunchaku_dir": "D:/AI/convert/minimax/h3-models/zimage_nunchaku",
+    "zimage_control_dir": "D:/AI/Wan2GP/ckpts/Z-Image-Turbo-Fun-Controlnet-Union2.1_quanto_bf16_int8.safetensors",
     "text_cache_dir": "D:/AI/convert/minimax/h3-models/config/text-cache"
   },
   "linux": {
@@ -15,6 +16,7 @@
     "qwen21_lora_dir": "~/h3-models/qwen21/loras",
     "zimage_dir": "~/h3-models/zimage",
     "zimage_nunchaku_dir": "~/h3-models/zimage_nunchaku",
+    "zimage_control_dir": "~/h3-models/zimage_control",
     "text_cache_dir": "~/h3-models/config/text-cache"
   }
 }

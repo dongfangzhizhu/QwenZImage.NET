@@ -114,6 +114,33 @@ typedef struct {
     float *to_out, *to_out_bias;   /* [512, 512] + bias */
 } zvae_mid;
 
+/* Single-head spatial self-attention parameters.  The decoder and encoder mid
+ * blocks share one numerical kernel (zvae_attention_forward); only these
+ * tensors differ between them. */
+typedef struct {
+    zvae_norm norm;                 /* GroupNorm weight/bias [channels] */
+    float *to_q, *to_q_bias, *to_k, *to_k_bias, *to_v, *to_v_bias;
+    float *to_out, *to_out_bias;    /* [channels, channels] + bias */
+} zvae_attn;
+
+typedef struct {
+    zvae_resnet resnets[2];         /* 2 resnets per down block */
+    int has_downsample;
+    zvae_conv3x3 downsample;        /* 3x3 stride-2 conv, present for b = 0..2 */
+} zvae_down_block;
+
+/* Lazily loaded encoder half of the AutoencoderKL (ControlNet guide images).
+ * Stays zeroed until the first qzen_zvae_encode(). */
+typedef struct {
+    zvae_conv3x3 conv_in;           /* 3 -> ch[0] */
+    zvae_down_block down[4];
+    zvae_resnet mid_resnets[2];     /* ch[3] -> ch[3] */
+    zvae_attn mid_attn;
+    zvae_norm conv_norm_out;        /* GroupNorm(32, ch[3]) */
+    zvae_conv3x3 conv_out;          /* ch[3] -> 2 * latent_channels */
+    int loaded;
+} zvae_encoder;
+
 typedef struct zvae_gpu zvae_gpu;
 
 struct qzen_zvae {
@@ -124,6 +151,8 @@ struct qzen_zvae {
     zvae_norm norm_out;
     zvae_conv3x3 conv_out;
     zvae_gpu *gpu;   /* device weight mirror + CUDA context, built lazily */
+    char *source_path;    /* path passed to qzen_zvae_load, for lazy encoder load */
+    zvae_encoder encoder; /* lazily loaded ControlNet encoder */
 };
 
 qzen_zvae_config qzen_zvae_default_config(void) {
@@ -248,9 +277,31 @@ static int zvae_resnet_load(const qzen_weight_store *store, const char *prefix,
     return 1;
 }
 
+/* Free the lazily loaded encoder weights; safe on a zeroed struct. */
+static void zvae_encoder_free(zvae_encoder *enc) {
+    zvae_conv_free(&enc->conv_in);
+    for (uint32_t b = 0; b < 4; b++) {
+        for (uint32_t r = 0; r < 2; r++) {
+            zvae_resnet_free(&enc->down[b].resnets[r]);
+        }
+        zvae_conv_free(&enc->down[b].downsample);
+    }
+    for (uint32_t r = 0; r < 2; r++) zvae_resnet_free(&enc->mid_resnets[r]);
+    free(enc->mid_attn.norm.weight); free(enc->mid_attn.norm.bias);
+    free(enc->mid_attn.to_q);       free(enc->mid_attn.to_q_bias);
+    free(enc->mid_attn.to_k);       free(enc->mid_attn.to_k_bias);
+    free(enc->mid_attn.to_v);       free(enc->mid_attn.to_v_bias);
+    free(enc->mid_attn.to_out);     free(enc->mid_attn.to_out_bias);
+    free(enc->conv_norm_out.weight); free(enc->conv_norm_out.bias);
+    zvae_conv_free(&enc->conv_out);
+    memset(enc, 0, sizeof(*enc));
+}
+
 void qzen_zvae_free(qzen_zvae *vae) {
     if (!vae) return;
     zvae_gpu_free(vae->gpu);
+    zvae_encoder_free(&vae->encoder);
+    free(vae->source_path);
     zvae_conv_free(&vae->conv_in);
     for (uint32_t r = 0; r < 2; r++) zvae_resnet_free(&vae->mid.resnets[r]);
     free(vae->mid.attn_norm.weight); free(vae->mid.attn_norm.bias);
@@ -283,6 +334,16 @@ qzen_zvae *qzen_zvae_load(const char *directory, const qzen_zvae_config *config,
         return NULL;
     }
     vae->config = config ? *config : qzen_zvae_default_config();
+    /* Remember the source so the encoder can be loaded lazily from the same
+     * store on the first encode.  qzen_weight_store_open() accepts a shard
+     * directory or a single .safetensors file, so re-opening this exact path
+     * finds the encoder tensors.  A malloc failure here must not break the
+     * (much more common) decode path, so it is non-fatal. */
+    if (directory && *directory) {
+        size_t length = strlen(directory) + 1;
+        vae->source_path = malloc(length);
+        if (vae->source_path) memcpy(vae->source_path, directory, length);
+    }
     ZVAE_TRACE_LOG("conv_in\n");
     uint32_t latent = vae->config.latent_channels;
     uint32_t out0 = vae->config.up_channels[0];
@@ -454,6 +515,53 @@ static void zvae_conv3x3_forward(const zvae_conv3x3 *conv, const float *input,
     }
 }
 
+/* 3x3 stride-2 pad-1 convolution: [in, H, W] -> [out, H/2, W/2].  Output
+ * (o, y, x) reads input (c, 2y+ky-1, 2x+kx-1) for ky,kx in 0..2, treating
+ * out-of-range input coordinates as zero (standard PyTorch Conv2d stride=2
+ * padding=1 for even H/W).  input and output must not alias. */
+static void zvae_conv3x3_stride2_forward(const zvae_conv3x3 *conv,
+                                         const float *input, float *output,
+                                         uint32_t height, uint32_t width) {
+    const uint32_t in_ch = conv->in;
+    const uint32_t out_ch = conv->out;
+    const uint32_t out_h = height / 2;
+    const uint32_t out_w = width / 2;
+    const size_t in_plane = (size_t)height * width;
+    const size_t out_plane = (size_t)out_h * out_w;
+    {
+        int64_t o;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (o = 0; o < (int64_t)out_ch; o++) {
+            float *out_p = output + (size_t)o * out_plane;
+            const float bias = conv->bias[o];
+            for (size_t index = 0; index < out_plane; index++) out_p[index] = bias;
+            const float *weight = conv->weight + (size_t)o * in_ch * 9;
+            for (uint32_t c = 0; c < in_ch; c++) {
+                const float *in_p = input + (size_t)c * in_plane;
+                const float *w = weight + (size_t)c * 9;
+                for (uint32_t ky = 0; ky < 3; ky++) {
+                    for (uint32_t kx = 0; kx < 3; kx++) {
+                        const float wk = w[ky * 3 + kx];
+                        for (uint32_t y = 0; y < out_h; y++) {
+                            int32_t iy = (int32_t)(2 * y) + (int32_t)ky - 1;
+                            if (iy < 0 || iy >= (int32_t)height) continue;
+                            const float *in_row = in_p + (size_t)iy * width;
+                            float *out_row = out_p + (size_t)y * out_w;
+                            for (uint32_t x = 0; x < out_w; x++) {
+                                int32_t ix = (int32_t)(2 * x) + (int32_t)kx - 1;
+                                if (ix < 0 || ix >= (int32_t)width) continue;
+                                out_row[x] += wk * in_row[ix];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /* 1x1 convolution (resnet shortcuts), in/out [C, H, W], no aliasing. */
 static void zvae_conv1x1_forward(const zvae_conv3x3 *conv, const float *input,
                                  float *output, uint32_t height, uint32_t width) {
@@ -515,23 +623,23 @@ static void zvae_resnet_forward(const zvae_resnet *resnet, const float *input,
 /* Mid-block spatial self-attention (one head over HW tokens): GroupNorm(32)
  * on [C, HW], to_q/k/v (bias), scaled dot-product with fp32 softmax, to_out,
  * residual connection to the un-normalized input. */
-static int zvae_mid_attention(const qzen_zvae *vae, const float *input,
-                              float *output, uint32_t height, uint32_t width) {
-    uint32_t channels = vae->mid.attn_norm.channels;
+static int zvae_attention_forward(const zvae_attn *attn, uint32_t groups,
+                                  float eps, const float *input, float *output,
+                                  uint32_t height, uint32_t width) {
+    uint32_t channels = attn->norm.channels;
     size_t tokens_count = (size_t)height * width;
     size_t plane = (size_t)channels * tokens_count;
     float *normed = zvae_alloc(plane);
     float *q = zvae_alloc(plane);
     float *k = zvae_alloc(plane);
     float *v = zvae_alloc(plane);
-    float *attn = zvae_alloc(plane);
-    if (!normed || !q || !k || !v || !attn) {
-        free(normed); free(q); free(k); free(v); free(attn);
+    float *attn_buf = zvae_alloc(plane);
+    if (!normed || !q || !k || !v || !attn_buf) {
+        free(normed); free(q); free(k); free(v); free(attn_buf);
         return 0;
     }
     memcpy(normed, input, plane * sizeof(float));
-    zvae_group_norm(&vae->mid.attn_norm, vae->config.groups, vae->config.eps,
-                    normed, channels, height, width);
+    zvae_group_norm(&attn->norm, groups, eps, normed, channels, height, width);
     /* q/k/v = W x normed per token: weight rows are [C], the normed column is
      * strided by tokens_count in the [C, HW] layout. */
     {
@@ -544,9 +652,9 @@ static int zvae_mid_attention(const qzen_zvae *vae, const float *input,
             float *k_row = k + (size_t)i * channels;
             float *v_row = v + (size_t)i * channels;
             for (uint32_t o = 0; o < channels; o++) {
-                const float *wq = vae->mid.to_q + (size_t)o * channels;
-                const float *wk = vae->mid.to_k + (size_t)o * channels;
-                const float *wv = vae->mid.to_v + (size_t)o * channels;
+                const float *wq = attn->to_q + (size_t)o * channels;
+                const float *wk = attn->to_k + (size_t)o * channels;
+                const float *wv = attn->to_v + (size_t)o * channels;
                 float sq = 0.0f, sk = 0.0f, sv = 0.0f;
                 for (uint32_t c = 0; c < channels; c++) {
                     float value = normed[(size_t)c * tokens_count + i];
@@ -554,9 +662,9 @@ static int zvae_mid_attention(const qzen_zvae *vae, const float *input,
                     sk += wk[c] * value;
                     sv += wv[c] * value;
                 }
-                q_row[o] = sq + vae->mid.to_q_bias[o];
-                k_row[o] = sk + vae->mid.to_k_bias[o];
-                v_row[o] = sv + vae->mid.to_v_bias[o];
+                q_row[o] = sq + attn->to_q_bias[o];
+                k_row[o] = sk + attn->to_k_bias[o];
+                v_row[o] = sv + attn->to_v_bias[o];
             }
         }
     }
@@ -588,7 +696,7 @@ static int zvae_mid_attention(const qzen_zvae *vae, const float *input,
                 sum += scores[j];
             }
             float inverse = 1.0f / sum;
-            float *out_row = attn + (size_t)i * channels;
+            float *out_row = attn_buf + (size_t)i * channels;
             memset(out_row, 0, channels * sizeof(float));
             for (size_t j = 0; j < tokens_count; j++) {
                 const float *v_row = v + j * channels;
@@ -605,17 +713,31 @@ static int zvae_mid_attention(const qzen_zvae *vae, const float *input,
 #pragma omp parallel for schedule(static)
 #endif
         for (i = 0; i < (int64_t)tokens_count; i++) {
-            const float *attn_row = attn + (size_t)i * channels;
+            const float *attn_row = attn_buf + (size_t)i * channels;
             for (uint32_t o = 0; o < channels; o++) {
-                const float *w = vae->mid.to_out + (size_t)o * channels;
-                float sum = vae->mid.to_out_bias[o];
+                const float *w = attn->to_out + (size_t)o * channels;
+                float sum = attn->to_out_bias[o];
                 for (uint32_t c = 0; c < channels; c++) sum += w[c] * attn_row[c];
                 output[(size_t)o * tokens_count + i] = sum + input[(size_t)o * tokens_count + i];
             }
         }
     }
-    free(normed); free(q); free(k); free(v); free(attn);
+    free(normed); free(q); free(k); free(v); free(attn_buf);
     return attention_ok;
+}
+
+/* Decoder mid-block attention: wire the shared kernel to the decoder tensors.
+ * The numerics are unchanged; only the parameter source moved. */
+static int zvae_mid_attention(const qzen_zvae *vae, const float *input,
+                              float *output, uint32_t height, uint32_t width) {
+    zvae_attn attn;
+    attn.norm = vae->mid.attn_norm;
+    attn.to_q    = vae->mid.to_q;      attn.to_q_bias    = vae->mid.to_q_bias;
+    attn.to_k    = vae->mid.to_k;      attn.to_k_bias    = vae->mid.to_k_bias;
+    attn.to_v    = vae->mid.to_v;      attn.to_v_bias    = vae->mid.to_v_bias;
+    attn.to_out  = vae->mid.to_out;    attn.to_out_bias  = vae->mid.to_out_bias;
+    return zvae_attention_forward(&attn, vae->config.groups, vae->config.eps,
+                                  input, output, height, width);
 }
 
 /* Nearest-neighbour x2 upsampling, [C, H, W] -> [C, 2H, 2W]. */
@@ -817,6 +939,214 @@ int qzen_zvae_decode(const qzen_zvae *vae, const float *latents,
 fail:
     free(a); free(b); free(c); free(d); free(e); free(f); free(g); free(h);
     return 0;
+}
+
+/* --- lazy encoder load (ControlNet) ----------------------------------------- */
+
+/* The encoder tensors live in the same safetensors store as the decoder.
+ * qzen_zvae_load() remembered its path; this reads the encoder half on the
+ * first qzen_zvae_encode() so an ordinary decode pays nothing for it. */
+static int zvae_encoder_load(qzen_zvae *vae, char *error, size_t error_size) {
+    zvae_encoder *enc = &vae->encoder;
+    if (enc->loaded) return 1;
+    if (!vae->source_path) {
+        zvae_fail(error, error_size, "VAE encoder source path is unavailable");
+        return 0;
+    }
+    qzen_weight_store *store = qzen_weight_store_open(vae->source_path, error, error_size);
+    if (!store) return 0;
+
+    const qzen_zvae_config *config = &vae->config;
+    /* Encoder block_out_channels is the reverse of the decoder's up_channels:
+     * {128, 256, 512, 512} for the default config. */
+    uint32_t ch[4];
+    for (uint32_t b = 0; b < 4; b++) ch[b] = config->up_channels[3 - b];
+    const uint32_t doubled = 2 * config->latent_channels; /* mean + logvar */
+
+    char prefix[128];
+    int ok = zvae_conv_load(store, "encoder.conv_in", ch[0], 3, 3,
+                            &enc->conv_in, error, error_size);
+
+    for (uint32_t b = 0; ok && b < 4; b++) {
+        for (uint32_t r = 0; ok && r < 2; r++) {
+            uint32_t in_ch = r == 0 ? (b == 0 ? ch[0] : ch[b - 1]) : ch[b];
+            snprintf(prefix, sizeof(prefix),
+                     "encoder.down_blocks.%u.resnets.%u", b, r);
+            ok = zvae_resnet_load(store, prefix, in_ch, ch[b], config,
+                                  &enc->down[b].resnets[r], error, error_size);
+        }
+        if (ok && b < 3) {
+            enc->down[b].has_downsample = 1;
+            snprintf(prefix, sizeof(prefix),
+                     "encoder.down_blocks.%u.downsamplers.0.conv", b);
+            ok = zvae_conv_load(store, prefix, ch[b], ch[b], 3,
+                                &enc->down[b].downsample, error, error_size);
+        }
+    }
+
+    for (uint32_t r = 0; ok && r < 2; r++) {
+        snprintf(prefix, sizeof(prefix), "encoder.mid_block.resnets.%u", r);
+        ok = zvae_resnet_load(store, prefix, ch[3], ch[3], config,
+                              &enc->mid_resnets[r], error, error_size);
+    }
+    if (ok) ok = zvae_norm_load(store,
+                                "encoder.mid_block.attentions.0.group_norm",
+                                ch[3], &enc->mid_attn.norm, error, error_size);
+    static const char *qkv[4] = {"to_q", "to_k", "to_v", "to_out.0"};
+    float **mats[4] = {&enc->mid_attn.to_q, &enc->mid_attn.to_k,
+                       &enc->mid_attn.to_v, &enc->mid_attn.to_out};
+    float **bies[4] = {&enc->mid_attn.to_q_bias, &enc->mid_attn.to_k_bias,
+                       &enc->mid_attn.to_v_bias, &enc->mid_attn.to_out_bias};
+    for (uint32_t m = 0; ok && m < 4; m++) {
+        snprintf(prefix, sizeof(prefix),
+                 "encoder.mid_block.attentions.0.%s", qkv[m]);
+        zvae_conv3x3 loaded;
+        memset(&loaded, 0, sizeof(loaded));
+        int loaded_ok = zvae_conv_load(store, prefix, ch[3], ch[3], 1,
+                                       &loaded, error, error_size);
+        /* Keep even a partial allocation in the struct so cleanup frees it. */
+        *mats[m] = loaded.weight;
+        *bies[m] = loaded.bias;
+        ok = loaded_ok;
+    }
+
+    if (ok) ok = zvae_norm_load(store, "encoder.conv_norm_out", ch[3],
+                                &enc->conv_norm_out, error, error_size);
+    if (ok) ok = zvae_conv_load(store, "encoder.conv_out", doubled, ch[3], 3,
+                                &enc->conv_out, error, error_size);
+
+    qzen_weight_store_free(store);
+    if (!ok) {
+        zvae_encoder_free(enc);
+        return 0;
+    }
+    enc->loaded = 1;
+    return 1;
+}
+
+/* Run one encoder ResnetBlock2D through the 4 working buffers: input is
+ * buf[cur], hidden/scratch/output are the other three.  On return the output
+ * buffer holds the new current tensor. */
+static void zvae_encode_resnet_step(float *buf[4], int *cur_idx,
+                                    const zvae_resnet *resnet,
+                                    uint32_t groups, float eps,
+                                    uint32_t h, uint32_t w) {
+    int i = *cur_idx;
+    zvae_resnet_forward(resnet, buf[i], buf[(i + 1) & 3],
+                        buf[(i + 2) & 3], buf[(i + 3) & 3],
+                        groups, eps, h, w);
+    *cur_idx = (i + 3) & 3;
+}
+
+int qzen_zvae_encode(qzen_zvae *vae, const uint8_t *rgb,
+                     uint32_t width, uint32_t height, float *latent,
+                     char *error, size_t error_size) {
+    if (!vae)    { zvae_fail(error, error_size, "qzen_zvae_encode: vae is NULL"); return 0; }
+    if (!rgb)    { zvae_fail(error, error_size, "qzen_zvae_encode: rgb is NULL"); return 0; }
+    if (!latent) { zvae_fail(error, error_size, "qzen_zvae_encode: latent is NULL"); return 0; }
+    if (width == 0 || height == 0 || (width % 8) != 0 || (height % 8) != 0) {
+        zvae_fail(error, error_size,
+                  "qzen_zvae_encode: width/height must be non-zero multiples of 8 (got %ux%u)",
+                  width, height);
+        return 0;
+    }
+    if (!zvae_encoder_load(vae, error, error_size)) return 0;
+
+    const qzen_zvae_config *config = &vae->config;
+    const uint32_t groups = config->groups;
+    const float eps = config->eps;
+    const uint32_t latent_ch = config->latent_channels;
+    const zvae_encoder *enc = &vae->encoder;
+
+    uint32_t ch[4];
+    for (uint32_t b = 0; b < 4; b++) ch[b] = config->up_channels[3 - b];
+
+    const size_t plane0 = (size_t)height * width;
+    /* Largest single working tensor: the first down block runs at full
+     * resolution with ch[0] channels (128 * H * W).  Derive the max over all
+     * stages defensively (hidden = max(in, out) channels). */
+    size_t cap = (size_t)ch[0] * plane0;
+    for (uint32_t b = 0; b < 4; b++) {
+        size_t spatial = (size_t)(height >> b) * (width >> b);
+        uint32_t prev = b == 0 ? ch[0] : ch[b - 1];
+        uint32_t widest = ch[b] > prev ? ch[b] : prev;
+        size_t need = (size_t)widest * spatial;
+        if (need > cap) cap = need;
+    }
+
+    float *buf[4];
+    for (int k = 0; k < 4; k++) buf[k] = zvae_alloc(cap);
+    if (!buf[0] || !buf[1] || !buf[2] || !buf[3]) {
+        zvae_fail(error, error_size, "cannot allocate VAE encode buffers");
+        for (int k = 0; k < 4; k++) free(buf[k]);
+        return 0;
+    }
+
+    /* 1. planar RGB8 [3,H,W] 0..255 -> F32 [-1,1] into buf[0]. */
+    for (uint32_t c = 0; c < 3; c++) {
+        const uint8_t *src = rgb + (size_t)c * plane0;
+        float *dst = buf[0] + (size_t)c * plane0;
+        for (size_t i = 0; i < plane0; i++) {
+            dst[i] = (float)src[i] * (2.0f / 255.0f) - 1.0f;
+        }
+    }
+
+    /* 2. conv_in: 3 -> ch[0] at HxW. */
+    zvae_conv3x3_forward(&enc->conv_in, buf[0], buf[1], height, width);
+    int cur_idx = 1;
+    uint32_t h = height, w = width;
+
+    /* 3. four down blocks: two resnets, then a stride-2 conv on b = 0..2. */
+    for (uint32_t b = 0; b < 4; b++) {
+        zvae_encode_resnet_step(buf, &cur_idx, &enc->down[b].resnets[0],
+                                groups, eps, h, w);
+        zvae_encode_resnet_step(buf, &cur_idx, &enc->down[b].resnets[1],
+                                groups, eps, h, w);
+        if (enc->down[b].has_downsample) {
+            int i = cur_idx;
+            zvae_conv3x3_stride2_forward(&enc->down[b].downsample,
+                                         buf[i], buf[(i + 1) & 3], h, w);
+            cur_idx = (i + 1) & 3;
+            h /= 2;
+            w /= 2;
+        }
+    }
+
+    /* 4. mid block: resnet -> attention -> resnet at H/8 x W/8. */
+    zvae_encode_resnet_step(buf, &cur_idx, &enc->mid_resnets[0],
+                            groups, eps, h, w);
+    {
+        int i = cur_idx;
+        if (!zvae_attention_forward(&enc->mid_attn, groups, eps,
+                                    buf[i], buf[(i + 1) & 3], h, w)) {
+            zvae_fail(error, error_size, "cannot allocate VAE attention buffers");
+            for (int k = 0; k < 4; k++) free(buf[k]);
+            return 0;
+        }
+        cur_idx = (i + 1) & 3;
+    }
+    zvae_encode_resnet_step(buf, &cur_idx, &enc->mid_resnets[1],
+                            groups, eps, h, w);
+
+    /* 5. conv_norm_out -> SiLU -> conv_out ch[3] -> 2*latent_ch. */
+    zvae_group_norm(&enc->conv_norm_out, groups, eps, buf[cur_idx], ch[3], h, w);
+    zvae_silu(buf[cur_idx], (size_t)ch[3] * h * w);
+    float *moments = buf[(cur_idx + 1) & 3];
+    zvae_conv3x3_forward(&enc->conv_out, buf[cur_idx], moments, h, w);
+
+    /* 6. posterior mode = the first latent_ch channels (the mean);
+     * discard the trailing logvar channels and normalise for the DiT. */
+    const size_t p = (size_t)h * w;   /* (H/8)*(W/8) */
+    for (uint32_t c = 0; c < latent_ch; c++) {
+        const float *mean = moments + (size_t)c * p;
+        float *dst = latent + (size_t)c * p;
+        for (size_t i = 0; i < p; i++) {
+            dst[i] = (mean[i] - config->shift_factor) * config->scaling_factor;
+        }
+    }
+
+    for (int k = 0; k < 4; k++) free(buf[k]);
+    return 1;
 }
 
 /* --- device decode (default since §23) -------------------------------------- */

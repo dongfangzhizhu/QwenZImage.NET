@@ -80,6 +80,12 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
     object? engine = null;
     bool ok = rt.Engine is not null && rt.Queue is not null;
     string? error = rt.InitError;
+    bool editing = false;
+    try { editing = rt.Engine?.SupportsImageEditing == true; }
+    catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe image-edit capability"); }
+    bool controlnet = false;
+    try { controlnet = rt.Engine?.SupportsControlNet == true; }
+    catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe ControlNet capability"); }
 
     if (ok)
     {
@@ -119,6 +125,8 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         config_path = rt.Config.ConfigPath,
         native_library = rt.Engine?.NativeLibraryPath,
         native_library_source = rt.Config.NativeLibrarySource,
+        supports_image_editing = editing,
+        supports_controlnet = controlnet,
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
     });
@@ -161,6 +169,14 @@ app.MapPost("/api/jobs", async (HttpContext context, WebUiRuntime rt) =>
     try
     {
         options = RequestMapper.ToOptions(body);
+        // Editing and ControlNet are additive in ABI v1: an older native
+        // library still serves text-to-image but lacks the matching export.
+        // Reject those modes here so the operator sees a 400 instead of a
+        // queued job failing later (or silently degrading to t2i / noise).
+        string? capabilityError = WebUiCapabilities.ErrorFor(options,
+            rt.Engine?.SupportsImageEditing == true,
+            rt.Engine?.SupportsControlNet == true);
+        if (capabilityError is not null) return BadRequest(capabilityError);
         job = rt.Queue.Submit(options);
     }
     catch (ArgumentException ex)

@@ -39,5 +39,7 @@ public enum GenerationPhase
     /// <summary>PNG encoding.</summary>
     Encode = 5,
     /// <summary>A stage name the wrapper does not recognise (still surfaced).</summary>
-    Unknown = 6
+    Unknown = 6,
+    /// <summary>Image edits only: VAE-encoding the reference image into latents.</summary>
+    ImageEncode = 7
 }

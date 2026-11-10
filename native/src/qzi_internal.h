@@ -16,8 +16,12 @@ void        qzi_emit_progress(const qzi_callbacks *callbacks, const char *phase,
 uint64_t    qzi_fnv1a(const char *text);
 qzi_status  qzi_validate_qwen21(const qzi_qwen21_request *request,
                                 char *error, size_t error_cap);
+qzi_status  qzi_validate_qwen21_edit(const qzi_qwen21_edit_request *request,
+                                     char *error, size_t error_cap);
 qzi_status  qzi_validate_zimage(const qzi_zimage_request *request,
                                 char *error, size_t error_cap);
+qzi_status  qzi_validate_zimage_control(const qzi_zimage_control_request *request,
+                                        char *error, size_t error_cap);
 
 /* The built-in deterministic backend vtable (defined in qzi_stub.c). */
 extern const qzi_backend qzi_reference_vtable;

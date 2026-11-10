@@ -48,7 +48,9 @@
       <label for="model">Model</label>
       <select id="model">
         <option value="qwen21">Qwen-Image 2.1</option>
+        <option value="qwen21-edit">Qwen-Image 2.1 · image edit</option>
         <option value="zimage">Z-Image</option>
+        <option value="zimage-control">Z-Image · ControlNet Union</option>
       </select>
     </div>
 
@@ -120,6 +122,53 @@
       </div>
     </div>
 
+    <!-- Qwen-Image 2.1 image editing: upload a reference, paint the region to
+         regenerate. Both rasters are PNG data URLs decoded by QziRasterImage,
+         so no imaging dependency is needed on the server. -->
+    <div class="edit-block" data-only="qwen21-edit">
+      <h3 class="section-title">Image edit</h3>
+      <div class="field">
+        <label for="reference-file">Reference image <span class="hint">PNG / JPEG / WebP · required</span></label>
+        <input id="reference-file" type="file" accept="image/*">
+      </div>
+      <p id="reference-empty" class="note edit-empty">Upload an image to start editing. The engine cover-fits it to the output canvas (same crop is applied to the mask).</p>
+      <div id="mask-editor" hidden>
+        <div id="mask-stage" class="mask-stage">
+          <img id="reference-preview" alt="Reference image preview">
+          <canvas id="mask-canvas" aria-label="Paint the areas to regenerate"></canvas>
+        </div>
+        <p class="note edit-note">Paint <strong>white</strong> where the image should be regenerated. Untouched pixels follow the reference trajectory. With no mask the whole image is edited at the denoising strength.</p>
+        <div class="grid-2">
+          <div class="field">
+            <label for="brush-mode">Brush</label>
+            <select id="brush-mode">
+              <option value="paint">Paint (regenerate)</option>
+              <option value="erase">Erase (keep)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="brush-size">Brush size <span class="hint" id="brush-size-hint">32 px</span></label>
+            <input id="brush-size" type="range" min="4" max="160" step="2" value="32">
+          </div>
+        </div>
+        <div class="button-row">
+          <button id="mask-clear" class="btn btn-ghost btn-sm" type="button">Clear mask</button>
+          <button id="mask-fill" class="btn btn-ghost btn-sm" type="button">Paint all white</button>
+          <button id="reference-remove" class="btn btn-ghost btn-sm" type="button">Remove image</button>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="strength">Denoising strength <span class="hint" id="strength-hint">0.75</span></label>
+            <input id="strength" type="range" min="0.05" max="1" step="0.05" value="0.75">
+          </div>
+          <div class="field">
+            <label for="masking-strength">Masking strength <span class="hint" id="masking-strength-hint">1.00</span></label>
+            <input id="masking-strength" type="range" min="0.05" max="1" step="0.05" value="1" disabled>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="field" data-only="zimage">
       <label for="checkpoint">Checkpoint</label>
       <select id="checkpoint">
@@ -129,6 +178,43 @@
         <option value="nunchaku-r64">nunchaku-r64</option>
         <option value="nunchaku-r128">nunchaku-r128</option>
       </select>
+    </div>
+
+    <!-- Z-Image Turbo Fun ControlNet Union. The control image must ALREADY be
+         preprocessed (pose / canny / depth / scribble): the library does NOT
+         run any edge / pose / depth estimator, it only consumes the planar RGB
+         control raster. Real Union weights come from zimage_control_dir. -->
+    <div class="edit-block control-block" data-only="zimage-control">
+      <h3 class="section-title">ControlNet Union</h3>
+      <div class="field">
+        <label for="control-file">Control image <span class="hint">PNG / JPEG / WebP · required · preprocessed</span></label>
+        <input id="control-file" type="file" accept="image/*">
+      </div>
+      <p id="control-empty" class="note edit-empty">Upload an <strong>already preprocessed</strong> control image (pose / canny / depth / scribble). This library does <strong>not</strong> run edge / pose / depth estimation — it consumes the control raster exactly as supplied ("raw" semantics).</p>
+      <div id="control-editor" hidden>
+        <img id="control-preview" class="control-preview" alt="Control image preview">
+        <div class="button-row">
+          <button id="control-remove" class="btn btn-ghost btn-sm" type="button">Remove image</button>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="control-type">Control type</label>
+            <select id="control-type">
+              <option value="auto">auto</option>
+              <option value="pose">pose</option>
+              <option value="canny">canny</option>
+              <option value="depth">depth</option>
+              <option value="scribble">scribble</option>
+              <option value="raw">raw</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="control-scale">Control scale <span class="hint" id="control-scale-hint">0.65</span></label>
+            <input id="control-scale" type="range" min="0" max="2" step="0.05" value="0.65">
+          </div>
+        </div>
+        <p class="note edit-note"><strong>Real weights required:</strong> configure the Z-Image Turbo Fun ControlNet Union weights via <code>zimage_control_dir</code> in <code>QwenZImage.config.json</code> (or <code>QZI_ZIMAGE_CONTROL_DIR</code>). The bundled reference backend only performs a deterministic byte comparison and emits noise — it is not real ControlNet inference.</p>
+      </div>
     </div>
 
     <button id="generate" class="btn btn-primary btn-block" type="button">Queue generation</button>

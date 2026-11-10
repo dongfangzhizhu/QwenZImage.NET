@@ -114,7 +114,9 @@ static void custom_shutdown(void *context)
 /*
  * Both generate_* implementations must:
  *   1. emit "model load" / "text" / "dit" (one tick per denoise step) /
- *      "vae" / "encode" through callbacks->progress when it is non-NULL;
+ *      "vae" / "encode" through callbacks->progress when it is non-NULL
+ *      (image edits additionally emit "image encode" for the reference VAE
+ *      pass, see the optional generate_qwen21_edit slot below);
  *   2. poll callbacks->should_cancel between phases and steps and return
  *      QZI_ERR_CANCELLED if it asks to stop;
  *   3. write a complete PNG into out_image->data / ->size / ->width /
@@ -235,7 +237,16 @@ static const qzi_backend custom_backend_vtable = {
     custom_generate_zimage,
     custom_health,
     custom_unload,
-    custom_release_image
+    custom_release_image,
+    /* Optional, additive in ABI v1. Leaving it NULL keeps t2i working and
+     * makes qzi_generate_qwen21_edit() answer QZI_ERR_UNSUPPORTED instead of
+     * calling through a null pointer. Implement it (see qzi_backend.h) to
+     * support Qwen-Image 2.1 image editing. */
+    NULL,
+    /* Optional, additive in ABI v1: Z-Image Turbo Fun ControlNet Union. NULL
+     * makes qzi_generate_zimage_control() answer QZI_ERR_UNSUPPORTED while
+     * every older generate path keeps working. */
+    NULL
 };
 
 /* Call this BEFORE qzi_engine_create(). The vtable is copied, so a static

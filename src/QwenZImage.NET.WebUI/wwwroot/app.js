@@ -12,7 +12,22 @@ const state = {
   selection: new Set(),
   lastDeleted: [],
   lightboxUrl: null,
+  // Qwen-Image 2.1 edit state. Both are PNG data URLs produced by a canvas;
+  // the server decodes them into planar rasters (no imaging dependency).
+  referencePng: null,
+  maskDirty: false,
+  editingAvailable: true,
+  // Z-Image Turbo Fun ControlNet Union state. The control image is a PNG data
+  // URL re-encoded by a canvas; it must already be preprocessed upstream.
+  controlPng: null,
+  controlnetAvailable: true,
+  drawing: false,
+  lastPoint: null,
 };
+
+const modelFamily = () => ($("model").value.startsWith("qwen21") ? "qwen21" : "zimage");
+const isEditMode = () => $("model").value === "qwen21-edit";
+const isControlMode = () => $("model").value === "zimage-control";
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -58,6 +73,25 @@ async function refreshHealth() {
         `served: ${h.engine?.served ?? 0}`,
       ].join("\n");
       $("backend-banner").hidden = !reference;
+      // Editing is additive in ABI v1: an older native library simply has no
+      // qzi_generate_qwen21_edit export. Do not offer a mode that would fail.
+      state.editingAvailable = h.supports_image_editing === true;
+      const editOption = document.querySelector('#model option[value="qwen21-edit"]');
+      if (editOption) editOption.disabled = !state.editingAvailable;
+      if (!state.editingAvailable && isEditMode()) {
+        $("model").value = "qwen21";
+        switchModel();
+      }
+      // ControlNet is additive in ABI v1 too: hide the mode when the loaded
+      // library has no qzi_generate_zimage_control export, so a job never
+      // silently degrades to text-to-image or the noise backend.
+      state.controlnetAvailable = h.supports_controlnet === true;
+      const controlOption = document.querySelector('#model option[value="zimage-control"]');
+      if (controlOption) controlOption.disabled = !state.controlnetAvailable;
+      if (!state.controlnetAvailable && isControlMode()) {
+        $("model").value = "zimage";
+        switchModel();
+      }
     } else {
       $("backend-banner").hidden = true;
       pill.className = "pill pill-bad";
@@ -81,11 +115,11 @@ async function refreshPresets() {
 }
 
 function renderPresets() {
-  const model = $("model").value;
+  const family = modelFamily();
   const select = $("preset");
   select.innerHTML = '<option value="">Custom</option>';
   state.presets.forEach((preset, index) => {
-    if (preset.model !== model) return;
+    if (preset.model !== family) return;
     const option = document.createElement("option");
     option.value = String(state.presets.indexOf(preset));
     option.textContent = `${preset.label}${preset.model === "qwen21" ? ` · ${preset.tier || "turbo"}` : ""}`;
@@ -101,7 +135,7 @@ function applyPreset() {
   if (!preset) return;
   $("width").value = preset.width;
   $("height").value = preset.height;
-  if (preset.model === "qwen21") {
+  if (modelFamily() === "qwen21") {
     $("tier").value = preset.tier || "turbo";
     $("steps").value = preset.steps ?? 8;
     $("guidance").value = preset.guidance ?? 1;
@@ -118,8 +152,9 @@ function markCustom() { $("preset").value = ""; }
 // -------------------------------------------------------------- model rules
 
 function syncModelUI() {
-  const model = $("model").value;
-  const step = model === "qwen21" ? 32 : 16;
+  const family = modelFamily();
+  const edit = isEditMode();
+  const step = family === "qwen21" ? 32 : 16;
   $("width").step = String(step);
   $("height").step = String(step);
   $("width").min = String(step);
@@ -127,19 +162,30 @@ function syncModelUI() {
   $("width-hint").textContent = `multiple of ${step}`;
   $("height-hint").textContent = `multiple of ${step}`;
 
+  // "qwen21" fields are shared by t2i and edit; "qwen21-edit" adds the
+  // reference/mask controls on top of them. "zimage-control" is a zimage
+  // variant (so checkpoint / 16-px steps still apply) that adds the control
+  // image, type and scale controls.
   document.querySelectorAll("[data-only]").forEach((el) => {
-    el.hidden = el.getAttribute("data-only") !== model;
+    const only = el.getAttribute("data-only");
+    el.hidden = only === "qwen21" ? family !== "qwen21"
+      : only === "qwen21-edit" ? !edit
+      : only === "zimage" ? family !== "zimage"
+      : only === "zimage-control" ? !isControlMode()
+      : false;
   });
 
-  const isBase = model === "qwen21" && $("tier").value === "base";
+  const isBase = family === "qwen21" && $("tier").value === "base";
   document.querySelectorAll("[data-requires='base']").forEach((el) => {
     el.querySelectorAll("input, select, textarea").forEach((input) => { input.disabled = !isBase; });
   });
   $("negative").disabled = !isBase;
+  syncMaskControls();
+  syncControlScaleHint();
 }
 
 function switchModel() {
-  const step = $("model").value === "qwen21" ? 32 : 16;
+  const step = modelFamily() === "qwen21" ? 32 : 16;
   ["width", "height"].forEach((id) => {
     const input = $(id);
     const value = Math.min(2048, Math.max(step, Number(input.value) || 1024));
@@ -150,10 +196,207 @@ function switchModel() {
   syncModelUI();
 }
 
+// ------------------------------------------------------------- image edits
+
+/* The native decoder accepts 8-bit PNG, so re-encode every upload through a
+ * canvas. That also gives us a single resolution for both the reference and
+ * the painted mask, which the engine cover-fits with the SAME crop. */
+function syncMaskControls() {
+  const masking = $("masking-strength");
+  if (!masking) return;
+  masking.disabled = !state.maskDirty;
+  $("masking-strength-hint").textContent = Number(masking.value).toFixed(2);
+  $("strength-hint").textContent = Number($("strength").value).toFixed(2);
+  $("brush-size-hint").textContent = `${$("brush-size").value} px`;
+}
+
+function clearMask() {
+  const canvas = $("mask-canvas");
+  canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+  state.maskDirty = false;
+  syncMaskControls();
+}
+
+function fillMask() {
+  const canvas = $("mask-canvas");
+  const ctx = canvas.getContext("2d");
+  ctx.save();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.restore();
+  state.maskDirty = true;
+  syncMaskControls();
+}
+
+function removeReference() {
+  state.referencePng = null;
+  state.maskDirty = false;
+  $("reference-file").value = "";
+  $("reference-preview").removeAttribute("src");
+  $("mask-editor").hidden = true;
+  $("reference-empty").hidden = false;
+  syncMaskControls();
+}
+
+async function loadReference(file) {
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+
+    // Mirror qzi.c / QziRasterImage limits: <= 4096 per side and at most
+    // 2048*2048 total pixels. Downscale before encoding so the server never
+    // has to reject a perfectly good photo.
+    const maxSide = 4096, maxPixels = 2048 * 2048;
+    const nativeW = image.naturalWidth, nativeH = image.naturalHeight;
+    const scale = Math.min(1, maxSide / nativeW, maxSide / nativeH,
+                           Math.sqrt(maxPixels / (nativeW * nativeH)));
+    const width = Math.max(1, Math.round(nativeW * scale));
+    const height = Math.max(1, Math.round(nativeH * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext("2d").drawImage(image, 0, 0, width, height);
+    state.referencePng = canvas.toDataURL("image/png");
+
+    $("reference-preview").src = state.referencePng;
+    const mask = $("mask-canvas");
+    mask.width = width;
+    mask.height = height;
+    clearMask();
+    $("reference-empty").hidden = true;
+    $("mask-editor").hidden = false;
+    showToast(`Reference loaded (${width}×${height}). Paint white to regenerate a region.`);
+  } catch (error) {
+    showToast(`Could not read the reference image: ${error.message || error}`);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function strokeGeometry(event) {
+  const canvas = $("mask-canvas");
+  const rect = canvas.getBoundingClientRect();
+  const ratio = canvas.width / rect.width;
+  return {
+    ctx: canvas.getContext("2d"),
+    ratio,
+    x: (event.clientX - rect.left) * ratio,
+    y: (event.clientY - rect.top) * ratio,
+    width: Number($("brush-size").value) * ratio,
+  };
+}
+
+function prepareStroke(ctx, width) {
+  const erasing = $("brush-mode").value === "erase";
+  ctx.save();
+  ctx.globalCompositeOperation = erasing ? "destination-out" : "source-over";
+  ctx.strokeStyle = "#ffffff";
+  ctx.fillStyle = "#ffffff";
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+}
+
+function beginStroke(event) {
+  if ($("mask-editor").hidden) return;
+  event.preventDefault();
+  const g = strokeGeometry(event);
+  state.drawing = true;
+  state.lastPoint = { x: g.x, y: g.y };
+  $("mask-canvas").setPointerCapture(event.pointerId);
+  prepareStroke(g.ctx, g.width);
+  // A single click still paints a dot, not an invisible zero-length line.
+  g.ctx.beginPath();
+  g.ctx.arc(g.x, g.y, g.width / 2, 0, Math.PI * 2);
+  g.ctx.fill();
+  g.ctx.restore();
+  state.maskDirty = true;
+  syncMaskControls();
+}
+
+function moveStroke(event) {
+  if (!state.drawing) return;
+  event.preventDefault();
+  const g = strokeGeometry(event);
+  prepareStroke(g.ctx, g.width);
+  g.ctx.beginPath();
+  g.ctx.moveTo(state.lastPoint.x, state.lastPoint.y);
+  g.ctx.lineTo(g.x, g.y);
+  g.ctx.stroke();
+  g.ctx.restore();
+  state.lastPoint = { x: g.x, y: g.y };
+}
+
+function endStroke() {
+  state.drawing = false;
+  state.lastPoint = null;
+}
+
+// Transparent pixels decode to mask value 0 ("keep"); opaque white strokes
+// decode to 255 ("regenerate"). Only send the mask once it has been painted.
+function maskPng() {
+  return state.maskDirty ? $("mask-canvas").toDataURL("image/png") : null;
+}
+
+// ------------------------------------------ Z-Image ControlNet Union
+
+/* The control image must already be preprocessed. Re-encode every upload
+ * through a canvas to 8-bit PNG (the only format the native decoder accepts)
+ * and downscale to the QziRasterImage limits. No server-side estimator. */
+async function loadControlImage(file) {
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+    const maxSide = 4096, maxPixels = 2048 * 2048;
+    const nativeW = image.naturalWidth, nativeH = image.naturalHeight;
+    const scale = Math.min(1, maxSide / nativeW, maxSide / nativeH,
+                           Math.sqrt(maxPixels / (nativeW * nativeH)));
+    const width = Math.max(1, Math.round(nativeW * scale));
+    const height = Math.max(1, Math.round(nativeH * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext("2d").drawImage(image, 0, 0, width, height);
+    state.controlPng = canvas.toDataURL("image/png");
+    $("control-preview").src = state.controlPng;
+    $("control-empty").hidden = true;
+    $("control-editor").hidden = false;
+    showToast(`Control image loaded (${width}×${height}). Used as-is (no preprocessing).`);
+  } catch (error) {
+    showToast(`Could not read the control image: ${error.message || error}`);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function removeControlImage() {
+  state.controlPng = null;
+  $("control-file").value = "";
+  $("control-preview").removeAttribute("src");
+  $("control-editor").hidden = true;
+  $("control-empty").hidden = false;
+}
+
+function syncControlScaleHint() {
+  const slider = $("control-scale");
+  if (!slider) return;
+  const value = Number(slider.value);
+  $("control-scale-hint").textContent = value === 0 ? "0 (engine default 0.65)" : value.toFixed(2);
+}
+
 // --------------------------------------------------------------------- form
 
 function buildRequestBody() {
   const model = $("model").value;
+  const family = modelFamily();
   const body = {
     model,
     prompt: $("prompt").value.trim(),
@@ -162,7 +405,7 @@ function buildRequestBody() {
     seed: Number($("seed").value),
     client: "webui",
   };
-  if (model === "qwen21") {
+  if (family === "qwen21") {
     body.tier = $("tier").value;
     // LoRA is valid on both tiers in the library / C ABI; only the sampler
     // controls and negative prompt are base-only.
@@ -180,6 +423,22 @@ function buildRequestBody() {
   } else {
     body.checkpoint = $("checkpoint").value;
   }
+  if (isEditMode()) {
+    body.reference_image = state.referencePng;
+    body.strength = Number($("strength").value);
+    const mask = maskPng();
+    if (mask) {
+      body.mask_image = mask;
+      // masking_strength would be silently dropped without a mask, so the
+      // mapper rejects that combination. Only send both together.
+      body.masking_strength = Number($("masking-strength").value);
+    }
+  }
+  if (isControlMode()) {
+    body.control_image = state.controlPng;
+    body.control_type = $("control-type").value;
+    body.control_scale = Number($("control-scale").value);
+  }
   return body;
 }
 
@@ -189,13 +448,30 @@ async function submit() {
     $("prompt").focus();
     return;
   }
+  if (isEditMode() && !state.referencePng) {
+    showToast("Upload a reference image before queueing an edit.");
+    $("reference-file").focus();
+    return;
+  }
+  if (isControlMode() && !state.controlPng) {
+    showToast("Upload a preprocessed control image before queueing a ControlNet job.");
+    $("control-file").focus();
+    return;
+  }
+  const payload = JSON.stringify(buildRequestBody());
+  // The API caps the body at 64 MiB. Base64 inflates by ~4/3, so a very large
+  // photo plus mask / control image can exceed it; say so before it is wasted.
+  if (payload.length > 60 * 1024 * 1024) {
+    showToast("Reference / mask / control image payload is too large (60 MiB limit). Use a smaller image.");
+    return;
+  }
   const button = $("generate");
   button.disabled = true;
   try {
     const job = await api("/api/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildRequestBody()),
+      body: payload,
     });
     state.jobs.set(job.id, job);
     renderJobs();
@@ -229,12 +505,18 @@ function renderJobs() {
     const output = job.output_url
       ? `<a class="link" href="${escapeHtml(job.output_url)}" target="_blank" rel="noopener">PNG (${job.output_length ?? 0} B)</a>`
       : (job.error ? `<span class="error-text" title="${escapeHtml(job.error)}">${escapeHtml(job.error)}</span>` : "—");
+    const editBadge = job.edit
+      ? `<span class="job-edit-badge">edit${job.has_mask ? " · mask" : ""}</span>`
+      : "";
+    const controlBadge = job.control
+      ? `<span class="job-control-badge">control</span>`
+      : "";
     const actions = [];
     if (!terminal) actions.push(`<button class="btn btn-ghost btn-sm" data-action="cancel" data-id="${job.id}">Cancel</button>`);
     else actions.push(`<button class="btn btn-ghost btn-sm" data-action="retry" data-id="${job.id}">Retry</button>`);
     return `<tr>
       <td>#${job.id}${job.retry_of ? `<div class="hint">↻ #${job.retry_of}</div>` : ""}</td>
-      <td>${escapeHtml(job.model)}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
+      <td>${escapeHtml(job.model)}${editBadge}${controlBadge}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
       <td><span class="state state-${escapeHtml(job.state)}">${escapeHtml(job.state)}</span></td>
       <td class="progress-cell">
         <div class="progress-track"><div class="progress-fill" style="width:${job.state === "done" ? 100 : fraction}%"></div></div>
@@ -398,6 +680,26 @@ function wire() {
     $(id).addEventListener("change", markCustom);
   });
   $("tier").addEventListener("change", () => { syncModelUI(); markCustom(); });
+
+  // Image editing: reference upload, brush mask and the two strength sliders.
+  $("reference-file").addEventListener("change", (event) => loadReference(event.target.files?.[0]));
+  $("mask-clear").addEventListener("click", clearMask);
+  $("mask-fill").addEventListener("click", fillMask);
+  $("reference-remove").addEventListener("click", removeReference);
+  const maskCanvas = $("mask-canvas");
+  maskCanvas.addEventListener("pointerdown", beginStroke);
+  maskCanvas.addEventListener("pointermove", moveStroke);
+  maskCanvas.addEventListener("pointerup", endStroke);
+  maskCanvas.addEventListener("pointercancel", endStroke);
+  maskCanvas.addEventListener("lostpointercapture", endStroke);
+  ["strength", "masking-strength", "brush-size"].forEach((id) => {
+    $(id).addEventListener("input", syncMaskControls);
+  });
+
+  // Z-Image ControlNet Union: control-image upload, removal and scale slider.
+  $("control-file").addEventListener("change", (event) => loadControlImage(event.target.files?.[0]));
+  $("control-remove").addEventListener("click", removeControlImage);
+  $("control-scale").addEventListener("input", syncControlScaleHint);
   $("seed-dice").addEventListener("click", () => {
     $("seed").value = String(crypto.getRandomValues(new Uint32Array(1))[0]);
   });

@@ -28,17 +28,22 @@ qzen_qwen21_vae *qzen_qwen21_vae_open(const char *checkpoint, int thread_count, 
                                   size_t error_size);
 void qzen_qwen21_vae_close(qzen_qwen21_vae *vae);
 
-/* Decode a denormalised latent [64][height][width] into RGB8 [3][4*height][4*width]:
- * clamp to [-1, 1] then (x + 1) * 127.5, rounding to the nearest integer. */
+/* Decode a denormalised latent [64][height][width] into RGB8
+ * [3][16*height][16*width] (four nearest-2x up blocks): clamp to [-1, 1]
+ * then (x + 1) * 127.5, rounding to the nearest integer. The encoder below
+ * is the exact inverse, hence the /16 latent grid used by the ABI. */
 int qzen_qwen21_vae_decode(qzen_qwen21_vae *vae, const float *latent, int height, int width,
                          unsigned char *rgb, char *error, size_t error_size);
 
 /* Encode RGB8 [3][height][width] into the sampler's normalised latent
  * [64][height/16][width/16]: the encoder is the mirror of the decoder and
  * lives in the same checkpoint, loaded on the first call. The 4th input
- * channel is the edit mask (1 = regenerate this pixel), which is what the
- * checkpoint's 4-channel conv_in expects. Deterministic: the returned latent
- * is the posterior mean, so an edit does not resample the reference. */
+ * channel is the RGBA alpha of the reference (WanGP feeds image.convert("RGBA")
+ * into the VAE); an opaque edit reference therefore sets it to 1 everywhere.
+ * The user's inpainting mask does NOT enter the VAE -- it is applied on the
+ * latent grid by the sampler (see qzen_qwen21_sample.latent_mask).
+ * Deterministic: the returned latent is the posterior mean, so an edit does
+ * not resample the reference. */
 int qzen_qwen21_vae_encode(qzen_qwen21_vae *vae, const unsigned char *rgb, int height, int width,
                          float *latent, char *error, size_t error_size);
 

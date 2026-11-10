@@ -49,6 +49,9 @@ public sealed record QziConfig
     /// <summary>Environment variable carrying the Z-Image Nunchaku directory to the native backend.</summary>
     public const string NunchakuDirectoryVariable = "QZI_ZIMAGE_NUNCHAKU_DIR";
 
+    /// <summary>Environment variable carrying the Z-Image ControlNet Union weights directory to the native backend.</summary>
+    public const string ZImageControlDirectoryVariable = "QZI_ZIMAGE_CONTROL_DIR";
+
     /// <summary>Environment variable overriding <c>text_cache_dir</c>.</summary>
     public const string ModelCacheVariable = "QZI_MODEL_CACHE";
 
@@ -60,8 +63,8 @@ public sealed record QziConfig
 
     private static readonly HashSet<string> KnownKeys = new(StringComparer.Ordinal)
     {
-        "qwen21_dir", "zimage_dir", "zimage_nunchaku_dir", "qwen21_lora_dir",
-        "text_cache_dir", "device_id", "thread_count", "native_library"
+        "qwen21_dir", "zimage_dir", "zimage_nunchaku_dir", "zimage_control_dir",
+        "qwen21_lora_dir", "text_cache_dir", "device_id", "thread_count", "native_library"
     };
 
     private static readonly HashSet<string> PlatformKeys = new(StringComparer.Ordinal)
@@ -77,6 +80,9 @@ public sealed record QziConfig
 
     /// <summary>SVDQuant int4 DiT repacks for Z-Image; empty means unavailable.</summary>
     public string? ZImageNunchakuDirectory { get; init; }
+
+    /// <summary>Z-Image Turbo Fun ControlNet Union weights directory.</summary>
+    public string? ZImageControlDirectory { get; init; }
 
     /// <summary>Directory holding Qwen-Image 2.1 LoRA adapters (bare file names).</summary>
     public string? Qwen21LoraDirectory { get; init; }
@@ -133,6 +139,7 @@ public sealed record QziConfig
             Qwen21Directory = Expand(Str(values, "qwen21_dir", path)),
             ZImageDirectory = Expand(Str(values, "zimage_dir", path)),
             ZImageNunchakuDirectory = Expand(Str(values, "zimage_nunchaku_dir", path)),
+            ZImageControlDirectory = Expand(Str(values, "zimage_control_dir", path)),
             Qwen21LoraDirectory = Expand(Str(values, "qwen21_lora_dir", path)),
             TextCacheDirectory = Expand(Str(values, "text_cache_dir", path)),
             NativeLibraryPath = Expand(Str(values, "native_library", path)),
@@ -182,6 +189,7 @@ public sealed record QziConfig
         CacheDirectory = TextCacheDirectory,
         Qwen21LoraDirectory = Qwen21LoraDirectory,
         ZImageNunchakuDirectory = ZImageNunchakuDirectory,
+        ZImageControlDirectory = ZImageControlDirectory,
         DeviceId = DeviceId,
         ThreadCount = ThreadCount,
         NativeLibraryPath = NativeLibraryPath,
@@ -202,6 +210,7 @@ public sealed record QziConfig
             "qwen21_dir" => this with { Qwen21Directory = expanded },
             "zimage_dir" => this with { ZImageDirectory = expanded },
             "zimage_nunchaku_dir" => this with { ZImageNunchakuDirectory = expanded },
+            "zimage_control_dir" => this with { ZImageControlDirectory = expanded },
             "qwen21_lora_dir" => this with { Qwen21LoraDirectory = expanded },
             "text_cache_dir" => this with { TextCacheDirectory = expanded },
             "native_library" => this with { NativeLibraryPath = expanded },
@@ -269,6 +278,7 @@ public sealed record QziConfig
         result = Env(result, Qwen21DirectoryVariable, c => c with { Qwen21Directory = Expand(Environment.GetEnvironmentVariable(Qwen21DirectoryVariable)) });
         result = Env(result, ZImageDirectoryVariable, c => c with { ZImageDirectory = Expand(Environment.GetEnvironmentVariable(ZImageDirectoryVariable)) });
         result = Env(result, NunchakuDirectoryVariable, c => c with { ZImageNunchakuDirectory = Expand(Environment.GetEnvironmentVariable(NunchakuDirectoryVariable)) });
+        result = Env(result, ZImageControlDirectoryVariable, c => c with { ZImageControlDirectory = Expand(Environment.GetEnvironmentVariable(ZImageControlDirectoryVariable)) });
         result = Env(result, LoraDirectoryVariable, c => c with { Qwen21LoraDirectory = Expand(Environment.GetEnvironmentVariable(LoraDirectoryVariable)) });
         result = Env(result, ModelCacheVariable, c => c with { TextCacheDirectory = Expand(Environment.GetEnvironmentVariable(ModelCacheVariable)) });
         result = Env(result, NativeLibraryVariable, c => c with { NativeLibraryPath = Expand(Environment.GetEnvironmentVariable(NativeLibraryVariable)) });

@@ -4,6 +4,8 @@
 #include "qzen_zimage_text.h"
 #include "qzen_tokenizer.h"
 #include "qzen_safetensors.h"
+#include "qzen_zimage_control.h"
+#include "qzen_zimage_vae.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -579,11 +581,386 @@ static void zpipe_unpatchify(const float *branch, uint32_t x_real,
     }
 }
 
+/* --- Z-Image Turbo Fun ControlNet Union 2.1 ------------------------------
+ *
+ * One denoise step precomputes every ControlNet skip connection on the host,
+ * then the ordinary CPU/GPU DiT forward adds them with context_scale. This is
+ * the WanGP v2.x path (prepare_forward_control_2_0_refiner -> dedicated
+ * control noise refiners -> control_layers prime pass ->
+ * prepare_forward_control_2_0_layers -> control_layers hint pass) specialised
+ * for the single-sample, guidance_scale = 0 case the C engine implements.
+ *
+ * Running the hint path on the host keeps the CUDA change to one new kernel
+ * (BF16 scaled add) and avoids uploading a second 7 GiB transformer when the
+ * text encoder is still resident. When the ControlNet weights have been
+ * uploaded, each control block is evaluated on the device through the
+ * host-in/host-out block wrapper; otherwise the CPU reference forward runs.
+ */
+
+typedef struct {
+    float *noise[QZEN_ZIMAGE_CONTROL_REFINERS]; /* [seq_x, dim] */
+    float *main[QZEN_ZIMAGE_CONTROL_LAYERS];    /* [seq, dim] */
+    uint32_t layers, refiners, seq_x, seq, dim;
+    float scale;
+} zpipe_control_hints;
+
+static void zpipe_control_hints_free(zpipe_control_hints *hints) {
+    if (!hints) return;
+    for (uint32_t i = 0; i < QZEN_ZIMAGE_CONTROL_REFINERS; i++)
+        free(hints->noise[i]);
+    for (uint32_t i = 0; i < QZEN_ZIMAGE_CONTROL_LAYERS; i++)
+        free(hints->main[i]);
+    memset(hints, 0, sizeof(*hints));
+}
+
+static void zpipe_control_add(float *dst, const float *src, size_t count,
+                              float alpha) {
+    for (size_t i = 0; i < count; i++) dst[i] += alpha * src[i];
+}
+
+static int zpipe_control_block(const qzen_zimage_pipeline *pipe,
+                               const qzen_zimage_block *block, int use_gpu,
+                               float *x, uint32_t seq, const float *adaln,
+                               const float *rope_cos, const float *rope_sin,
+                               char *error, size_t error_size) {
+    if (use_gpu && pipe->gpu)
+        return qzen_zimage_block_forward_gpu_host(block, pipe->gpu, x, seq,
+                                                  adaln, rope_cos, rope_sin,
+                                                  error, error_size);
+    return qzen_zimage_block_forward(block, x, seq, adaln, rope_cos, rope_sin,
+                                     error, error_size);
+}
+
+/* out = linear(x), in place (scratch has rows * linear->out floats). */
+static void zpipe_control_proj(const qzen_zimage_linear *linear, float *x,
+                               uint32_t rows, float *scratch) {
+    qzen_zimage_linear_forward(linear, x, rows, scratch);
+    memcpy(x, scratch, (size_t)rows * linear->out * sizeof(float));
+}
+
+static int zpipe_control_hints_compute(const qzen_zimage_pipeline *pipe,
+    const zpipe_prep *prep, const float *cap_feats, uint32_t cap_len,
+    qzen_zimage_control *control, const float *control_context,
+    float context_scale, zpipe_control_hints *hints,
+    char *error, size_t error_size) {
+    memset(hints, 0, sizeof(*hints));
+    const uint32_t dim = prep->dim, half = prep->half;
+    const uint32_t seq = prep->seq, seq_x = prep->seq_x;
+    const uint32_t seq_cap = prep->seq_cap;
+    const uint32_t layers = qzen_zimage_control_layers(control);
+    const uint32_t refiners = qzen_zimage_control_refiners(control);
+    const uint32_t in_dim = qzen_zimage_control_in_dim(control);
+    if (!layers || layers > QZEN_ZIMAGE_CONTROL_LAYERS || !refiners ||
+        refiners > QZEN_ZIMAGE_CONTROL_REFINERS ||
+        (in_dim != QZEN_ZIMAGE_CONTROL_IN_DIM_V2)) {
+        zpipe_fail(error, error_size,
+                   "unsupported ControlNet Union variant: in_dim=%u, %u layers, "
+                   "%u dedicated noise refiners (expected v2.x: 33/15/2)",
+                   in_dim, layers, refiners);
+        return 0;
+    }
+    if (!control_context || !cap_feats || !isfinite(context_scale)) {
+        zpipe_fail(error, error_size, "invalid ControlNet context or scale");
+        return 0;
+    }
+
+    const int ctrl_gpu = pipe->gpu && qzen_zimage_control_uploaded(control);
+    const int main_gpu = pipe->gpu != NULL;
+    const size_t x_count = (size_t)seq_x * dim;
+    const size_t full_count = (size_t)seq * dim;
+    const uint32_t patch_features = in_dim * 4;
+
+    float *ctrl_patches = calloc((size_t)seq_x * patch_features, sizeof(float));
+    float *c = malloc(full_count * sizeof(float));
+    float *x_init = malloc(x_count * sizeof(float));
+    float *x_nr = malloc(x_count * sizeof(float));
+    float *cap_buf = malloc((size_t)seq_cap * dim * sizeof(float));
+    float *normed = malloc((size_t)(cap_len ? cap_len : 1) * 2560 * sizeof(float));
+    float *scratch = malloc(full_count * sizeof(float));
+    float *x_unified = malloc(full_count * sizeof(float));
+    if (!ctrl_patches || !c || !x_init || !x_nr || !cap_buf || !normed ||
+        !scratch || !x_unified) {
+        free(ctrl_patches); free(c); free(x_init); free(x_nr);
+        free(cap_buf); free(normed); free(scratch); free(x_unified);
+        zpipe_fail(error, error_size, "cannot allocate ControlNet hint buffers");
+        return 0;
+    }
+
+    /* Patchify the control context exactly like the main latents, but with
+     * in_dim planes per 2x2 cell: token = (h * w_tokens + w), feature =
+     * (ph * 2 + pw) * in_dim + c. Padded rows stay zero until after the
+     * embedder, when they are replaced by the main DiT's x_pad_token. */
+    const uint32_t lh = prep->latent_h, lw = prep->latent_w;
+    for (uint32_t h = 0; h < prep->h_tokens; h++) {
+        for (uint32_t w = 0; w < prep->w_tokens; w++) {
+            float *row = ctrl_patches +
+                         ((size_t)h * prep->w_tokens + w) * patch_features;
+            for (uint32_t ph = 0; ph < 2; ph++) {
+                for (uint32_t pw = 0; pw < 2; pw++) {
+                    const size_t pixel =
+                        (size_t)(2 * h + ph) * lw + 2 * w + pw;
+                    float *cell = row + ((size_t)(ph * 2 + pw) * in_dim);
+                    for (uint32_t ch = 0; ch < in_dim; ch++)
+                        cell[ch] = control_context[(size_t)ch * lh * lw + pixel];
+                }
+            }
+        }
+    }
+
+    /* Only the real patch rows carry data; the padded rows are overwritten
+     * with x_pad_token below, so never read the uninitialised tail. */
+    qzen_zimage_linear_forward(qzen_zimage_control_embedder(control),
+                               ctrl_patches, prep->x_real, c);
+    qzen_zimage_linear_forward(&pipe->x_embedder, prep->patches,
+                               prep->x_real, x_init);
+    for (uint32_t i = prep->x_real; i < seq_x; i++) {
+        memcpy(c + (size_t)i * dim, pipe->x_pad_token, dim * sizeof(float));
+        memcpy(x_init + (size_t)i * dim, pipe->x_pad_token,
+               dim * sizeof(float));
+    }
+    free(ctrl_patches);
+    ctrl_patches = NULL;
+
+    /* Context-refined caption rows. WanGP uses cap_embedded_list[0] *after*
+     * the context refiners when it assembles the main-layer hint sequence. */
+    qzen_zimage_rms_forward(&pipe->cap_norm, cap_feats, cap_len, normed);
+    qzen_zimage_linear_forward(&pipe->cap_linear, normed, cap_len, cap_buf);
+    for (uint32_t i = cap_len; i < seq_cap; i++)
+        memcpy(cap_buf + (size_t)i * dim, pipe->cap_pad_token,
+               dim * sizeof(float));
+    free(normed);
+    normed = NULL;
+    for (uint32_t index = 0; index < 2; index++) {
+        if (!zpipe_control_block(pipe, pipe->context_refiner[index], main_gpu,
+                                 cap_buf, seq_cap, NULL,
+                                 prep->rope_cos + (size_t)seq_x * half,
+                                 prep->rope_sin + (size_t)seq_x * half,
+                                 error, error_size))
+            goto fail;
+    }
+
+    /* Dedicated control noise refiners: before_proj(c) + x at block 0, one
+     * control block, then after_proj(c) becomes this layer's skip. */
+    for (uint32_t r = 0; r < refiners; r++) {
+        const qzen_zimage_linear *before =
+            qzen_zimage_control_before_proj(control, 1, r);
+        if (before) {
+            zpipe_control_proj(before, c, seq_x, scratch);
+            zpipe_control_add(c, x_init, x_count, 1.0f);
+        }
+        if (!zpipe_control_block(pipe,
+                                 qzen_zimage_control_refiner(control, r),
+                                 ctrl_gpu, c, seq_x, prep->adaln,
+                                 prep->rope_cos, prep->rope_sin,
+                                 error, error_size))
+            goto fail;
+        float *skip = malloc(x_count * sizeof(float));
+        if (!skip) {
+            zpipe_fail(error, error_size, "cannot allocate ControlNet noise hint");
+            goto fail;
+        }
+        qzen_zimage_linear_forward(
+            qzen_zimage_control_after_proj(control, 1, r), c, seq_x, skip);
+        hints->noise[r] = skip;
+    }
+
+    /* The main noise refiners, with their skips applied, form the `x` that
+     * control_layers.0 adds to the main-phase hint sequence. */
+    memcpy(x_nr, x_init, x_count * sizeof(float));
+    for (uint32_t index = 0; index < 2 && index < refiners; index++) {
+        if (!zpipe_control_block(pipe, pipe->noise_refiner[index], main_gpu,
+                                 x_nr, seq_x, prep->adaln,
+                                 prep->rope_cos, prep->rope_sin,
+                                 error, error_size))
+            goto fail;
+        zpipe_control_add(x_nr, hints->noise[index], x_count, context_scale);
+    }
+
+    /* v2.x "finish processing" pass: advance the hint state through all
+     * control layers on the image section before the main layers run. */
+    for (uint32_t j = 0; j < layers; j++) {
+        const qzen_zimage_linear *before =
+            qzen_zimage_control_before_proj(control, 0, j);
+        if (before) {
+            zpipe_control_proj(before, c, seq_x, scratch);
+            zpipe_control_add(c, x_init, x_count, 1.0f);
+        }
+        if (!zpipe_control_block(pipe, qzen_zimage_control_layer(control, j),
+                                 ctrl_gpu, c, seq_x, prep->adaln,
+                                 prep->rope_cos, prep->rope_sin,
+                                 error, error_size))
+            goto fail;
+    }
+
+    /* Main-phase hints: [control context | refined caption] over the unified
+     * sequence, with the noise-refined image + caption as the `x` added by
+     * control_layers.0. Every layer produces one skip for main layer 2*j. */
+    memcpy(c + x_count, cap_buf, (size_t)seq_cap * dim * sizeof(float));
+    memcpy(x_unified, x_nr, x_count * sizeof(float));
+    memcpy(x_unified + x_count, cap_buf,
+           (size_t)seq_cap * dim * sizeof(float));
+    for (uint32_t j = 0; j < layers; j++) {
+        const qzen_zimage_linear *before =
+            qzen_zimage_control_before_proj(control, 0, j);
+        if (before) {
+            zpipe_control_proj(before, c, seq, scratch);
+            zpipe_control_add(c, x_unified, full_count, 1.0f);
+        }
+        if (!zpipe_control_block(pipe, qzen_zimage_control_layer(control, j),
+                                 ctrl_gpu, c, seq, prep->adaln,
+                                 prep->rope_cos, prep->rope_sin,
+                                 error, error_size))
+            goto fail;
+        float *skip = malloc(full_count * sizeof(float));
+        if (!skip) {
+            zpipe_fail(error, error_size, "cannot allocate ControlNet layer hint");
+            goto fail;
+        }
+        qzen_zimage_linear_forward(
+            qzen_zimage_control_after_proj(control, 0, j), c, seq, skip);
+        hints->main[j] = skip;
+    }
+
+    hints->layers = layers;
+    hints->refiners = refiners;
+    hints->seq_x = seq_x;
+    hints->seq = seq;
+    hints->dim = dim;
+    hints->scale = context_scale;
+    free(c); free(x_init); free(x_nr); free(cap_buf);
+    free(scratch); free(x_unified);
+    return 1;
+
+fail:
+    free(ctrl_patches);
+    free(c); free(x_init); free(x_nr); free(cap_buf);
+    free(normed); free(scratch); free(x_unified);
+    zpipe_control_hints_free(hints);
+    return 0;
+}
+
+float *qzen_zpipe_control_context(const qzen_zimage_control *control,
+                                  const float *control_latent,
+                                  uint32_t latent_h, uint32_t latent_w,
+                                  char *error, size_t error_size) {
+    const uint32_t in_dim = qzen_zimage_control_in_dim(control);
+    if (!control_latent || !latent_h || !latent_w ||
+        (in_dim != QZEN_ZIMAGE_CONTROL_IN_DIM_V2 &&
+         in_dim != QZEN_ZIMAGE_CONTROL_IN_DIM_V1)) {
+        zpipe_fail(error, error_size, "invalid ControlNet control latent");
+        return NULL;
+    }
+    const size_t plane = (size_t)latent_h * latent_w;
+    float *context = calloc((size_t)in_dim * plane, sizeof(float));
+    if (!context) {
+        zpipe_fail(error, error_size, "cannot allocate ControlNet context");
+        return NULL;
+    }
+    /* [control_latent(16) | keep_mask(1, zero) | inpaint_latent(16, zero)].
+     * With no inpaint mask WanGP leaves the last 17 planes at zero. */
+    memcpy(context, control_latent, 16 * plane * sizeof(float));
+    return context;
+}
+
+int qzen_zpipe_control_prepare(qzen_zimage_pipeline *pipe,
+                               qzen_zimage_control *control,
+                               char *error, size_t error_size) {
+    if (!pipe || !control) {
+        zpipe_fail(error, error_size, "control prepare needs a pipeline and weights");
+        return 0;
+    }
+    if (!pipe->gpu) return 1; /* CPU hint path needs no uploads */
+    char local[512];
+    if (!qzen_zimage_control_upload(control, pipe->gpu, local, sizeof(local))) {
+        /* Device upload is an optimisation, not a requirement. */
+        if (getenv("ZPIPE_TRACE"))
+            fprintf(stderr, "ControlNet GPU upload unavailable (%s); "
+                            "using the CPU hint path\n", local);
+        if (error && error_size) error[0] = '\0';
+    }
+    return 1;
+}
+
+/* --- Hint injection ----------------------------------------------------------
+ *
+ * WanGP's BaseZImageTransformerBlock.forward adds each ControlNet skip AFTER
+ * its own attention / feed-forward pass, with alpha = control_context_scale.
+ * control_layers_places is [0,2,...,28] for Union 2.x, so only even main
+ * layers receive a hint; the two dedicated control noise refiners map 1:1 to
+ * the main DiT's noise_refiner.0/1. A NULL `hints` leaves the ordinary t2i
+ * forward bit-for-bit unchanged (qzen_zpipe_denoise() always passes NULL).
+ */
+static uint16_t zpipe_f32_to_bf16(float value);
+
+static const float *zpipe_hint_for(const zpipe_control_hints *hints,
+                                   int main_phase, uint32_t index,
+                                   size_t *count, float *scale) {
+    if (!hints) return NULL;
+    if (main_phase) {
+        if ((index & 1u) != 0u) return NULL;
+        uint32_t j = index / 2u;
+        if (j >= hints->layers || !hints->main[j]) return NULL;
+        *count = (size_t)hints->seq * hints->dim;
+        *scale = hints->scale;
+        return hints->main[j];
+    }
+    if (index >= hints->refiners || !hints->noise[index]) return NULL;
+    *count = (size_t)hints->seq_x * hints->dim;
+    *scale = hints->scale;
+    return hints->noise[index];
+}
+
+static void zpipe_apply_hint_cpu(float *x, const zpipe_control_hints *hints,
+                                 int main_phase, uint32_t index) {
+    size_t count;
+    float scale;
+    const float *hint = zpipe_hint_for(hints, main_phase, index, &count, &scale);
+    if (hint) zpipe_control_add(x, hint, count, scale);
+}
+
+/* `scratch` / `staged` are allocated lazily on the first injection with
+ * `capacity` elements, which must cover the largest hint (the unified
+ * sequence). Every early return in the GPU forward happens before the first
+ * injection, so those buffers never leak on an error path. */
+static int zpipe_apply_hint_gpu(const qzen_zimage_pipeline *pipe,
+                                qzen_gpu_tensor *dst,
+                                qzen_gpu_tensor **scratch, uint16_t **staged,
+                                size_t capacity,
+                                const zpipe_control_hints *hints,
+                                int main_phase, uint32_t index,
+                                char *error, size_t error_size) {
+    size_t count;
+    float scale;
+    const float *hint = zpipe_hint_for(hints, main_phase, index, &count, &scale);
+    if (!hint) return 1;
+    qzen_gpu *gpu = qzen_zimage_gpu_handle(pipe->gpu);
+    if (!*scratch) {
+        *scratch = qzen_gpu_tensor_new_bf16(gpu, capacity);
+        *staged = (uint16_t *)malloc(capacity * sizeof(uint16_t));
+    }
+    if (!*scratch || !*staged || count > capacity) {
+        zpipe_fail(error, error_size,
+                   "cannot allocate the ControlNet hint GPU buffer");
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++)
+        (*staged)[i] = zpipe_f32_to_bf16(hint[i]);
+    if (!qzen_gpu_tensor_write_bf16_range(*scratch, 0, *staged, count) ||
+        !qzen_gpu_scale_add_bf16(gpu, dst, dst, *scratch,
+                                 (uint32_t)count, scale)) {
+        zpipe_fail(error, error_size, "ControlNet hint injection failed: %s",
+                   qzen_gpu_error(gpu));
+        return 0;
+    }
+    return 1;
+}
+
 /* --- CPU reference path ------------------------------------------------------ */
 
 static int zpipe_dit_forward_cpu(const qzen_zimage_pipeline *pipe,
                                  const zpipe_prep *prep,
                                  const float *cap_feats, uint32_t cap_len,
+                                 const zpipe_control_hints *hints,
                                  float *velocity, char *error,
                                  size_t error_size) {
     const uint32_t dim = prep->dim;
@@ -624,6 +1001,7 @@ static int zpipe_dit_forward_cpu(const qzen_zimage_pipeline *pipe,
                                      rope_cos, rope_sin, error, error_size)) {
             goto fail;
         }
+        zpipe_apply_hint_cpu(x, hints, 0, index);
     }
     for (uint32_t index = 0; index < 2; index++) {
         if (!qzen_zimage_block_forward(pipe->context_refiner[index], cap, seq_cap,
@@ -641,6 +1019,7 @@ static int zpipe_dit_forward_cpu(const qzen_zimage_pipeline *pipe,
                                      rope_cos, rope_sin, error, error_size)) {
             goto fail;
         }
+        zpipe_apply_hint_cpu(x, hints, 1, index);
     }
 
     /* final layer + unpatchify over the real image rows. */
@@ -667,9 +1046,13 @@ static uint16_t zpipe_f32_to_bf16(float value) {
 static int zpipe_dit_forward_gpu(const qzen_zimage_pipeline *pipe,
                                  const zpipe_prep *prep,
                                  const float *cap_feats, uint32_t cap_len,
+                                 const zpipe_control_hints *hints,
                                  float *velocity, char *error,
                                  size_t error_size) {
     qzen_zimage_gpu *zgu = pipe->gpu;
+    /* Lazily allocated on the first hint injection; see zpipe_apply_hint_gpu. */
+    qzen_gpu_tensor *hint_scratch = NULL;
+    uint16_t *hint_staged = NULL;
     qzen_gpu *gpu = qzen_zimage_gpu_handle(zgu);
     const uint32_t dim = prep->dim, half = prep->half;
     const uint32_t seq = prep->seq, seq_x = prep->seq_x, seq_cap = prep->seq_cap;
@@ -781,7 +1164,8 @@ static int zpipe_dit_forward_gpu(const qzen_zimage_pipeline *pipe,
                                   pipe->cap_linear.gpu_weight,
                                   pipe->cap_linear.gpu_bias, cap_len, 2560, dim);
     qzen_gpu_tensor_free(cap_feats_gpu);
-    /* refiners. */
+    /* refiners. ControlNet noise hints are added right after the matching
+     * main noise refiner, with alpha = control_context_scale. */
     for (uint32_t index = 0; index < 2; index++) {
         ok = ok && qzen_zimage_block_modulation_gpu(pipe->noise_refiner[index],
                                                   zgu, prep->adaln, error,
@@ -789,6 +1173,10 @@ static int zpipe_dit_forward_gpu(const qzen_zimage_pipeline *pipe,
              qzen_zimage_block_forward_gpu(pipe->noise_refiner[index], zgu, img,
                                          seq_x, modulation, rope_cos, rope_sin,
                                          error, error_size);
+        if (ok && !zpipe_apply_hint_gpu(pipe, img, &hint_scratch, &hint_staged,
+                                        (size_t)seq * dim, hints, 0, index,
+                                        error, error_size))
+            ok = 0;
     }
     for (uint32_t index = 0; index < 2; index++) {
         ok = ok && qzen_zimage_block_forward_gpu(pipe->context_refiner[index], zgu,
@@ -808,6 +1196,12 @@ static int zpipe_dit_forward_gpu(const qzen_zimage_pipeline *pipe,
              qzen_zimage_block_forward_gpu(pipe->layers[index], zgu, full, seq,
                                          modulation, rope_cos, rope_sin, error,
                                          error_size);
+        /* Union 2.x control_layers_places = [0,2,...,28]: one skip per even
+         * main layer, added after that layer's forward. */
+        if (ok && !zpipe_apply_hint_gpu(pipe, full, &hint_scratch, &hint_staged,
+                                        (size_t)seq * dim, hints, 1, index,
+                                        error, error_size))
+            ok = 0;
     }
     /* final layer over the unified sequence. */
     double trace_t4 = zpipe_now();
@@ -847,6 +1241,8 @@ static int zpipe_dit_forward_gpu(const qzen_zimage_pipeline *pipe,
         zpipe_unpatchify(branch, x_real, prep->w_tokens, prep->latent_h,
                          prep->latent_w, velocity);
     free(branch);
+    qzen_gpu_tensor_free(hint_scratch);
+    free(hint_staged);
     return ok;
 }
 
@@ -859,9 +1255,9 @@ int qzen_zpipe_dit_forward(const qzen_zimage_pipeline *pipe, const float *latent
                        error, error_size))
         return 0;
     int ok = pipe->gpu
-                 ? zpipe_dit_forward_gpu(pipe, &prep, cap_feats, cap_len,
+                 ? zpipe_dit_forward_gpu(pipe, &prep, cap_feats, cap_len, NULL,
                                          velocity, error, error_size)
-                 : zpipe_dit_forward_cpu(pipe, &prep, cap_feats, cap_len,
+                 : zpipe_dit_forward_cpu(pipe, &prep, cap_feats, cap_len, NULL,
                                          velocity, error, error_size);
     zpipe_prep_free(&prep);
     return ok;
@@ -898,6 +1294,69 @@ int qzen_zpipe_denoise(const qzen_zimage_pipeline *pipe, const float *cap_feats,
     }
     free(sigmas); free(velocity);
     return 1;
+}
+
+/* Same Euler schedule as qzen_zpipe_denoise(), but every step first recomputes
+ * the ControlNet skips from the CURRENT noisy latents (WanGP recomputes the
+ * control context once and the skips per step, because adaLN and x_init depend
+ * on tau and x_t). Plain t2i stays on qzen_zpipe_denoise() and never pays for
+ * hint computation. */
+int qzen_zpipe_denoise_control(const qzen_zimage_pipeline *pipe,
+                     qzen_zimage_control *control,
+                     const float *control_context, float context_scale,
+                     const float *cap_feats, uint32_t cap_len,
+                     float *latents, uint32_t latent_h, uint32_t latent_w,
+                     void (*progress)(uint32_t step, uint32_t steps),
+                     char *error, size_t error_size) {
+    if (!pipe || !control || !control_context || !isfinite(context_scale)) {
+        zpipe_fail(error, error_size, "invalid ControlNet denoise request");
+        return 0;
+    }
+    const uint32_t steps = pipe->config.steps;
+    float *sigmas = malloc((steps + 1) * sizeof(float));
+    float *velocity = malloc((size_t)16 * latent_h * latent_w * sizeof(float));
+    if (!sigmas || !velocity) {
+        free(sigmas); free(velocity);
+        zpipe_fail(error, error_size, "cannot allocate denoise buffers");
+        return 0;
+    }
+    qzen_zpipe_sigmas(steps, pipe->config.shift, sigmas);
+    for (uint32_t step = 0; step < steps; step++) {
+        const float tau = 1.0f - sigmas[step];
+        zpipe_prep prep;
+        zpipe_control_hints hints;
+        if (!zpipe_prepare(pipe, latents, latent_h, latent_w, cap_len, tau,
+                           &prep, error, error_size))
+            goto fail;
+        if (!zpipe_control_hints_compute(pipe, &prep, cap_feats, cap_len,
+                                         control, control_context,
+                                         context_scale, &hints,
+                                         error, error_size)) {
+            zpipe_prep_free(&prep);
+            goto fail;
+        }
+        int ok = pipe->gpu
+            ? zpipe_dit_forward_gpu(pipe, &prep, cap_feats, cap_len, &hints,
+                                    velocity, error, error_size)
+            : zpipe_dit_forward_cpu(pipe, &prep, cap_feats, cap_len, &hints,
+                                    velocity, error, error_size);
+        zpipe_control_hints_free(&hints);
+        zpipe_prep_free(&prep);
+        if (!ok) goto fail;
+
+        /* Euler: x += (sigma_next - sigma) * (-v). */
+        const float delta = sigmas[step + 1] - sigmas[step];
+        const size_t count = (size_t)16 * latent_h * latent_w;
+        for (size_t index = 0; index < count; index++)
+            latents[index] -= delta * velocity[index];
+        if (progress) progress(step + 1, steps);
+    }
+    free(sigmas); free(velocity);
+    return 1;
+
+fail:
+    free(sigmas); free(velocity);
+    return 0;
 }
 /* --- PNG (8-bit RGB, stored deflate) ------------------------------------------ */
 

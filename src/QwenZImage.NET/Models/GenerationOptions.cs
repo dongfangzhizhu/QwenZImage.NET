@@ -33,7 +33,7 @@ public abstract record GenerationOptions
 /// setting either to another value is rejected locally rather than being
 /// silently ignored by the sampler.
 /// </summary>
-public sealed record QwenImageOptions : GenerationOptions
+public record QwenImageOptions : GenerationOptions
 {
     /// <summary>Sampling tier. Defaults to <see cref="QwenImageTier.Turbo"/>.</summary>
     public QwenImageTier Tier { get; init; } = QwenImageTier.Turbo;
@@ -79,10 +79,50 @@ public sealed record QwenImageOptions : GenerationOptions
 }
 
 /// <summary>
+/// Qwen-Image 2.1 image editing (img2img / masked inpainting) on the SAME 7B
+/// weights as <see cref="QwenImageOptions"/>. The reference is VAE-encoded and
+/// blended into the noise at WanGP's denoising strength; an optional mask pins
+/// the unmasked latent cells to the reference trajectory.
+/// </summary>
+public sealed record Qwen21EditOptions : QwenImageOptions
+{
+    /// <summary>Required planar RGB8 reference image.</summary>
+    public required QziRasterImage Reference { get; init; }
+
+    /// <summary>
+    /// Optional one-channel mask at the reference's dimensions. White (255)
+    /// pixels are regenerated from the prompt, black (0) pixels keep the
+    /// reference. Resized to the output canvas with the same cover fit.
+    /// </summary>
+    public QziRasterImage? Mask { get; init; }
+
+    /// <summary>
+    /// WanGP's denoising strength, 0.05..1.0. 1.0 ignores the reference
+    /// (equivalent to text-to-image); smaller values stay closer to it.
+    /// <c>null</c> uses the engine default 0.75.
+    /// </summary>
+    public float? Strength { get; init; }
+
+    /// <summary>
+    /// Fraction of the remaining schedule during which unmasked cells are
+    /// restored, 0.05..1.0. Requires <see cref="Mask"/>. <c>null</c> uses 1.0
+    /// when a mask is present, otherwise 0 (no masking).
+    /// </summary>
+    public float? MaskingStrength { get; init; }
+
+    /// <summary>The strength actually sent to the engine (never the 0 sentinel).</summary>
+    public float EffectiveStrength => Strength ?? 0.75f;
+
+    /// <summary>The masking strength actually sent (0 without a mask).</summary>
+    public float EffectiveMaskingStrength =>
+        Mask is null ? 0.0f : (MaskingStrength ?? 1.0f);
+}
+
+/// <summary>
 /// Z-Image (Turbo / Nunchaku) request. Turbo runs a fixed 8-step schedule with
 /// no CFG branch, so there are no steps, guidance or negative-prompt fields.
 /// </summary>
-public sealed record ZImageOptions : GenerationOptions
+public record ZImageOptions : GenerationOptions
 {
     /// <summary>
     /// <c>null</c> or <c>"bf16"</c> (default), <c>"nunchaku"</c>, or a pack id
@@ -93,4 +133,67 @@ public sealed record ZImageOptions : GenerationOptions
 
     /// <inheritdoc/>
     public override GenerationModel Model => GenerationModel.ZImage;
+}
+
+/// <summary>
+/// Z-Image Turbo Fun ControlNet Union request (WanGP z_image_control2_1).
+/// Reuses the ordinary <see cref="ZImageOptions"/> fields (prompt, checkpoint,
+/// width, height, seed) and adds a planar RGB control image plus the Union
+/// control metadata. The control image is descriptive metadata only: this
+/// wrapper does NOT run an edge / pose / depth estimator.
+/// </summary>
+/// <remarks>
+/// The control image is VAE-encoded to a 16-channel 1/8 latent and combined
+/// with the DiT's control context upstream. <see cref="ControlType"/> is
+/// normalised to a lowercase canonical value before it is sent across the ABI.
+/// </remarks>
+public sealed record ZImageControlOptions : ZImageOptions
+{
+    /// <summary>Canonical (lowercase) control types accepted by the engine.</summary>
+    private static readonly HashSet<string> CanonicalControlTypes = new(StringComparer.Ordinal)
+    {
+        "auto", "pose", "canny", "depth", "scribble", "raw"
+    };
+
+    /// <summary>Required planar RGB8 control image (<c>[3][cw*ch]</c>).</summary>
+    public required QziRasterImage ControlImage { get; init; }
+
+    /// <summary>
+    /// Descriptive control type: <c>null</c> or one of <c>auto</c>, <c>pose</c>,
+    /// <c>canny</c>, <c>depth</c>, <c>scribble</c>, <c>raw</c> (case-insensitive).
+    /// <c>raw</c> means the caller already supplies a Z-Image-format control image.
+    /// </summary>
+    public string? ControlType { get; init; }
+
+    /// <summary>
+    /// WanGP's control context scale. <c>0</c> is the ABI sentinel for the engine
+    /// default (0.65); any other value must be finite and lie in 0.05..2.0.
+    /// </summary>
+    public float ControlScale { get; init; }
+
+    /// <summary>Reserved for the C ABI; must be 0.</summary>
+    public uint Flags { get; init; }
+
+    /// <summary>
+    /// The lowercase canonical control type actually sent to the engine, or
+    /// <c>null</c> when <see cref="ControlType"/> is absent. Validation rejects
+    /// unknown values before the request is built, so the value is always one
+    /// of <see cref="CanonicalControlTypes"/> on the generation path.
+    /// </summary>
+    public string? EffectiveControlType => NormalizeControlType(ControlType);
+
+    /// <summary>
+    /// Normalises a control type to its lowercase canonical form. Returns
+    /// <c>null</c> for a null / blank value; an unknown non-blank value is
+    /// returned lowercased so that <see cref="IsValidControlType"/> can reject it.
+    /// </summary>
+    internal static string? NormalizeControlType(string? value)
+        => string.IsNullOrWhiteSpace(value) ? null : value.Trim().ToLowerInvariant();
+
+    /// <summary>
+    /// True when a <see cref="NormalizeControlType"/> result is accepted by the
+    /// C ABI (<c>null</c> or a canonical control type).
+    /// </summary>
+    internal static bool IsValidControlType(string? normalized)
+        => normalized is null || CanonicalControlTypes.Contains(normalized);
 }

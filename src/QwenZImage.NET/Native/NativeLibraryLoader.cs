@@ -28,8 +28,18 @@ internal static class NativeLibraryLoader
     private static bool _registered;
     private static string? _explicitPath;
     private static string? _resolvedPath;
+    private static IntPtr _handle;
 
     internal static string? ResolvedPath => _resolvedPath;
+
+    /// <summary>
+    /// Handle of the library the resolver actually loaded. AbiGuard probes this
+    /// handle with <c>NativeLibrary.TryGetExport</c> to discover additive ABI
+    /// v1 exports (qzi_abi_features / qzi_qwen21_edit_layout) without ever
+    /// triggering a missing-entry-point exception. Zero when the runtime loaded
+    /// the library through its own probing and we could not capture a handle.
+    /// </summary>
+    internal static IntPtr Handle => _handle;
 
     internal static void Configure(string? explicitPath)
     {
@@ -73,6 +83,7 @@ internal static class NativeLibraryLoader
             {
                 IntPtr handle = NativeLibrary.Load(full);
                 _resolvedPath = full;
+                _handle = handle;
                 return handle;
             }
             catch (Exception ex) when (ex is DllNotFoundException or BadImageFormatException)
@@ -91,8 +102,20 @@ internal static class NativeLibraryLoader
             if (File.Exists(candidate) && NativeLibrary.TryLoad(candidate, out IntPtr handle))
             {
                 _resolvedPath = candidate;
+                _handle = handle;
                 return handle;
             }
+        }
+
+        // No explicit path and no candidate hit: let the runtime probe, but try
+        // the plain library name ourselves first so AbiGuard still gets a
+        // handle for its additive-export probe. TryLoad(string, out IntPtr)
+        // does NOT re-enter the DllImportResolver, so this cannot recurse.
+        if (NativeLibrary.TryLoad(libraryName, out IntPtr fallback))
+        {
+            _resolvedPath = libraryName;
+            _handle = fallback;
+            return fallback;
         }
         return IntPtr.Zero; // let the runtime probe normally
     }

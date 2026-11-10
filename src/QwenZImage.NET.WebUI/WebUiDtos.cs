@@ -19,6 +19,47 @@ public sealed class GenerateRequest
     public float? LoraScale { get; set; }
     public string? Checkpoint { get; set; }
     public string? Client { get; set; }
+
+    /// <summary>
+    /// Qwen-Image 2.1 image editing only: a base64 PNG (optionally a
+    /// <c>data:image/png;base64,...</c> URL) carrying the reference image.
+    /// The browser canvas re-encodes uploads so JPEG / WebP also work.
+    /// </summary>
+    public string? ReferenceImage { get; set; }
+
+    /// <summary>
+    /// Optional single-channel brush mask at the reference resolution. White
+    /// pixels are regenerated, black pixels follow the reference trajectory.
+    /// </summary>
+    public string? MaskImage { get; set; }
+
+    /// <summary>Denoising strength 0.05..1.0 (default 0.75).</summary>
+    public float? Strength { get; set; }
+
+    /// <summary>
+    /// Fraction of the denoise steps during which unmasked pixels are restored
+    /// from the reference. Requires <see cref="MaskImage"/>.
+    /// </summary>
+    public float? MaskingStrength { get; set; }
+
+    /// <summary>
+    /// Z-Image Turbo Fun ControlNet Union only: a base64 PNG (optionally a
+    /// <c>data:image/png;base64,...</c> URL) carrying the preprocessed control
+    /// image. The browser canvas re-encodes uploads so JPEG / WebP also work.
+    /// This library does NOT run edge / pose / depth estimation: the caller
+    /// supplies an already-preprocessed control image ("raw" semantics).
+    /// </summary>
+    public string? ControlImage { get; set; }
+
+    /// <summary>
+    /// Descriptive control type: <c>auto</c> / <c>pose</c> / <c>canny</c> /
+    /// <c>depth</c> / <c>scribble</c> / <c>raw</c> (case-insensitive).
+    /// <c>raw</c> means the control image is already in Z-Image control format.
+    /// </summary>
+    public string? ControlType { get; set; }
+
+    /// <summary>Control context scale. 0 uses the engine default 0.65, else 0.05..2.0.</summary>
+    public float? ControlScale { get; set; }
 }
 
 /// <summary>Batch delete / restore body.</summary>
@@ -33,6 +74,10 @@ public sealed class JobDto
     public long Id { get; init; }
     public string State { get; init; } = "queued";
     public string Model { get; init; } = "none";
+    public bool Edit { get; init; }
+    public bool HasMask { get; init; }
+    public bool Control { get; init; }
+    public bool HasControl { get; init; }
     public string Prompt { get; init; } = "";
     public int Width { get; init; }
     public int Height { get; init; }
@@ -58,6 +103,7 @@ public sealed class JobDto
         GenerationOptions request = job.Request;
         string? output = runtime.OutputNameFor(job.Id);
         GenerationProgress p = job.LastProgress;
+        (bool control, bool hasControl) = ControlState(request);
         return new JobDto
         {
             Id = job.Id,
@@ -68,6 +114,12 @@ public sealed class JobDto
                 GenerationModel.ZImage => "zimage",
                 _ => "none"
             },
+            // Qwen21EditOptions derives from QwenImageOptions, so the model id
+            // alone cannot tell an edit job apart in the gallery / job list.
+            Edit = request is Qwen21EditOptions,
+            HasMask = request is Qwen21EditOptions { Mask: not null },
+            Control = control,
+            HasControl = hasControl,
             Prompt = request.Prompt,
             Width = request.Width,
             Height = request.Height,
@@ -89,6 +141,16 @@ public sealed class JobDto
             Client = runtime.ClientFor(job.Id)
         };
     }
+
+    /// <summary>
+    /// ControlNet state derived from a request. Kept as a pure function so the
+    /// job-list / gallery flags are unit-testable without a native engine;
+    /// <see cref="From"/> uses it for both properties.
+    /// </summary>
+    internal static (bool Control, bool HasControl) ControlState(GenerationOptions request)
+        => request is ZImageControlOptions control
+            ? (true, control.ControlImage is not null)
+            : (false, false);
 }
 
 /// <summary>A preset as the UI needs it: flat values, no polymorphic request object.</summary>

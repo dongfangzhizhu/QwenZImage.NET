@@ -751,10 +751,11 @@ int qzen_qwen21_vae_encode(qzen_qwen21_vae *vae, const unsigned char *rgb, int h
         snprintf(error, error_size, "out of memory for the %dx%d encode", width, height);
         return 0;
     }
-    /* RGB8 -> [-1,1] plus the mask channel. The 4th channel is the edit mask
-     * the checkpoint was trained with; the whole image is being re-encoded, so
-     * it is 1 everywhere (a 0 mask asks the model to keep the pixels, which is
-     * the "no edit" degenerate case). */
+    /* RGB8 -> [-1,1] plus the 4th (alpha) channel. WanGP passes
+     * image.convert("RGBA") to this encoder; an opaque reference has alpha
+     * 255, which maps to 255/127.5 - 1 = 1.0 here. The inpainting mask is NOT
+     * a VAE input: it is binarised onto the latent grid and used by the
+     * sampler's masked-denoising loop instead. */
     const size_t pixels = (size_t)h * w;
     for (size_t index = 0; index < pixels; index++) {
         for (int channel = 0; channel < 3; channel++) {
