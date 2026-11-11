@@ -283,6 +283,37 @@ static int downsample_mask(const uint8_t *canvas_mask, uint32_t w, uint32_t h,
     return 1;
 }
 
+/* Z-Image Union 2.x inpainting: contract a canvas-sized 8-bit mask to the
+ * VAE's 1/8 latent grid as a SOFT keep plane in [0,1].
+ *   mask=255 (white, repaint)   -> keep 0.0
+ *   mask=0   (black, keep)      -> keep 1.0
+ * WanGP uses nearest-neighbour interpolation to the latent size, which for a
+ * hard brush mask is the same as this 8x8 area mean; averaging also keeps
+ * anti-aliased mask edges from turning into blocky staircases. The two other
+ * mask consumers (the masked source image and this plane) therefore agree. */
+static int downsample_mask_keep(const uint8_t *canvas_mask, uint32_t w,
+                                uint32_t h, uint32_t latent_w,
+                                uint32_t latent_h, float *out)
+{
+    if (!canvas_mask || !out || !latent_w || !latent_h ||
+        w != latent_w * 8u || h != latent_h * 8u) return 0;
+    for (uint32_t ly = 0; ly < latent_h; ly++) {
+        for (uint32_t lx = 0; lx < latent_w; lx++) {
+            uint64_t sum = 0;
+            for (uint32_t dy = 0; dy < 8u; dy++) {
+                const uint8_t *row = canvas_mask +
+                    (size_t)(ly * 8u + dy) * w + (size_t)lx * 8u;
+                for (uint32_t dx = 0; dx < 8u; dx++) sum += row[dx];
+            }
+            double painted = (double)sum / (64.0 * 255.0);
+            if (painted < 0.0) painted = 0.0;
+            if (painted > 1.0) painted = 1.0;
+            out[(size_t)ly * latent_w + lx] = (float)(1.0 - painted);
+        }
+    }
+    return 1;
+}
+
 /* Planar RGB8 [3][H][W] + alpha plane [H][W] -> interleaved RGBA8. */
 static void pack_planar_rgba8(const uint8_t *planar, const uint8_t *alpha,
                               uint32_t width, uint32_t height, uint8_t *packed)
@@ -1269,25 +1300,36 @@ static qzi_status ensure_zimage_control(qzen_state *s,
 static qzi_status qzen_generate_zimage_impl(void *context,
                                        const qzi_zimage_request *base,
                                        const qzi_zimage_control_request *control,
+                                       const qzi_zimage_inpaint_request *inpaint,
                                        const qzi_callbacks *callbacks,
                                        qzi_image *out_image,
                                        char *error, size_t error_cap)
 {
-    const qzi_zimage_request *request = control ? &control->base : base;
+    /* An inpaint request embeds the ordinary ControlNet request. Keeping one
+     * effective pointer means t2i / control / inpaint share exactly the same
+     * orchestration below, and the plain ControlNet path stays byte-identical. */
+    const qzi_zimage_control_request *control_eff =
+        control ? control : (inpaint ? &inpaint->base : NULL);
+    const qzi_zimage_request *request = control_eff ? &control_eff->base : base;
     qzen_state *s = (qzen_state *)context;
     progress_bridge bridge = {callbacks, qzi_now_seconds(), 0};
     char local[QZEN_ERR_CAP] = "";
     float *cap = NULL, *latents = NULL, *pixels = NULL;
     float *control_latent = NULL, *control_context = NULL;
+    float *inpaint_latent = NULL, *keep_mask = NULL;
     uint8_t *rgb = NULL, *guide = NULL;
+    uint8_t *mask_canvas = NULL, *inpaint_rgb = NULL;
     qzen_zvae *vae = NULL;
     uint32_t cap_len = 0;
     qzi_status status = QZI_ERR_ENGINE;
 
     /* Defensive: the ABI layer already validates and normalises, but a custom
      * backend registration can call this function directly. */
-    if (control) {
-        status = qzi_validate_zimage_control(control, error, error_cap);
+    if (inpaint) {
+        status = qzi_validate_zimage_inpaint(inpaint, error, error_cap);
+        if (status != QZI_OK) return status;
+    } else if (control_eff) {
+        status = qzi_validate_zimage_control(control_eff, error, error_cap);
         if (status != QZI_OK) return status;
     }
 
@@ -1353,14 +1395,14 @@ static qzi_status qzen_generate_zimage_impl(void *context,
     }
     qzen_zpipe_init_latents(request->seed, 16, lh, lw, latents);
 
-    if (control) {
+    if (control_eff) {
         status = ensure_zimage_control(s, &bridge, error, error_cap);
         if (status != QZI_OK) goto done;
 
         bridge_emit(&bridge, "image encode", 0, 1);
-        const uint8_t *guide_rgb = control->control_rgb;
-        if (control->control_width != width ||
-            control->control_height != height) {
+        const uint8_t *guide_rgb = control_eff->control_rgb;
+        if (control_eff->control_width != width ||
+            control_eff->control_height != height) {
             guide = (uint8_t *)malloc((size_t)3 * width * height);
             if (!guide) {
                 qzi_set_error(error, error_cap,
@@ -1368,9 +1410,9 @@ static qzi_status qzen_generate_zimage_impl(void *context,
                 status = QZI_ERR_OUT_OF_MEMORY;
                 goto done;
             }
-            if (!resample_planar_cover(control->control_rgb,
-                                       control->control_width,
-                                       control->control_height,
+            if (!resample_planar_cover(control_eff->control_rgb,
+                                       control_eff->control_width,
+                                       control_eff->control_height,
                                        width, height, 3, guide)) {
                 qzi_set_error(error, error_cap,
                               "cannot cover-fit the control image");
@@ -1402,10 +1444,88 @@ static qzi_status qzen_generate_zimage_impl(void *context,
             status = QZI_ERR_ENGINE;
             goto done;
         }
-        local[0] = '\0';
-        control_context = qzen_zpipe_control_context(s->z_control,
-                                                     control_latent, lh, lw,
-                                                     local, sizeof(local));
+
+        if (inpaint) {
+            /* WanGP models/z_image/pipeline_z_image.py, control_in_dim == 33:
+             *   inpaint_image  = control_image * (1 - inpaint_mask)
+             *   inpaint_latent = vae.encode(inpaint_image)
+             *   keep_mask      = 1 - mask, on the 1/8 latent grid
+             * The control image and the mask are cover-fitted independently so
+             * either may have a different source resolution. */
+            const uint8_t *mask_pixels = inpaint->mask;
+            if (inpaint->mask_width != width ||
+                inpaint->mask_height != height) {
+                mask_canvas = (uint8_t *)malloc((size_t)width * height);
+                if (!mask_canvas) {
+                    qzi_set_error(error, error_cap,
+                                  "out of memory for the cover-fit inpaint mask");
+                    status = QZI_ERR_OUT_OF_MEMORY;
+                    goto done;
+                }
+                if (!resample_planar_cover(inpaint->mask,
+                                           inpaint->mask_width,
+                                           inpaint->mask_height,
+                                           width, height, 1, mask_canvas)) {
+                    qzi_set_error(error, error_cap,
+                                  "cannot cover-fit the inpaint mask");
+                    status = QZI_ERR_ENGINE;
+                    goto done;
+                }
+                mask_pixels = mask_canvas;
+            }
+
+            const size_t plane = (size_t)width * height;
+            inpaint_rgb = (uint8_t *)malloc(3u * plane);
+            if (!inpaint_rgb) {
+                qzi_set_error(error, error_cap,
+                              "out of memory for the masked source image");
+                status = QZI_ERR_OUT_OF_MEMORY;
+                goto done;
+            }
+            for (uint32_t c = 0; c < 3u; c++) {
+                const uint8_t *src = guide_rgb + (size_t)c * plane;
+                uint8_t *dst = inpaint_rgb + (size_t)c * plane;
+                for (size_t p = 0; p < plane; p++) {
+                    const double keep =
+                        (255.0 - (double)mask_pixels[p]) / 255.0;
+                    dst[p] = (uint8_t)((double)src[p] * keep + 0.5);
+                }
+            }
+
+            inpaint_latent =
+                (float *)malloc((size_t)16 * lh * lw * sizeof(float));
+            keep_mask = (float *)malloc((size_t)lh * lw * sizeof(float));
+            if (!inpaint_latent || !keep_mask) {
+                qzi_set_error(error, error_cap,
+                              "out of memory for the inpaint latent / keep mask");
+                status = QZI_ERR_OUT_OF_MEMORY;
+                goto done;
+            }
+            local[0] = '\0';
+            if (!qzen_zvae_encode(vae, inpaint_rgb, width, height,
+                                  inpaint_latent, local, sizeof(local))) {
+                qzi_set_error_fmt(error, error_cap,
+                                  "masked image VAE encode: %s", local);
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            if (!downsample_mask_keep(mask_pixels, width, height, lw, lh,
+                                      keep_mask)) {
+                qzi_set_error(error, error_cap,
+                    "cannot contract the inpaint mask to the latent grid");
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            local[0] = '\0';
+            control_context = qzen_zpipe_control_context_ex(
+                s->z_control, control_latent, keep_mask, inpaint_latent,
+                lh, lw, local, sizeof(local));
+        } else {
+            local[0] = '\0';
+            control_context = qzen_zpipe_control_context(s->z_control,
+                                                         control_latent, lh, lw,
+                                                         local, sizeof(local));
+        }
         if (!control_context) {
             qzi_set_error_fmt(error, error_cap, "control context: %s", local);
             status = QZI_ERR_ENGINE;
@@ -1431,9 +1551,9 @@ static qzi_status qzen_generate_zimage_impl(void *context,
     local[0] = '\0';
     /* ABI normalises the 0 sentinel to 0.65; keep the backend correct when a
      * custom caller hands us an unnormalised request. */
-    const float context_scale = control && control->control_scale > 0.0f
-                                    ? control->control_scale : 0.65f;
-    int denoised = control
+    const float context_scale = control_eff && control_eff->control_scale > 0.0f
+                                    ? control_eff->control_scale : 0.65f;
+    int denoised = control_eff
         ? qzen_zpipe_denoise_control(s->zpipe, s->z_control, control_context,
                                      context_scale, cap, cap_len, latents,
                                      lh, lw, zimage_progress,
@@ -1496,10 +1616,14 @@ done:
     if (vae) qzen_zvae_free(vae);
     free(rgb);
     free(guide);
+    free(mask_canvas);
+    free(inpaint_rgb);
     free(pixels);
     free(latents);
     free(control_latent);
     free(control_context);
+    free(inpaint_latent);
+    free(keep_mask);
     free(cap);
     return status;
 }
@@ -1510,7 +1634,7 @@ static qzi_status qzen_generate_zimage(void *context,
                                        qzi_image *out_image,
                                        char *error, size_t error_cap)
 {
-    return qzen_generate_zimage_impl(context, request, NULL, callbacks,
+    return qzen_generate_zimage_impl(context, request, NULL, NULL, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -1521,7 +1645,18 @@ static qzi_status qzen_generate_zimage_control(
                                        qzi_image *out_image,
                                        char *error, size_t error_cap)
 {
-    return qzen_generate_zimage_impl(context, NULL, request, callbacks,
+    return qzen_generate_zimage_impl(context, NULL, request, NULL, callbacks,
+                                     out_image, error, error_cap);
+}
+
+static qzi_status qzen_generate_zimage_inpaint(
+                                       void *context,
+                                       const qzi_zimage_inpaint_request *request,
+                                       const qzi_callbacks *callbacks,
+                                       qzi_image *out_image,
+                                       char *error, size_t error_cap)
+{
+    return qzen_generate_zimage_impl(context, NULL, NULL, request, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -1581,7 +1716,8 @@ static const qzi_backend qzen_vtable = {
      * initialisers keep every existing offset. */
     qzen_generate_qwen21_edit,
     qzen_generate_zimage_control,
-    qzen_generate_qwen21_edit_ex
+    qzen_generate_qwen21_edit_ex,
+    qzen_generate_zimage_inpaint
 };
 
 const qzi_backend *qzi_real_backend(void)

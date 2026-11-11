@@ -89,6 +89,9 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
     bool advancedEditing = false;
     try { advancedEditing = rt.Engine?.SupportsAdvancedEditing == true; }
     catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe advanced-edit capability"); }
+    bool inpaint = false;
+    try { inpaint = rt.Engine?.SupportsInpaint == true; }
+    catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe inpaint capability"); }
 
     if (ok)
     {
@@ -131,6 +134,7 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         supports_image_editing = editing,
         supports_controlnet = controlnet,
         supports_advanced_editing = advancedEditing,
+        supports_inpaint = inpaint,
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
     });
@@ -173,14 +177,15 @@ app.MapPost("/api/jobs", async (HttpContext context, WebUiRuntime rt) =>
     try
     {
         options = RequestMapper.ToOptions(body);
-        // Editing and ControlNet are additive in ABI v1: an older native
-        // library still serves text-to-image but lacks the matching export.
-        // Reject those modes here so the operator sees a 400 instead of a
-        // queued job failing later (or silently degrading to t2i / noise).
+        // Editing, ControlNet and inpaint are additive in ABI v1: an older
+        // native library still serves text-to-image but lacks the matching
+        // export. Reject those modes here so the operator sees a 400 instead
+        // of a queued job failing later (or silently degrading to t2i / noise).
         string? capabilityError = WebUiCapabilities.ErrorFor(options,
             rt.Engine?.SupportsImageEditing == true,
             rt.Engine?.SupportsControlNet == true,
-            rt.Engine?.SupportsAdvancedEditing == true);
+            rt.Engine?.SupportsAdvancedEditing == true,
+            rt.Engine?.SupportsInpaint == true);
         if (capabilityError is not null) return BadRequest(capabilityError);
         job = rt.Queue.Submit(options);
     }

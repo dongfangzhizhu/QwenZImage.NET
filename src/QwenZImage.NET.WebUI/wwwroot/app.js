@@ -23,13 +23,24 @@ const state = {
   // URL re-encoded by a canvas; it must already be preprocessed upstream.
   controlPng: null,
   controlnetAvailable: true,
+  // Fourth additive ABI v1 increment: Z-Image Union 2.x inpaint. It reuses
+  // the control image above plus the shared brush mask canvas (white =
+  // repaint, black = keep); no second image component is introduced.
+  inpaintAvailable: true,
   drawing: false,
   lastPoint: null,
 };
 
+// modelFamily already covers the new mode: every non-qwen21 model (zimage,
+// zimage-control and zimage-inpaint) is a Z-Image family request, so
+// checkpoint / 16-px steps still apply and qwen21-only fields stay hidden.
 const modelFamily = () => ($("model").value.startsWith("qwen21") ? "qwen21" : "zimage");
 const isEditMode = () => $("model").value === "qwen21-edit";
 const isControlMode = () => $("model").value === "zimage-control";
+const isInpaintMode = () => $("model").value === "zimage-inpaint";
+// Inpaint is a strict superset of ControlNet: it always carries a control
+// image, so the control upload / type / scale fields are shared by both.
+const isControlLike = () => isControlMode() || isInpaintMode();
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -99,6 +110,21 @@ async function refreshHealth() {
         $("model").value = "zimage";
         switchModel();
       }
+      // Inpaint is the fourth additive increment: an older library has no
+      // qzi_generate_zimage_inpaint export. Disable the option (and fall back
+      // to plain zimage if it was selected) so no job is queued to fail.
+      state.inpaintAvailable = h.supports_inpaint === true;
+      const inpaintOption = document.querySelector('#model option[value="zimage-inpaint"]');
+      if (inpaintOption) {
+        inpaintOption.disabled = !state.inpaintAvailable;
+        inpaintOption.title = state.inpaintAvailable
+          ? "Z-Image Union 2.x inpaint: control image + brush mask"
+          : "Unavailable: the loaded native library has no Z-Image inpaint export";
+      }
+      if (!state.inpaintAvailable && isInpaintMode()) {
+        $("model").value = "zimage";
+        switchModel();
+      }
     } else {
       $("backend-banner").hidden = true;
       pill.className = "pill pill-bad";
@@ -161,6 +187,7 @@ function markCustom() { $("preset").value = ""; }
 function syncModelUI() {
   const family = modelFamily();
   const edit = isEditMode();
+  const inpaint = isInpaintMode();
   const step = family === "qwen21" ? 32 : 16;
   $("width").step = String(step);
   $("height").step = String(step);
@@ -172,13 +199,17 @@ function syncModelUI() {
   // "qwen21" fields are shared by t2i and edit; "qwen21-edit" adds the
   // reference/mask controls on top of them. "zimage-control" is a zimage
   // variant (so checkpoint / 16-px steps still apply) that adds the control
-  // image, type and scale controls.
+  // image, type and scale controls. "zimage-inpaint" reuses that control
+  // block plus the shared brush mask canvas; qwen21-only sub-fields of the
+  // edit block are hidden via their own data-only="qwen21-edit" markers.
   document.querySelectorAll("[data-only]").forEach((el) => {
     const only = el.getAttribute("data-only");
     el.hidden = only === "qwen21" ? family !== "qwen21"
       : only === "qwen21-edit" ? !edit
       : only === "zimage" ? family !== "zimage"
-      : only === "zimage-control" ? !isControlMode()
+      : only === "zimage-control" ? !isControlLike()
+      : only === "edit-or-inpaint" ? !(edit || inpaint)
+      : only === "zimage-inpaint" ? !inpaint
       : false;
   });
 
@@ -377,6 +408,17 @@ async function loadControlImage(file) {
     $("control-preview").src = state.controlPng;
     $("control-empty").hidden = true;
     $("control-editor").hidden = false;
+    // Inpaint reuses the qwen21-edit brush mask canvas verbatim: the control
+    // image becomes its backdrop and sets the mask resolution. maskPng()
+    // (canvas -> data URL) and the pointer handlers are shared unchanged.
+    if (isInpaintMode()) {
+      const mask = $("mask-canvas");
+      mask.width = width;
+      mask.height = height;
+      $("reference-preview").src = state.controlPng;
+      clearMask();
+      $("mask-editor").hidden = false;
+    }
     showToast(`Control image loaded (${width}×${height}). Used as-is (no preprocessing).`);
   } catch (error) {
     showToast(`Could not read the control image: ${error.message || error}`);
@@ -391,6 +433,11 @@ function removeControlImage() {
   $("control-preview").removeAttribute("src");
   $("control-editor").hidden = true;
   $("control-empty").hidden = false;
+  if (isInpaintMode()) {
+    clearMask();
+    $("reference-preview").removeAttribute("src");
+    $("mask-editor").hidden = true;
+  }
 }
 
 function syncControlScaleHint() {
@@ -479,10 +526,16 @@ function buildRequestBody() {
     const advanced = advancedEditFields();
     if (advanced) Object.assign(body, advanced);
   }
-  if (isControlMode()) {
+  if (isControlLike()) {
     body.control_image = state.controlPng;
     body.control_type = $("control-type").value;
     body.control_scale = Number($("control-scale").value);
+    // Inpaint carries the same control fields plus the single-channel brush
+    // mask (white = repaint, black = keep). submit() guarantees a painted
+    // mask so the mapper never sees a missing mask_image on this path.
+    if (isInpaintMode()) {
+      body.mask_image = maskPng();
+    }
   }
   return body;
 }
@@ -498,9 +551,13 @@ async function submit() {
     $("reference-file").focus();
     return;
   }
-  if (isControlMode() && !state.controlPng) {
-    showToast("Upload a preprocessed control image before queueing a ControlNet job.");
+  if (isControlLike() && !state.controlPng) {
+    showToast("Upload a preprocessed control image before queueing a ControlNet / inpaint job.");
     $("control-file").focus();
+    return;
+  }
+  if (isInpaintMode() && !maskPng()) {
+    showToast("Paint a mask (white = repaint) before queueing an inpaint job.");
     return;
   }
   const payload = JSON.stringify(buildRequestBody());
@@ -556,15 +613,20 @@ function renderJobs() {
     const advancedBadge = job.advanced_edit
       ? `<span class="job-edit-badge">adv${job.outpaint ? " · outpaint" : ""}${job.rgba ? " · rgba" : ""}</span>`
       : "";
-    const controlBadge = job.control
+    // Inpaint is a superset of ControlNet: show one inpaint badge (including
+    // the has_mask flag) instead of a redundant separate control badge.
+    const controlBadge = job.control && !job.inpaint
       ? `<span class="job-control-badge">control</span>`
+      : "";
+    const inpaintBadge = job.inpaint
+      ? `<span class="job-edit-badge">inpaint${job.has_mask ? " · mask" : ""}</span>`
       : "";
     const actions = [];
     if (!terminal) actions.push(`<button class="btn btn-ghost btn-sm" data-action="cancel" data-id="${job.id}">Cancel</button>`);
     else actions.push(`<button class="btn btn-ghost btn-sm" data-action="retry" data-id="${job.id}">Retry</button>`);
     return `<tr>
       <td>#${job.id}${job.retry_of ? `<div class="hint">↻ #${job.retry_of}</div>` : ""}</td>
-      <td>${escapeHtml(job.model)}${editBadge}${advancedBadge}${controlBadge}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
+      <td>${escapeHtml(job.model)}${editBadge}${advancedBadge}${controlBadge}${inpaintBadge}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
       <td><span class="state state-${escapeHtml(job.state)}">${escapeHtml(job.state)}</span></td>
       <td class="progress-cell">
         <div class="progress-track"><div class="progress-fill" style="width:${job.state === "done" ? 100 : fraction}%"></div></div>

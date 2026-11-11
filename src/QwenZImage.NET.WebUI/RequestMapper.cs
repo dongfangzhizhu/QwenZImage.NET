@@ -36,12 +36,23 @@ public static class RequestMapper
 
         // Z-Image Turbo Fun ControlNet Union is the Z-Image counterpart of the
         // edit mode: an explicit "zimage-control" model, or a plain zimage
-        // request that simply carries a control_image.
+        // request that simply carries a control_image. Z-Image Union 2.x inpaint
+        // is a strict superset: an explicit "zimage-inpaint" model, or a
+        // ControlNet request that also carries a mask_image.
         bool controlAlias = model is "zimage-control" or "zimage_control" or "z-image-control";
-        if (controlAlias) model = "zimage";
-        bool wantsControl = controlAlias || !string.IsNullOrWhiteSpace(request.ControlImage);
+        bool inpaintAlias = model is "zimage-inpaint" or "zimage_inpaint" or "z-image-inpaint";
+        if (controlAlias || inpaintAlias) model = "zimage";
 
-        if (wantsEdit && wantsControl)
+        bool hasControlImage = !string.IsNullOrWhiteSpace(request.ControlImage);
+        bool hasMaskImage = !string.IsNullOrWhiteSpace(request.MaskImage);
+        bool wantsControl = controlAlias || hasControlImage;
+        // control_image + mask_image together upgrade a ControlNet job to inpaint.
+        bool wantsInpaint = inpaintAlias || (wantsControl && hasMaskImage);
+        // Inpaint always carries a control image, so keep the ControlNet model /
+        // edit-exclusion / capability gates applying to inpaint jobs as well.
+        if (wantsInpaint) wantsControl = true;
+
+        if (wantsEdit && (wantsControl || wantsInpaint))
             throw new ArgumentException(
                 "Image editing and Z-Image ControlNet are mutually exclusive features.");
         if (wantsEdit && model is not ("qwen21" or "qwen" or "qwen-image"))
@@ -50,7 +61,7 @@ public static class RequestMapper
         if (wantsControl && model is not ("zimage" or "z-image" or "z_image"))
             throw new ArgumentException(
                 "Z-Image ControlNet is a Z-Image feature; use model 'zimage-control'.");
-        if (!wantsEdit && HasEditParameters(request))
+        if (!wantsEdit && HasEditParameters(request, wantsControl))
             throw new ArgumentException(
                 "mask_image / strength / masking_strength and the advanced edit fields " +
                 "(margin_*, model_mode, rgba) require reference_image.");
@@ -63,7 +74,9 @@ public static class RequestMapper
             "qwen21" or "qwen" or "qwen-image" =>
                 wantsEdit ? MapQwen21Edit(request) : MapQwen21(request),
             "zimage" or "z-image" or "z_image" =>
-                wantsControl ? MapZImageControl(request) : MapZImage(request),
+                wantsInpaint ? MapZImageInpaint(request)
+                : wantsControl ? MapZImageControl(request)
+                : MapZImage(request),
             _ => throw new ArgumentException(
                 $"Unknown model '{request.Model}'. Use 'qwen21', 'qwen21-edit', " +
                 "'zimage' or 'zimage-control'.")
@@ -203,8 +216,10 @@ public static class RequestMapper
            request.MarginLeft is not null || request.MarginRight is not null ||
            request.ModelMode is not null || request.Rgba is not null;
 
-    private static bool HasEditParameters(GenerateRequest request)
-        => !string.IsNullOrWhiteSpace(request.MaskImage) ||
+    private static bool HasEditParameters(GenerateRequest request, bool wantsControl)
+        // mask_image is a Z-Image inpaint field when a control request is
+        // present, so it must not be mistaken for a Qwen edit parameter there.
+        => (!wantsControl && !string.IsNullOrWhiteSpace(request.MaskImage)) ||
            request.Strength is not null || request.MaskingStrength is not null ||
            HasAdvancedParameters(request);
 
@@ -254,6 +269,48 @@ public static class RequestMapper
             // default 0.65; other values are validated in 0.05..2.0.
             ControlScale = request.ControlScale ?? 0.0f,
             Flags = 0
+        };
+    }
+
+    /// <summary>
+    /// Z-Image Union 2.x inpaint: copies every ControlNet field from
+    /// <see cref="MapZImageControl"/> (prompt, checkpoint, seed, control image,
+    /// type, scale and flags) and additionally decodes the brush mask
+    /// (white = repaint, black = keep) into a single-channel raster. Both the
+    /// control image and the mask are required; the library validator checks
+    /// the raster dimensions and control metadata.
+    /// </summary>
+    private static ZImageInpaintOptions MapZImageInpaint(GenerateRequest request)
+    {
+        string controlData = NullIfBlank(request.ControlImage)
+            ?? throw new ArgumentException(
+                "control_image (a base64 PNG) is required for Z-Image inpaint.");
+        string maskData = NullIfBlank(request.MaskImage)
+            ?? throw new ArgumentException(
+                "mask_image (a base64 PNG) is required for Z-Image inpaint.");
+
+        ZImageOptions common = MapZImage(request);
+        QziRasterImage control = QziRasterImage.FromPngBase64(controlData);
+        QziRasterImage mask = QziRasterImage.FromPngBase64(maskData, mask: true);
+
+        string? type = NormalizeControlType(request.ControlType);
+        if (type is not null && !CanonicalControlTypes.Contains(type))
+            throw new ArgumentException(
+                $"Unknown control_type '{request.ControlType}'. Use auto, pose, " +
+                "canny, depth, scribble or raw.");
+
+        return new ZImageInpaintOptions
+        {
+            Prompt = common.Prompt,
+            Width = common.Width,
+            Height = common.Height,
+            Seed = common.Seed,
+            Checkpoint = common.Checkpoint,
+            ControlImage = control,
+            ControlType = type,
+            ControlScale = request.ControlScale ?? 0.0f,
+            Flags = 0,
+            Mask = mask
         };
     }
 

@@ -229,7 +229,7 @@ public record ZImageOptions : GenerationOptions
 /// with the DiT's control context upstream. <see cref="ControlType"/> is
 /// normalised to a lowercase canonical value before it is sent across the ABI.
 /// </remarks>
-public sealed record ZImageControlOptions : ZImageOptions
+public record ZImageControlOptions : ZImageOptions
 {
     /// <summary>Canonical (lowercase) control types accepted by the engine.</summary>
     private static readonly HashSet<string> CanonicalControlTypes = new(StringComparer.Ordinal)
@@ -278,4 +278,35 @@ public sealed record ZImageControlOptions : ZImageOptions
     /// </summary>
     internal static bool IsValidControlType(string? normalized)
         => normalized is null || CanonicalControlTypes.Contains(normalized);
+}
+
+/// <summary>
+/// Z-Image Turbo Fun ControlNet Union 2.x MASK INPAINTING, additive over
+/// <see cref="ZImageControlOptions"/>. It reuses every ControlNet field
+/// (prompt, checkpoint, width, height, seed, control image, control type,
+/// control scale and reserved flags) and adds a required single-channel mask.
+/// </summary>
+/// <remarks>
+/// The native backend centre-crop cover-fits the control image and the mask to
+/// the output canvas INDEPENDENTLY, so the mask may have different dimensions
+/// from <see cref="ZImageControlOptions.ControlImage"/>. It VAE-encodes twice:
+/// the original control image into <c>control_latent</c>, and the masked image
+/// (<c>control_image * (1 - mask)</c>) into <c>inpaint_latent</c>. With
+/// <c>keep_mask = 1 - mask</c> these form the 33-channel context
+/// <c>[control_latent(16) | keep_mask(1) | inpaint_latent(16)]</c>. Only Union
+/// v2 / v2.1 weights support inpainting; a plain ControlNet call leaves the
+/// last 17 planes at zero.
+/// </remarks>
+public sealed record ZImageInpaintOptions : ZImageControlOptions
+{
+    /// <summary>
+    /// Required single-channel 8-bit mask (<c>[mask_w*mask_h]</c>). WHITE (255)
+    /// pixels are REPAINTED from the prompt, BLACK (0) pixels KEEP the source
+    /// (control) image. Decode an 8-bit PNG with
+    /// <c>QziRasterImage.FromPngBase64(data, mask: true)</c>, or build one with
+    /// <see cref="QziRasterImage.SolidMask"/>. The mask is 1..4096 pixels per
+    /// side and at most 2048*2048 pixels in total; its dimensions need not match
+    /// <see cref="ZImageControlOptions.ControlImage"/>.
+    /// </summary>
+    public required QziRasterImage Mask { get; init; }
 }

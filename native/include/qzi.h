@@ -59,6 +59,10 @@ extern "C" {
 /* Advanced WanGP editing: outpainting, LanPaint and RGBA output. All three are
  * pure orchestration / sampling on the SAME 7B weights; no new checkpoint. */
 #define QZI_FEATURE_QWEN21_EDIT_ADV 0x4u
+/* Z-Image Turbo Fun ControlNet Union 2.x mask inpainting. WanGP builds the
+ * 33-channel context as [control_latent | keep_mask | inpaint_latent]; this
+ * bit means the last 17 planes can actually be populated from a mask. */
+#define QZI_FEATURE_ZIMAGE_INPAINT  0x8u
 
 /* Outpainting margins and source offsets are aligned to 32 pixels, matching
  * models/qwen21/pipeline.py OUTPAINTING_ALIGNMENT. */
@@ -266,6 +270,37 @@ typedef struct qzi_zimage_control_request {
     uint32_t           flags;             /* reserved, must be 0 */
 } qzi_zimage_control_request;
 
+/* Z-Image Turbo Fun ControlNet Union 2.x INPAINTING, additive in ABI v1 in
+ * exactly the same way as the three increments above: the ordinary ControlNet
+ * request is the first member, no pre-existing struct or export changes.
+ * Probe QZI_FEATURE_ZIMAGE_INPAINT and qzi_zimage_inpaint_layout() before
+ * calling qzi_generate_zimage_inpaint().
+ *
+ * The mask is a one-channel 8-bit plane [mw*mh]. WHITE (255) means "repaint
+ * this area from the prompt", BLACK (0) means "keep the source image". Both
+ * the control image and the mask are centre-crop cover-fitted to the output
+ * canvas independently, so they need not share the same dimensions.
+ *
+ * This mirrors WanGP models/z_image/pipeline_z_image.py (Union 2.x branch):
+ *   inpaint_image  = control_image * (1 - mask)
+ *   inpaint_latent = vae.encode(inpaint_image)
+ *   keep_mask      = 1 - mask, contracted to the 1/8 latent grid
+ *   context        = [control_latent(16) | keep_mask(1) | inpaint_latent(16)]
+ * A plain ControlNet call leaves the last 17 planes at zero, which is the
+ * WanGP no-mask path. Only the 33-channel Union v2 / v2.1 weights support
+ * inpainting; 16-channel v1 weights are rejected by the real backend.
+ *
+ * This library does NOT run an edge / pose / depth estimator on the control
+ * image, and does not implement WanGP's optional input_ref_images replacement
+ * of control_latent (its UI option is disabled upstream). */
+typedef struct qzi_zimage_inpaint_request {
+    qzi_zimage_control_request base;      /* the ordinary ControlNet request */
+    const uint8_t     *mask;              /* required: [mw*mh] 8-bit, white = repaint */
+    uint32_t           mask_width;
+    uint32_t           mask_height;
+    uint32_t           flags;             /* reserved, must be 0 */
+} qzi_zimage_inpaint_request;
+
 /* Progress callback. `phase` is a static literal: "model load", "text",
  * "image encode" (image edits / ControlNet: VAE-encoding the reference or
  * control image), "dit"
@@ -331,6 +366,9 @@ QZI_API size_t      qzi_zimage_control_layout(void);
 /* sizeof(qzi_qwen21_edit_ex_request); additive in v1, old libraries do not
  * export it at all. */
 QZI_API size_t      qzi_qwen21_edit_ex_layout(void);
+/* sizeof(qzi_zimage_inpaint_request); additive in v1, old libraries do not
+ * export it at all. */
+QZI_API size_t      qzi_zimage_inpaint_layout(void);
 
 /* Reports sizeof() for the six POD structs above. Used by the managed wrapper
  * to fail fast on a struct-packing mismatch instead of corrupting memory. */
@@ -394,6 +432,19 @@ QZI_API qzi_status  qzi_generate_zimage_control(qzi_engine *engine,
  * or RGBA (color type 6) according to request->rgba. */
 QZI_API qzi_status  qzi_generate_qwen21_edit_ex(qzi_engine *engine,
                                                 const qzi_qwen21_edit_ex_request *request,
+                                                const qzi_callbacks *callbacks,
+                                                qzi_image *out_image,
+                                                char *error, size_t error_cap);
+
+/* Z-Image Turbo Fun ControlNet Union 2.x mask inpainting. Same single-flight,
+ * progress, cancellation and buffer-ownership rules as
+ * qzi_generate_zimage_control(). Returns QZI_ERR_UNSUPPORTED when the
+ * registered backend has no inpaint slot or its Union weights are v1, and
+ * QZI_ERR_NOT_CONFIGURED when the real backend has no ControlNet weights.
+ * The control_rgb and mask buffers are only read during the call and remain
+ * owned by the caller. */
+QZI_API qzi_status  qzi_generate_zimage_inpaint(qzi_engine *engine,
+                                                const qzi_zimage_inpaint_request *request,
                                                 const qzi_callbacks *callbacks,
                                                 qzi_image *out_image,
                                                 char *error, size_t error_cap);

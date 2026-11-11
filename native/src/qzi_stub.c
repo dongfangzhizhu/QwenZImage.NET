@@ -135,16 +135,19 @@ static qzi_status run_phases(const qzi_callbacks *callbacks, double start,
         qzi_set_error(error, error_cap, "cancelled during text encoding");
         return QZI_ERR_CANCELLED;
     }
-    if (editing) {
-        /* VAE-encoding the reference / control image is a distinct,
-         * minute-scale stage on the real backend; report it so the UI does
-         * not look stuck. */
-        qzi_emit_progress(callbacks, "image encode", 0, 1, start);
+    /* `editing` is the number of distinct VAE-encode stages: 0 for plain
+     * t2i, 1 for qwen21 edits / ordinary ControlNet, 2 for Union 2.x
+     * inpainting (control image + masked source). Each is a minute-scale
+     * stage on the real backend; report them so the UI does not look stuck.
+     * With one stage the emitted (completed,total) pairs are still (0,1)
+     * and (1,1), exactly as before. */
+    for (i = 0; i < editing; i++) {
+        qzi_emit_progress(callbacks, "image encode", i, editing, start);
         if (qzi_cancelled(callbacks)) {
             qzi_set_error(error, error_cap, "cancelled during image encoding");
             return QZI_ERR_CANCELLED;
         }
-        qzi_emit_progress(callbacks, "image encode", 1, 1, start);
+        qzi_emit_progress(callbacks, "image encode", i + 1, editing, start);
     }
     for (i = 0; i < steps; i++) {
         qzi_emit_progress(callbacks, "dit", i, steps, start);
@@ -445,6 +448,7 @@ static qzi_status stub_generate_qwen21_edit_ex(void *context,
 static qzi_status stub_generate_zimage_impl(void *context,
                                             const qzi_zimage_request *base,
                                             const qzi_zimage_control_request *control,
+                                            const qzi_zimage_inpaint_request *inpaint,
                                             const qzi_callbacks *callbacks,
                                             qzi_image *out_image,
                                             char *error, size_t error_cap)
@@ -453,41 +457,61 @@ static qzi_status stub_generate_zimage_impl(void *context,
     qzi_status status;
     uint8_t *rgb, *png;
     size_t png_size = 0;
-    const qzi_zimage_request *request = control ? &control->base : base;
+    /* An inpaint request embeds the ordinary ControlNet request, so every
+     * downstream path sees one unified `control_eff` pointer. */
+    const qzi_zimage_control_request *control_eff =
+        control ? control : (inpaint ? &inpaint->base : NULL);
+    const qzi_zimage_request *request = control_eff ? &control_eff->base : base;
     int switched = (s->resident != QZI_MODEL_ZIMAGE) ||
-                   s->zimage_control != (control != NULL);
+                   s->zimage_control != (control_eff != NULL);
     double start = qzi_now_seconds();
     uint64_t tag = 0x5A494D4147ULL ^
                    qzi_fnv1a(request->checkpoint ? request->checkpoint : "bf16") ^
                    s->config_tag;
 
     /* Validate BEFORE hashing any caller-owned pixel buffer (an integrator may
-     * call the backend directly with a bogus control_width). */
-    status = control ? qzi_validate_zimage_control(control, error, error_cap)
-                     : qzi_validate_zimage(request, error, error_cap);
+     * call the backend directly with a bogus control_width / mask_width). */
+    status = inpaint ? qzi_validate_zimage_inpaint(inpaint, error, error_cap)
+             : control_eff ? qzi_validate_zimage_control(control_eff, error, error_cap)
+             : qzi_validate_zimage(request, error, error_cap);
     if (status != QZI_OK) return status;
     if (!s->zimage_dir) {
         qzi_set_error(error, error_cap,
                       "zimage model pack is not configured (zimage_dir)");
         return QZI_ERR_NOT_CONFIGURED;
     }
-    if (control) {
-        const size_t pixels = (size_t)control->control_width *
-                              (size_t)control->control_height;
+    if (control_eff) {
+        const size_t pixels = (size_t)control_eff->control_width *
+                              (size_t)control_eff->control_height;
         tag ^= 0x4354524C32315F31ULL; /* "CTRL21_1" */
-        tag ^= hash_bytes(control->control_rgb, 3u * pixels) *
+        tag ^= hash_bytes(control_eff->control_rgb, 3u * pixels) *
                0x9E3779B97F4A7C15ULL;
-        tag ^= qzi_fnv1a(control->control_type ? control->control_type : "auto") *
+        tag ^= qzi_fnv1a(control_eff->control_type ? control_eff->control_type : "auto") *
                0xBF58476D1CE4E5B9ULL;
-        tag ^= float_bits(control->control_scale) * 0x94D049BB133111EBULL;
-        tag ^= (uint64_t)control->control_width << 32 ^
-               (uint64_t)control->control_height;
+        tag ^= float_bits(control_eff->control_scale) * 0x94D049BB133111EBULL;
+        tag ^= (uint64_t)control_eff->control_width << 32 ^
+               (uint64_t)control_eff->control_height;
     }
-    /* Turbo: fixed 8-step schedule, no user-supplied steps/guidance. */
+    if (inpaint) {
+        /* The mask, its geometry and the fact that a SECOND VAE encode runs
+         * must all be observable in the deterministic PNG. */
+        const size_t mask_pixels = (size_t)inpaint->mask_width *
+                                   (size_t)inpaint->mask_height;
+        tag ^= 0x494E504E5432315FULL; /* "INPNT21_" */
+        tag ^= hash_bytes(inpaint->mask, mask_pixels) *
+               0xD6E8FEB86659FD93ULL;
+        tag ^= (uint64_t)inpaint->mask_width << 32 ^
+               (uint64_t)inpaint->mask_height;
+    }
+    /* Turbo: fixed 8-step schedule, no user-supplied steps/guidance.
+     * Inpainting VAE-encodes twice (control image + masked source), so the
+     * reference backend reports two "image encode" stages just like the real
+     * one; plain ControlNet still reports exactly one. */
     status = run_phases(callbacks, start, QZI_MODEL_ZIMAGE, switched, 8,
-                        control != NULL, s, error, error_cap);
+                        inpaint ? 2 : (control_eff != NULL), s, error,
+                        error_cap);
     if (status != QZI_OK) return status;
-    s->zimage_control = control != NULL;
+    s->zimage_control = control_eff != NULL;
 
     rgb = make_pixels(request->prompt, (uint32_t)request->width,
                       (uint32_t)request->height, 3u, request->seed, tag,
@@ -513,7 +537,7 @@ static qzi_status stub_generate_zimage(void *context,
                                       qzi_image *out_image,
                                       char *error, size_t error_cap)
 {
-    return stub_generate_zimage_impl(context, request, NULL, callbacks,
+    return stub_generate_zimage_impl(context, request, NULL, NULL, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -523,7 +547,17 @@ static qzi_status stub_generate_zimage_control(void *context,
                                               qzi_image *out_image,
                                               char *error, size_t error_cap)
 {
-    return stub_generate_zimage_impl(context, NULL, request, callbacks,
+    return stub_generate_zimage_impl(context, NULL, request, NULL, callbacks,
+                                     out_image, error, error_cap);
+}
+
+static qzi_status stub_generate_zimage_inpaint(void *context,
+                                               const qzi_zimage_inpaint_request *request,
+                                               const qzi_callbacks *callbacks,
+                                               qzi_image *out_image,
+                                               char *error, size_t error_cap)
+{
+    return stub_generate_zimage_impl(context, NULL, NULL, request, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -539,7 +573,8 @@ const qzi_backend qzi_reference_vtable = {
     stub_release_image,
     stub_generate_qwen21_edit,
     stub_generate_zimage_control,
-    stub_generate_qwen21_edit_ex
+    stub_generate_qwen21_edit_ex,
+    stub_generate_zimage_inpaint
 };
 
 /* The vtable's context pointer must be per-engine, not a global: qzi.c copies

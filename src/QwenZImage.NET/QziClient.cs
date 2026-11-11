@@ -57,6 +57,16 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     public bool SupportsAdvancedEditing => AbiGuard.Qwen21EditAdvSupported;
 
     /// <summary>
+    /// Whether the loaded native library implements the fourth additive ABI v1
+    /// increment: Z-Image Union 2.x mask inpainting. Inpainting embeds the
+    /// ControlNet request, so it is available only when
+    /// <see cref="SupportsControlNet"/> is also true; an older v1 library that
+    /// does not export qzi_generate_zimage_inpaint() keeps serving ControlNet
+    /// and text-to-image generation.
+    /// </summary>
+    public bool SupportsInpaint => AbiGuard.ZImageInpaintSupported;
+
+    /// <summary>
     /// Creates a native engine instance. With no options,
     /// <c>QwenZImage.config.json</c> is loaded automatically and its model
     /// directories are passed straight into the native backend; an explicit
@@ -278,6 +288,35 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         }
     }
 
+    /// <summary>
+    /// Generates a Z-Image Union 2.x inpaint PNG (masked regeneration on the
+    /// ControlNet Union weights; synchronous, may take minutes). WHITE (255)
+    /// mask pixels are repainted from the prompt, BLACK (0) pixels keep the
+    /// control image. Requires a native library that implements the fourth
+    /// additive ABI v1 increment; see <see cref="SupportsInpaint"/>. Only Union
+    /// v2 / v2.1 weights are supported by the real backend.
+    /// </summary>
+    public GenerationResult GenerateZImageInpaint(ZImageInpaintOptions options,
+                                                   IProgress<GenerationProgress>? progress = null,
+                                                   CancellationToken cancellationToken = default)
+    {
+        QziImage image = CallZImageInpaint(options, progress, cancellationToken,
+                                            out TimeSpan elapsed);
+        try
+        {
+            int length = checked((int)image.Size);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            new ReadOnlySpan<byte>(image.Data, length).CopyTo(buffer);
+            return new GenerationResult(buffer, length, (int)image.Width,
+                                        (int)image.Height, options.Seed,
+                                        GenerationModel.ZImage, elapsed);
+        }
+        finally
+        {
+            ReleaseImage(ref image);
+        }
+    }
+
     /// <summary>Dispatches either request kind.</summary>
     public GenerationResult Generate(GenerationOptions options,
                                      IProgress<GenerationProgress>? progress = null,
@@ -288,6 +327,8 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             Qwen21EditExOptions advanced => GenerateQwen21EditEx(advanced, progress, cancellationToken),
             Qwen21EditOptions edit => GenerateQwen21Edit(edit, progress, cancellationToken),
             QwenImageOptions qwen => GenerateQwen21(qwen, progress, cancellationToken),
+            // Inpaint derives from the ControlNet options, so it must come first.
+            ZImageInpaintOptions inpaint => GenerateZImageInpaint(inpaint, progress, cancellationToken),
             ZImageControlOptions control => GenerateZImageControl(control, progress, cancellationToken),
             ZImageOptions zimage => GenerateZImage(zimage, progress, cancellationToken),
             null => throw new ArgumentNullException(nameof(options)),
@@ -315,6 +356,9 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
                 break;
             case QwenImageOptions qwen:
                 image = CallQwen21(qwen, progress, cancellationToken, out _);
+                break;
+            case ZImageInpaintOptions inpaint:
+                image = CallZImageInpaint(inpaint, progress, cancellationToken, out _);
                 break;
             case ZImageControlOptions control:
                 image = CallZImageControl(control, progress, cancellationToken, out _);
@@ -384,6 +428,14 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         => Task.Run(() => GenerateZImageControl(options, progress, cancellationToken),
                     cancellationToken);
 
+    /// <summary>Async wrapper over the synchronous Z-Image inpaint call.</summary>
+    public Task<GenerationResult> GenerateZImageInpaintAsync(
+        ZImageInpaintOptions options,
+        IProgress<GenerationProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+        => Task.Run(() => GenerateZImageInpaint(options, progress, cancellationToken),
+                    cancellationToken);
+
     /// <summary>Async wrapper over the zero-copy <see cref="WriteTo"/> path.</summary>
     public Task WriteToAsync(Stream destination, GenerationOptions options,
                              IProgress<GenerationProgress>? progress = null,
@@ -421,7 +473,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         QziQwen21Request request = BuildQwen21Request(options, prompt, negative,
                                                        tier, lora);
 
-        return Invoke(&request, null, null, null, null, callbacks.Callbacks,
+        return Invoke(&request, null, null, null, null, null, callbacks.Callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -470,7 +522,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so both pins stay alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, &request, null, null, callbacks.Callbacks,
+            return Invoke(null, null, &request, null, null, null, callbacks.Callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -536,7 +588,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so both pins stay alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, null, null, &request, callbacks.Callbacks,
+            return Invoke(null, null, null, null, &request, null, callbacks.Callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -587,7 +639,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             Flags = 0
         };
 
-        return Invoke(null, &request, null, null, null, callbacks.Callbacks,
+        return Invoke(null, &request, null, null, null, null, callbacks.Callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -638,18 +690,84 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so the pin stays alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, null, &request, null, callbacks.Callbacks,
+            return Invoke(null, null, null, &request, null, null, callbacks.Callbacks,
+                          cancellationToken, out elapsed);
+        }
+    }
+
+    private QziImage CallZImageInpaint(ZImageInpaintOptions options,
+                                       IProgress<GenerationProgress>? progress,
+                                       CancellationToken cancellationToken,
+                                       out TimeSpan elapsed)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        RequestValidator.Validate(options);
+        ThrowIfDisposed();
+        if (!AbiGuard.ZImageInpaintSupported)
+            throw new QziException(QziStatus.Unsupported,
+                "The loaded native library does not implement Z-Image Union 2.x " +
+                "inpainting (qzi_generate_zimage_inpaint is not exported, or the " +
+                "ControlNet capability is missing). Rebuild QwenZImageNative from " +
+                "the matching source tree; ControlNet and text-to-image generation " +
+                "are unaffected.");
+        cancellationToken.ThrowIfCancellationRequested();
+
+        using var prompt = new Utf8PinnedString(options.Prompt);
+        using var checkpoint = new Utf8PinnedString(options.Checkpoint);
+        // null ControlType becomes a NULL pointer; a non-null one is already
+        // the lowercase canonical value produced by EffectiveControlType.
+        using var controlType = new Utf8PinnedString(options.EffectiveControlType);
+        using var callbacks = new CallbackScope(progress, cancellationToken);
+
+        QziZImageRequest baseRequest = new()
+        {
+            Prompt = prompt.Pointer,
+            Checkpoint = checkpoint.Pointer,
+            Width = options.Width,
+            Height = options.Height,
+            Seed = options.Seed,
+            Flags = 0
+        };
+        QziRasterImage control = options.ControlImage;
+        QziRasterImage mask = options.Mask;
+        // Both buffers are pinned exactly like the reference/mask pair in
+        // CallQwen21Edit: the native call is synchronous, so the pins stay
+        // alive until Invoke returns and the caller owns the PNG buffer.
+        fixed (byte* controlPtr = control.Bytes)
+        fixed (byte* maskPtr = mask.Bytes)
+        {
+            QziZImageControlRequest controlRequest = new()
+            {
+                Base = baseRequest,
+                ControlRgb = controlPtr,
+                ControlWidth = (uint)control.Width,
+                ControlHeight = (uint)control.Height,
+                ControlType = controlType.Pointer,
+                ControlScale = options.ControlScale,
+                Flags = options.Flags
+            };
+            QziZImageInpaintRequest request = new()
+            {
+                Base = controlRequest,
+                Mask = (IntPtr)maskPtr,
+                MaskWidth = (uint)mask.Width,
+                MaskHeight = (uint)mask.Height,
+                // Reserved for the C ABI; the reusable control flags above
+                // carry options.Flags and the validator keeps both at zero.
+                Flags = 0
+            };
+            return Invoke(null, null, null, null, null, &request, callbacks.Callbacks,
                           cancellationToken, out elapsed);
         }
     }
 
     private QziImage Invoke(QziQwen21Request* qwen, QziZImageRequest* zimage,
                             QziQwen21EditRequest* edit, QziZImageControlRequest* control,
-                            QziQwen21EditExRequest* editEx,
+                            QziQwen21EditExRequest* editEx, QziZImageInpaintRequest* inpaint,
                             QziCallbacks callbacks,
                             CancellationToken cancellationToken, out TimeSpan elapsed)
     {
-        // Exactly one of the five request pointers is non-null.
+        // Exactly one of the six request pointers is non-null.
         QziImage image = default;
         IntPtr engine = _handle.DangerousGetHandle();
         byte* error = stackalloc byte[NativeMethods.ErrorCapacity];
@@ -667,6 +785,9 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             else if (edit is not null)
                 status = NativeMethods.GenerateQwen21Edit(engine, edit, &callbacks, &image,
                                                           error, NativeMethods.ErrorCapacity);
+            else if (inpaint is not null)
+                status = NativeMethods.GenerateZImageInpaint(engine, inpaint, &callbacks, &image,
+                                                             error, NativeMethods.ErrorCapacity);
             else if (control is not null)
                 status = NativeMethods.GenerateZImageControl(engine, control, &callbacks, &image,
                                                              error, NativeMethods.ErrorCapacity);

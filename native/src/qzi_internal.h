@@ -24,6 +24,8 @@ qzi_status  qzi_validate_zimage(const qzi_zimage_request *request,
                                 char *error, size_t error_cap);
 qzi_status  qzi_validate_zimage_control(const qzi_zimage_control_request *request,
                                         char *error, size_t error_cap);
+qzi_status  qzi_validate_zimage_inpaint(const qzi_zimage_inpaint_request *request,
+                                        char *error, size_t error_cap);
 
 /* The built-in deterministic backend vtable (defined in qzi_stub.c). */
 extern const qzi_backend qzi_reference_vtable;

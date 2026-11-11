@@ -227,7 +227,7 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet`, `supports_advanced_editing` |
+| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet`, `supports_advanced_editing`, `supports_inpaint` |
 | `GET` | `/api/presets` | `{"presets":[...]}` — all `QziPresets` with a `model` discriminator |
 | `POST` | `/api/jobs` | Validate + enqueue; `202` with the job snapshot |
 | `GET` | `/api/jobs` | `{"jobs":[...]}` newest first; optional `?client=` filter |
@@ -404,6 +404,45 @@ mode back to plain `zimage`. Real inference additionally requires
 the request still succeeds but only produces the deterministic byte-comparison
 image.
 
+### Inpaint envelope (`POST /api/jobs`)
+
+A fourth additive mode: `model: "zimage-inpaint"`, **or** a ControlNet request
+that also carries `mask_image`. Either way both `control_image` and
+`mask_image` are required; the request is mapped to `ZImageInpaintOptions`
+(`GenerateZImageInpaint`). Editing (qwen21-edit) and inpaint remain mutually
+exclusive, just like editing and ControlNet.
+
+```json
+{
+  "model": "zimage-inpaint",
+  "prompt": "a red fox walking through fresh snow, cinematic light",
+  "width": 1024,
+  "height": 1024,
+  "seed": 42,
+  "checkpoint": "bf16",
+  "client": "manual-test",
+  "control_image": "data:image/png;base64,iVBORw0KGgo...",
+  "control_type": "raw",
+  "control_scale": 0.65,
+  "mask_image": "data:image/png;base64,iVBORw0KGgo..."
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `control_image` | **Required.** Same raster rules and `control_type` / `control_scale` semantics as the ControlNet envelope above |
+| `mask_image` | **Required.** Base64 single-channel 8-bit PNG (or `data:image/png;base64,...` URL) produced by the brush canvas. WHITE (255) = repaint from the prompt, BLACK (0) = keep the control image. Each side `1..4096`, total pixels `≤ 2048×2048`; dimensions need **not** match `control_image` — both are centre-crop cover-fitted to the output canvas independently |
+
+`mask_image` **without** a `control_image` is treated as a Qwen edit field and
+rejected with `400`; with `control_image` it is no longer mistaken for an edit
+parameter. Jobs appear in the list / gallery with `"inpaint": true` and
+`"has_mask": true` (the redundant `control` badge is suppressed).
+`/api/health` exposes `supports_inpaint`; when `false` the UI disables the
+`zimage-inpaint` option and falls back to plain `zimage`. Real inference also
+requires 33-channel Union v2 / v2.1 weights in `zimage_control_dir`; a 16-channel
+v1 pack is rejected by the engine. With the reference backend the request still
+succeeds but only produces the deterministic byte-comparison image.
+
 ### SSE (`/api/events`)
 
 ```
@@ -422,7 +461,8 @@ data: {"job_id":1,"phase":"Dit","completed":3,"total":8,"fraction":0.375, ...}
 job is running, a matching `progress` event is emitted as well. `phase` is the
 `GenerationPhase` enum name (`ModelLoad` / `Text` / `ImageEncode` / `Dit` /
 `Vae` / `Encode`); `ImageEncode` appears for edit jobs (VAE-encoding the
-reference) and ControlNet jobs (VAE-encoding the control image). The stream sends a comment heartbeat every 15 seconds so proxies
+reference), ControlNet jobs (VAE-encoding the control image) and inpaint jobs
+(two VAE encodes: the control image and the masked source image; the real backend folds them into a single `0/1 → 1/1` progress stage, while the GPU-free reference backend reports two `0/2 → 1/2 → 2/2` stages). The stream sends a comment heartbeat every 15 seconds so proxies
 do not close idle connections. `EventSource` reconnects automatically.
 
 ## Front-end features
@@ -463,6 +503,15 @@ do not close idle connections. `EventSource` reconnects automatically.
   `zimage_control_dir`. Edit mode and ControlNet mode are mutually exclusive;
   the option is disabled when `/api/health` reports
   `supports_controlnet: false`.
+- **Inpaint mode** (`zimage-inpaint`): a strict superset of ControlNet. It
+  reuses the same control-image upload / type / scale controls **and** the
+  shared brush mask canvas from edit mode (the control image becomes the mask
+  backdrop and sets its resolution); no second image component is introduced.
+  White = repaint, black / untouched = keep, and both the control image and a
+  painted mask are required before queueing. Gallery / job rows show a single
+  `inpaint · mask` badge instead of a redundant `control` badge. The option is
+  disabled (and an already-selected inpaint mode falls back to `zimage`) when
+  `/api/health` reports `supports_inpaint: false`.
 - Health pill showing resident model / backend (`reference backend (noise)`
   vs `QwenZImageNative`), with `transport`, `config_path` and directories in
   the tooltip, plus an "Unload model" action.

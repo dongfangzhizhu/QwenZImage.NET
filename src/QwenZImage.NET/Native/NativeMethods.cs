@@ -27,6 +27,12 @@ internal static unsafe partial class NativeMethods
     /// </summary>
     internal const uint FeatureQwen21EditAdv = 0x4u;
 
+    /// <summary>
+    /// Capability bit for Z-Image Union 2.x inpaint (masked regeneration on
+    /// the ControlNet Union weights). Added without bumping the ABI.
+    /// </summary>
+    internal const uint FeatureZImageInpaint = 0x8u;
+
     [LibraryImport(LibraryName, EntryPoint = "qzi_abi_version")]
     internal static partial uint AbiVersion();
 
@@ -108,6 +114,31 @@ internal static unsafe partial class NativeMethods
                                                       QziCallbacks* callbacks,
                                                       QziImage* image,
                                                       byte* error, nuint errorCap);
+
+    /// <summary>
+    /// Additive in ABI v1, fourth increment. Older libraries do not export this
+    /// symbol, so <see cref="AbiGuard"/> probes it with
+    /// <c>NativeLibrary.TryGetExport</c> before reporting support. The bound
+    /// stub is for callers (and tests) that have already established the
+    /// capability; calling it on an older library would raise
+    /// EntryPointNotFoundException.
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "qzi_zimage_inpaint_layout")]
+    internal static partial nuint ZImageInpaintLayout();
+
+    /// <summary>
+    /// Additive in ABI v1, fourth increment: Z-Image Union 2.x mask inpainting.
+    /// Older libraries do not export this symbol, so never call it until
+    /// <see cref="AbiGuard.ZImageInpaintSupported"/> has confirmed the export
+    /// exists (otherwise an EntryPointNotFoundException escapes). The request
+    /// embeds the ordinary ControlNet request as its first member.
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "qzi_generate_zimage_inpaint")]
+    internal static partial int GenerateZImageInpaint(IntPtr engine,
+                                                       QziZImageInpaintRequest* request,
+                                                       QziCallbacks* callbacks,
+                                                       QziImage* image,
+                                                       byte* error, nuint errorCap);
 
     [LibraryImport(LibraryName, EntryPoint = "qzi_image_release")]
     internal static partial void ImageRelease(IntPtr engine, QziImage* image);

@@ -111,6 +111,24 @@ internal unsafe struct QziZImageControlRequest
     public uint Flags;
 }
 
+/// <summary>
+/// Fourth additive ABI v1 request: the ordinary Z-Image ControlNet Union
+/// request followed by the single-channel inpaint mask, its dimensions and
+/// reserved flags. WHITE (255) mask pixels are repainted, BLACK (0) pixels keep
+/// the source. Field order and packing must match
+/// <c>qzi_zimage_inpaint_request</c> in native/include/qzi.h;
+/// <see cref="AbiGuard"/> verifies sizeof() against qzi_zimage_inpaint_layout().
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct QziZImageInpaintRequest
+{
+    public QziZImageControlRequest Base;
+    public IntPtr Mask;
+    public uint MaskWidth;
+    public uint MaskHeight;
+    public uint Flags;
+}
+
 /// <summary>Function pointers are passed as IntPtr so the source-generated
 /// marshaller treats the whole struct as blittable (no marshalling stubs).</summary>
 [StructLayout(LayoutKind.Sequential)]

@@ -250,6 +250,13 @@ static const qzi_backend custom_backend_vtable = {
     /* Optional, additive in ABI v1: advanced Qwen-Image 2.1 editing
      * (outpainting / LanPaint / RGBA). NULL makes
      * qzi_generate_qwen21_edit_ex() answer QZI_ERR_UNSUPPORTED. */
+    NULL,
+    /* Optional, additive in ABI v1: Z-Image Turbo Fun ControlNet Union 2.x
+     * mask inpainting. NULL makes qzi_generate_zimage_inpaint() answer
+     * QZI_ERR_UNSUPPORTED while every older generate path keeps working.
+     * All four optional slots stay at the END of the vtable, in this order,
+     * so an integrator that recompiles against qzi_backend.h keeps every
+     * existing slot at the same offset. */
     NULL
 };
 

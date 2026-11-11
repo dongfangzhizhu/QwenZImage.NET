@@ -41,6 +41,9 @@ public static class RequestValidator
             case Qwen21EditExOptions advanced: Validate(advanced); break;
             case Qwen21EditOptions edit: Validate(edit); break;
             case QwenImageOptions qwen: Validate(qwen); break;
+            // Inpaint derives from the ControlNet options, so it must be
+            // matched first or its mask rules would be skipped.
+            case ZImageInpaintOptions inpaint: Validate(inpaint); break;
             case ZImageControlOptions control: Validate(control); break;
             case ZImageOptions zimage: Validate(zimage); break;
             default: throw new ArgumentException(
@@ -278,6 +281,36 @@ public static class RequestValidator
 
         if (options.Flags != 0)
             throw new ArgumentException("Flags is reserved and must be 0.", nameof(options));
+    }
+
+    /// <summary>
+    /// Validates a Z-Image Union 2.x inpaint request. Mirrors
+    /// <c>qzi_validate_zimage_inpaint()</c>: the embedded ControlNet request
+    /// runs through the ordinary control rules (including the reserved
+    /// <c>Flags</c>), then the single-channel mask and its dimensions are
+    /// checked. The mask is cover-fitted independently of the control image,
+    /// so NO dimension equality between the two is required here (unlike
+    /// <see cref="Validate(Qwen21EditOptions)"/>).
+    /// </summary>
+    public static void Validate(ZImageInpaintOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        Validate((ZImageControlOptions)options);
+
+        QziRasterImage? mask = options.Mask;
+        if (mask is null)
+            throw new ArgumentException(
+                "Mask is required for Z-Image inpainting.", nameof(options));
+        if (mask.Channels != 1)
+            throw new ArgumentException(
+                "Mask must be a single-channel 8-bit raster.", nameof(options));
+        if (mask.Width <= 0 || mask.Height <= 0 ||
+            mask.Width > QziRasterImage.MaxSide ||
+            mask.Height > QziRasterImage.MaxSide ||
+            (long)mask.Width * mask.Height > QziRasterImage.MaxPixels)
+            throw new ArgumentException(
+                $"Mask dimensions must be 1..{QziRasterImage.MaxSide} per side and " +
+                "at most 2048*2048 total pixels.", nameof(options));
     }
 
     private static void ValidatePrompt(string? prompt)

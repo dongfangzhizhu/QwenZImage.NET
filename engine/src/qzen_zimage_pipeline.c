@@ -839,15 +839,29 @@ fail:
     return 0;
 }
 
-float *qzen_zpipe_control_context(const qzen_zimage_control *control,
-                                  const float *control_latent,
-                                  uint32_t latent_h, uint32_t latent_w,
-                                  char *error, size_t error_size) {
+float *qzen_zpipe_control_context_ex(const qzen_zimage_control *control,
+                                     const float *control_latent,
+                                     const float *keep_mask,
+                                     const float *inpaint_latent,
+                                     uint32_t latent_h, uint32_t latent_w,
+                                     char *error, size_t error_size) {
     const uint32_t in_dim = qzen_zimage_control_in_dim(control);
+    const int has_inpaint = (keep_mask != NULL) || (inpaint_latent != NULL);
     if (!control_latent || !latent_h || !latent_w ||
         (in_dim != QZEN_ZIMAGE_CONTROL_IN_DIM_V2 &&
          in_dim != QZEN_ZIMAGE_CONTROL_IN_DIM_V1)) {
         zpipe_fail(error, error_size, "invalid ControlNet control latent");
+        return NULL;
+    }
+    if (has_inpaint && (!keep_mask || !inpaint_latent)) {
+        zpipe_fail(error, error_size,
+                   "inpaint needs both keep_mask and inpaint_latent");
+        return NULL;
+    }
+    if (has_inpaint && in_dim != QZEN_ZIMAGE_CONTROL_IN_DIM_V2) {
+        zpipe_fail(error, error_size,
+                   "inpainting requires 33-channel Union 2.x weights "
+                   "(16-channel v1 packs cannot inpaint)");
         return NULL;
     }
     const size_t plane = (size_t)latent_h * latent_w;
@@ -856,10 +870,24 @@ float *qzen_zpipe_control_context(const qzen_zimage_control *control,
         zpipe_fail(error, error_size, "cannot allocate ControlNet context");
         return NULL;
     }
-    /* [control_latent(16) | keep_mask(1, zero) | inpaint_latent(16, zero)].
-     * With no inpaint mask WanGP leaves the last 17 planes at zero. */
+    /* [control_latent(16) | keep_mask(1) | inpaint_latent(16)] -- WanGP
+     * models/z_image/pipeline_z_image.py, control_in_dim == 33 branch.
+     * Without a mask the last 17 planes stay at zero, exactly as before. */
     memcpy(context, control_latent, 16 * plane * sizeof(float));
+    if (has_inpaint) {
+        memcpy(context + 16 * plane, keep_mask, plane * sizeof(float));
+        memcpy(context + 17 * plane, inpaint_latent,
+               16 * plane * sizeof(float));
+    }
     return context;
+}
+
+float *qzen_zpipe_control_context(const qzen_zimage_control *control,
+                                  const float *control_latent,
+                                  uint32_t latent_h, uint32_t latent_w,
+                                  char *error, size_t error_size) {
+    return qzen_zpipe_control_context_ex(control, control_latent, NULL, NULL,
+                                         latent_h, latent_w, error, error_size);
 }
 
 int qzen_zpipe_control_prepare(qzen_zimage_pipeline *pipe,

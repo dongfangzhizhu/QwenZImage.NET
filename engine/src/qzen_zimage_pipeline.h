@@ -129,6 +129,19 @@ float *qzen_zpipe_control_context(const qzen_zimage_control *control,
                                   uint32_t latent_h, uint32_t latent_w,
                                   char *error, size_t error_size);
 
+/* WanGP Union 2.x INPAINT variant of the same builder. `keep_mask` is a
+ * [lh, lw] plane in [0,1] (1 = keep the source, 0 = repaint) and
+ * `inpaint_latent` is the [16, lh, lw] VAE encoding of the masked source
+ * image. Both must be supplied together; passing NULL for both reproduces
+ * qzen_zpipe_control_context() bit for bit. A 16-channel v1 pack cannot
+ * inpaint and is rejected with an error. */
+float *qzen_zpipe_control_context_ex(const qzen_zimage_control *control,
+                                     const float *control_latent,
+                                     const float *keep_mask,
+                                     const float *inpaint_latent,
+                                     uint32_t latent_h, uint32_t latent_w,
+                                     char *error, size_t error_size);
+
 /* Denoise with ControlNet conditioning. `control_context` is the array above
  * (caller-owned); `context_scale` scales every skip connection (WanGP's
  * control_context_scale, 0.65 for Union2.1). Plain t2i uses

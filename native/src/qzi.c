@@ -598,6 +598,51 @@ static void qzi_normalize_zimage_control(const qzi_zimage_control_request *reque
     out->flags = 0;
 }
 
+qzi_status qzi_validate_zimage_inpaint(const qzi_zimage_inpaint_request *request,
+                                       char *error, size_t error_cap)
+{
+    qzi_status s;
+    if (!request) {
+        qzi_set_error(error, error_cap, "zimage inpaint request is NULL");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->flags != 0) {
+        qzi_set_error(error, error_cap, "zimage inpaint request flags must be 0");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    s = qzi_validate_zimage_control(&request->base, error, error_cap);
+    if (s != QZI_OK) return s;
+    if (!request->mask) {
+        qzi_set_error(error, error_cap,
+                      "mask is required for Z-Image inpainting");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->mask_width == 0 || request->mask_height == 0 ||
+        request->mask_width > QZI_MAX_REFERENCE_SIDE ||
+        request->mask_height > QZI_MAX_REFERENCE_SIDE ||
+        (int64_t)request->mask_width * (int64_t)request->mask_height >
+            QZI_MAX_PIXELS) {
+        qzi_set_error_fmt(error, error_cap,
+            "inpaint mask must be 1..%u pixels per side and at most 2048*2048 total pixels",
+            (unsigned)QZI_MAX_REFERENCE_SIDE);
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    return QZI_OK;
+}
+
+/* Same sentinel / type normalisation as a plain ControlNet request; the mask
+ * plane and its dimensions are passed through verbatim (each is cover-fitted
+ * to the output canvas by the backend). */
+static void qzi_normalize_zimage_inpaint(const qzi_zimage_inpaint_request *request,
+                                         qzi_zimage_inpaint_request *out)
+{
+    qzi_normalize_zimage_control(&request->base, &out->base);
+    out->mask = request->mask;
+    out->mask_width = request->mask_width;
+    out->mask_height = request->mask_height;
+    out->flags = 0;
+}
+
 /* ---- backend registration ---------------------------------------------- */
 
 #ifdef QZI_HAS_REAL_BACKEND
@@ -628,7 +673,7 @@ QZI_API uint32_t qzi_abi_version(void)
 QZI_API uint32_t qzi_abi_features(void)
 {
     return QZI_FEATURE_QWEN21_EDIT | QZI_FEATURE_ZIMAGE_CONTROL |
-           QZI_FEATURE_QWEN21_EDIT_ADV;
+           QZI_FEATURE_QWEN21_EDIT_ADV | QZI_FEATURE_ZIMAGE_INPAINT;
 }
 
 QZI_API size_t qzi_qwen21_edit_layout(void)
@@ -644,6 +689,11 @@ QZI_API size_t qzi_zimage_control_layout(void)
 QZI_API size_t qzi_qwen21_edit_ex_layout(void)
 {
     return sizeof(qzi_qwen21_edit_ex_request);
+}
+
+QZI_API size_t qzi_zimage_inpaint_layout(void)
+{
+    return sizeof(qzi_zimage_inpaint_request);
 }
 
 QZI_API const char *qzi_status_text(qzi_status status)
@@ -943,6 +993,38 @@ QZI_API qzi_status qzi_generate_zimage_control(qzi_engine *engine,
     qzi_normalize_zimage_control(request, &normalized);
     if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
     status = engine->backend.generate_zimage_control(engine->context, &normalized,
+                                                     callbacks, out_image, error,
+                                                     error_cap);
+    return generation_leave(engine, status, out_image, QZI_MODEL_ZIMAGE,
+                            error, error_cap);
+}
+
+QZI_API qzi_status qzi_generate_zimage_inpaint(qzi_engine *engine,
+                                                const qzi_zimage_inpaint_request *request,
+                                                const qzi_callbacks *callbacks,
+                                                qzi_image *out_image,
+                                                char *error, size_t error_cap)
+{
+    qzi_status status;
+    qzi_zimage_inpaint_request normalized;
+    if (!engine || !out_image || !error || error_cap == 0) {
+        qzi_set_error(error, error_cap,
+                      "engine, out_image and error buffer are required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_image, 0, sizeof(*out_image));
+    error[0] = '\0';
+    status = qzi_validate_zimage_inpaint(request, error, error_cap);
+    if (status != QZI_OK) { engine->rejected++; return status; }
+    if (!engine->backend.generate_zimage_inpaint) {
+        engine->rejected++;
+        qzi_set_error(error, error_cap,
+            "the registered native backend does not implement Z-Image inpainting");
+        return QZI_ERR_UNSUPPORTED;
+    }
+    qzi_normalize_zimage_inpaint(request, &normalized);
+    if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
+    status = engine->backend.generate_zimage_inpaint(engine->context, &normalized,
                                                      callbacks, out_image, error,
                                                      error_cap);
     return generation_leave(engine, status, out_image, QZI_MODEL_ZIMAGE,

@@ -16,6 +16,8 @@ internal static unsafe class AbiGuard
     private static int _controlState;
     // 0 = not probed, 1 = no advanced editing, 2 = advanced editing verified.
     private static int _advState;
+    // 0 = not probed, 1 = no Z-Image inpainting, 2 = inpainting verified.
+    private static int _inpaintState;
 
     internal static void Verify()
     {
@@ -163,6 +165,46 @@ internal static unsafe class AbiGuard
 
         nuint nativeSize = ((delegate* unmanaged<nuint>)layout)();
         Check("qzi_qwen21_edit_ex_request", nativeSize, sizeof(QziQwen21EditExRequest));
+        return true;
+    }
+
+    /// <summary>
+    /// True when the loaded library implements the fourth additive ABI v1
+    /// increment: Z-Image Union 2.x mask inpainting. The inpaint request embeds
+    /// the ordinary ControlNet request, so <see cref="ZImageControlSupported"/>
+    /// is a hard prerequisite: a library without ControlNet (or with a
+    /// mismatching control layout) cannot support inpainting. Like the three
+    /// increments above, this was added WITHOUT bumping QZI_ABI_VERSION, so
+    /// export discovery of BOTH the generate symbol and its layout export plus
+    /// a sizeof check is the only safe probe.
+    /// </summary>
+    internal static bool ZImageInpaintSupported
+    {
+        get
+        {
+            int state = Volatile.Read(ref _inpaintState);
+            if (state != 0) return state == 2;
+            Verify();
+            bool supported = ZImageControlSupported && ProbeInpaintFeatures();
+            Volatile.Write(ref _inpaintState, supported ? 2 : 1);
+            return supported;
+        }
+    }
+
+    private static bool ProbeInpaintFeatures()
+    {
+        IntPtr handle = NativeLibraryLoader.Handle;
+        if (handle == IntPtr.Zero) return false;
+        if (!NativeLibrary.TryGetExport(handle, "qzi_abi_features", out IntPtr features) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_zimage_inpaint_layout", out IntPtr layout) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_generate_zimage_inpaint", out _))
+            return false;
+
+        uint bits = ((delegate* unmanaged<uint>)features)();
+        if ((bits & NativeMethods.FeatureZImageInpaint) == 0) return false;
+
+        nuint nativeSize = ((delegate* unmanaged<nuint>)layout)();
+        Check("qzi_zimage_inpaint_request", nativeSize, sizeof(QziZImageInpaintRequest));
         return true;
     }
 

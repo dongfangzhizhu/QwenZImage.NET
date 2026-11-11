@@ -30,6 +30,8 @@ public sealed class GenerateRequest
     /// <summary>
     /// Optional single-channel brush mask at the reference resolution. White
     /// pixels are regenerated, black pixels follow the reference trajectory.
+    /// Reused by Z-Image Union 2.x inpaint (white = repaint, black = keep),
+    /// where it is required and paired with <see cref="ControlImage"/>.
     /// </summary>
     public string? MaskImage { get; set; }
 
@@ -103,6 +105,8 @@ public sealed class JobDto
     public bool Rgba { get; init; }
     public bool Control { get; init; }
     public bool HasControl { get; init; }
+    /// <summary>Z-Image Union 2.x inpaint job (a control request with a mask).</summary>
+    public bool Inpaint { get; init; }
     public string Prompt { get; init; } = "";
     public int Width { get; init; }
     public int Height { get; init; }
@@ -130,6 +134,7 @@ public sealed class JobDto
         GenerationProgress p = job.LastProgress;
         (bool control, bool hasControl) = ControlState(request);
         (bool advanced, bool outpaint, bool rgba) = AdvancedEditState(request);
+        (bool inpaint, bool hasInpaintMask) = InpaintState(request);
         return new JobDto
         {
             Id = job.Id,
@@ -143,12 +148,13 @@ public sealed class JobDto
             // Qwen21EditOptions derives from QwenImageOptions, so the model id
             // alone cannot tell an edit job apart in the gallery / job list.
             Edit = request is Qwen21EditOptions,
-            HasMask = request is Qwen21EditOptions { Mask: not null },
+            HasMask = request is Qwen21EditOptions { Mask: not null } || hasInpaintMask,
             AdvancedEdit = advanced,
             Outpaint = outpaint,
             Rgba = rgba,
             Control = control,
             HasControl = hasControl,
+            Inpaint = inpaint,
             Prompt = request.Prompt,
             Width = request.Width,
             Height = request.Height,
@@ -177,8 +183,24 @@ public sealed class JobDto
     /// <see cref="From"/> uses it for both properties.
     /// </summary>
     internal static (bool Control, bool HasControl) ControlState(GenerationOptions request)
-        => request is ZImageControlOptions control
-            ? (true, control.ControlImage is not null)
+        => request switch
+        {
+            // ZImageInpaintOptions derives from ZImageControlOptions, so the
+            // derived record must be matched first. Inpaint still carries a
+            // control image, so it keeps the ControlNet badges as well.
+            ZImageInpaintOptions inpaint => (true, inpaint.ControlImage is not null),
+            ZImageControlOptions control => (true, control.ControlImage is not null),
+            _ => (false, false)
+        };
+
+    /// <summary>
+    /// Inpaint state derived from a request. Pure function so the gallery
+    /// badges are unit-testable without a native engine. Returns
+    /// <c>(Inpaint, HasMask)</c>; the mask is required on an inpaint request.
+    /// </summary>
+    internal static (bool Inpaint, bool HasMask) InpaintState(GenerationOptions request)
+        => request is ZImageInpaintOptions inpaint
+            ? (true, inpaint.Mask is not null)
             : (false, false);
 
     /// <summary>

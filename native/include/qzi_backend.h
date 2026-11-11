@@ -81,9 +81,21 @@ typedef struct qzi_backend {
     /* Optional, additive in ABI v1: advanced Qwen-Image 2.1 editing
      * (outpainting / LanPaint / RGBA). NULL makes
      * qzi_generate_qwen21_edit_ex() report QZI_ERR_UNSUPPORTED while all four
-     * older generate paths keep working unchanged. Always the LAST slot. */
+     * older generate paths keep working unchanged. */
     qzi_status (*generate_qwen21_edit_ex)(void *context,
                                           const qzi_qwen21_edit_ex_request *request,
+                                          const qzi_callbacks *callbacks,
+                                          qzi_image *out_image,
+                                          char *error, size_t error_cap);
+
+    /* Optional, additive in ABI v1: Z-Image Union 2.x mask inpainting. NULL
+     * makes qzi_generate_zimage_inpaint() report QZI_ERR_UNSUPPORTED while all
+     * five older generate paths keep working unchanged. All optional fields
+     * stay at the END of the vtable so an integrator that recompiles against
+     * this header keeps every existing slot at the same offset.
+     * Always the LAST slot. */
+    qzi_status (*generate_zimage_inpaint)(void *context,
+                                          const qzi_zimage_inpaint_request *request,
                                           const qzi_callbacks *callbacks,
                                           qzi_image *out_image,
                                           char *error, size_t error_cap);

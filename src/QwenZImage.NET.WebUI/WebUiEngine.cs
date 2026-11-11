@@ -39,12 +39,20 @@ public sealed record WebUiEngineHealth
     /// </summary>
     [JsonPropertyName("supports_advanced_editing")]
     public bool SupportsAdvancedEditing { get; init; }
+
+    /// <summary>
+    /// Whether the loaded native library exports the fourth additive ABI v1
+    /// increment (Z-Image Union 2.x inpaint). Mirrors the top-level
+    /// <c>supports_inpaint</c> flag in <c>/api/health</c>.
+    /// </summary>
+    [JsonPropertyName("supports_inpaint")]
+    public bool SupportsInpaint { get; init; }
 }
 
 /// <summary>
 /// Capability gating for additive ABI v1 features. Kept as pure functions so
-/// the WebUI can fail fast on edit / ControlNet jobs and the behaviour is
-/// unit-testable without constructing a native engine. Text-to-image requests
+/// the WebUI can fail fast on edit / ControlNet / inpaint jobs and the behaviour
+/// is unit-testable without constructing a native engine. Text-to-image requests
 /// never need an optional feature.
 /// </summary>
 public static class WebUiCapabilities
@@ -68,6 +76,12 @@ public static class WebUiCapabilities
         "the matching source tree; ordinary image editing and text-to-image " +
         "generation are unaffected.";
 
+    /// <summary>400 message for an inpaint job on a library without inpaint.</summary>
+    public const string InpaintUnavailable =
+        "The loaded native library does not implement Z-Image Union 2.x " +
+        "inpaint. Rebuild QwenZImageNative from the matching source tree; " +
+        "text-to-image generation is unaffected.";
+
     /// <summary>
     /// Two-argument overload kept for callers that predate the third additive
     /// increment; it assumes the advanced capability follows the basic one.
@@ -79,21 +93,36 @@ public static class WebUiCapabilities
                     supportsImageEditing);
 
     /// <summary>
-    /// Returns a 400-style error when <paramref name="options"/> needs a
-    /// feature the loaded library does not provide, otherwise <c>null</c>.
-    /// Editing and ControlNet are additive in ABI v1: an older library still
-    /// serves text-to-image but lacks the matching export. Rejecting here means
-    /// the operator sees a 400 instead of a queued job failing minutes later
-    /// (or silently degrading to ordinary t2i / the noise backend).
+    /// Four-argument overload kept for callers that predate the fourth additive
+    /// increment; it assumes the inpaint capability follows ControlNet.
     /// </summary>
     public static string? ErrorFor(GenerationOptions options,
                                    bool supportsImageEditing,
                                    bool supportsControlNet,
                                    bool supportsAdvancedEditing)
+        => ErrorFor(options, supportsImageEditing, supportsControlNet,
+                    supportsAdvancedEditing, supportsControlNet);
+
+    /// <summary>
+    /// Returns a 400-style error when <paramref name="options"/> needs a
+    /// feature the loaded library does not provide, otherwise <c>null</c>.
+    /// Editing, ControlNet, advanced editing and inpaint are additive in ABI v1:
+    /// an older library still serves text-to-image but lacks the matching
+    /// export. Rejecting here means the operator sees a 400 instead of a queued
+    /// job failing minutes later (or silently degrading to ordinary t2i / the
+    /// noise backend).
+    /// </summary>
+    public static string? ErrorFor(GenerationOptions options,
+                                   bool supportsImageEditing,
+                                   bool supportsControlNet,
+                                   bool supportsAdvancedEditing,
+                                   bool supportsInpaint)
         => options switch
         {
-            // Advanced editing derives from the ordinary edit options, so it
-            // must be matched first.
+            // Inpaint derives from ControlNet, and advanced editing derives
+            // from the ordinary edit options, so both must be matched before
+            // their base records.
+            ZImageInpaintOptions when !supportsInpaint => InpaintUnavailable,
             Qwen21EditExOptions when !supportsAdvancedEditing => AdvancedEditingUnavailable,
             Qwen21EditOptions when !supportsImageEditing => EditingUnavailable,
             ZImageControlOptions when !supportsControlNet => ControlNetUnavailable,
@@ -138,14 +167,23 @@ public sealed class WebUiEngine : IQziExecutor, IDisposable
     /// </summary>
     public bool SupportsAdvancedEditing => _client.SupportsAdvancedEditing;
 
+    /// <summary>
+    /// Whether the loaded native library exports the fourth additive ABI v1
+    /// increment (Z-Image Union 2.x inpaint). Exposed so the WebUI can reject
+    /// inpaint jobs with a 400 instead of letting them fail minutes later.
+    /// </summary>
+    public bool SupportsInpaint => _client.SupportsInpaint;
+
     public GenerationResult Generate(GenerationOptions options,
                                      IProgress<GenerationProgress>? progress = null,
                                      CancellationToken cancellationToken = default)
         => options switch
         {
-            // Derived ControlNet options must go to the dedicated ControlNet
-            // call, not the base Z-Image path (which would ignore the control
-            // image). All other requests keep the client's own dispatch.
+            // Derived options must go to their dedicated calls, not the base
+            // Z-Image path (which would ignore the control image / mask).
+            // Inpaint derives from ControlNet, so it is matched first.
+            ZImageInpaintOptions inpaint =>
+                _client.GenerateZImageInpaint(inpaint, progress, cancellationToken),
             ZImageControlOptions control =>
                 _client.GenerateZImageControl(control, progress, cancellationToken),
             _ => _client.Generate(options, progress, cancellationToken)
@@ -168,7 +206,8 @@ public sealed class WebUiEngine : IQziExecutor, IDisposable
             IsReferenceBackend = h.IsReferenceBackend,
             Backend = h.IsReferenceBackend ? "reference (noise)" : "QwenZImageNative",
             SupportsControlNet = SupportsControlNet,
-            SupportsAdvancedEditing = SupportsAdvancedEditing
+            SupportsAdvancedEditing = SupportsAdvancedEditing,
+            SupportsInpaint = SupportsInpaint
         };
     }
 

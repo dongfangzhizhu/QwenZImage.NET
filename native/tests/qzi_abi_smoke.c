@@ -542,6 +542,173 @@ static void check_control_generation(qzi_engine *engine,
     qzi_image_release(engine, &v);
 }
 
+/* Z-Image Union 2.x mask inpainting is the FOURTH additive ABI v1 extension.
+ * The embedded ControlNet request is validated by the ordinary control rules,
+ * then the mask plane is checked. All of this happens in qzi.c before the
+ * vtable is called, so these cases run on both backends without weights.
+ * Returns the number of rejected requests so main() can assert health. */
+#define EXPECT_INPAINT_INVALID(call, label) do {                       \
+    if ((call) != QZI_ERR_INVALID_ARGUMENT) {                          \
+        fprintf(stderr, "FAIL: inpaint validation %s (%s)\n", label,  \
+                error[0] ? error : "no error");                        \
+        failures++;                                                    \
+    }                                                                  \
+    rejected++;                                                        \
+} while (0)
+
+static int check_inpaint_validation(qzi_engine *engine,
+                                    const qzi_zimage_request *base,
+                                    char *error, size_t error_cap)
+{
+    static uint8_t rgb[3 * 64 * 64];
+    static uint8_t mask[64 * 64];
+    qzi_zimage_inpaint_request p;
+    qzi_image image;
+    int rejected = 0;
+
+    memset(&image, 0, sizeof(image));
+    memset(&p, 0, sizeof(p));
+    memset(rgb, 0x22, sizeof(rgb));
+    memset(mask, 255, sizeof(mask));
+    p.base.base = *base;
+    p.base.control_rgb = rgb;
+    p.base.control_width = 64;
+    p.base.control_height = 64;
+    p.base.control_type = "pose";
+    p.base.control_scale = 0.65f;
+    p.mask = mask;
+    p.mask_width = 64;
+    p.mask_height = 64;
+
+    p.mask = NULL;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "mask is required");
+    p.mask = mask;
+    p.mask_width = 0;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "mask width");
+    p.mask_width = 4097;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "mask side bound");
+    p.mask_width = 4096;
+    p.mask_height = 4096;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "mask pixel budget");
+    p.mask_width = 64;
+    p.mask_height = 64;
+    p.flags = 1;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "reserved inpaint flags");
+    p.flags = 0;
+    p.base.flags = 1;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "reserved control flags");
+    p.base.flags = 0;
+    p.base.control_rgb = NULL;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "inherited control image validation");
+    p.base.control_rgb = rgb;
+    p.base.control_scale = 0.01f;
+    EXPECT_INPAINT_INVALID(qzi_generate_zimage_inpaint(engine, &p, NULL, &image,
+                                                       error, error_cap),
+                           "inherited control scale validation");
+    return rejected;
+}
+
+#undef EXPECT_INPAINT_INVALID
+
+/* With the deterministic backend an inpaint request must be observable in the
+ * bytes: it differs from its ControlNet twin, and the mask content / geometry
+ * change the result while an identical request stays byte-identical. Five
+ * successful generations (one plain control + four inpaint), reference only. */
+static void check_inpaint_generation(qzi_engine *engine,
+                                     const qzi_zimage_request *base,
+                                     char *error, size_t error_cap)
+{
+    static uint8_t rgb[3 * 64 * 64];
+    static uint8_t mask[64 * 64];
+    qzi_zimage_control_request c;
+    qzi_zimage_inpaint_request p;
+    qzi_callbacks callbacks;
+    qzi_image a, b, x, y, z;
+    qzi_status status;
+
+    memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b));
+    memset(&x, 0, sizeof(x)); memset(&y, 0, sizeof(y));
+    memset(&z, 0, sizeof(z));
+    memset(&callbacks, 0, sizeof(callbacks));
+    memset(rgb, 0x22, sizeof(rgb));
+    memset(mask, 255, sizeof(mask));
+    memset(&c, 0, sizeof(c));
+    memset(&p, 0, sizeof(p));
+    c.base = *base;
+    c.control_rgb = rgb;
+    c.control_width = 64;
+    c.control_height = 64;
+    c.control_type = "pose";
+    c.control_scale = 0.65f;
+    p.base = c;
+    p.mask = mask;
+    p.mask_width = 64;
+    p.mask_height = 64;
+    callbacks.progress = on_progress;
+
+    status = qzi_generate_zimage_control(engine, &c, NULL, &a, error, error_cap);
+    CHECK(status == QZI_OK, "inpaint control baseline generate");
+
+    image_encode_seen = 0;
+    model_load_seen = 0;
+    status = qzi_generate_zimage_inpaint(engine, &p, &callbacks, &b, error,
+                                         error_cap);
+    CHECK(status == QZI_OK, "zimage inpaint generate");
+    if (status != QZI_OK) fprintf(stderr, "  inpaint error: %s\n", error);
+    CHECK(is_png(&b), "inpaint png signature");
+    CHECK(status != QZI_OK ||
+          (a.size == b.size && memcmp(a.data, b.data, a.size) != 0),
+          "inpaint differs from plain ControlNet");
+    CHECK(image_encode_seen == 4,
+          "inpaint reports two VAE encode stages");
+    CHECK(model_load_seen == 0,
+          "inpaint reuses the resident Union weights");
+
+    memset(mask, 0, sizeof(mask));
+    status = qzi_generate_zimage_inpaint(engine, &p, NULL, &x, error, error_cap);
+    CHECK(status == QZI_OK, "inpaint keep-all mask generate");
+    CHECK(status != QZI_OK ||
+          (b.size == x.size && memcmp(b.data, x.data, b.size) != 0),
+          "mask content changes output bytes");
+
+    memset(mask, 255, sizeof(mask));
+    p.mask_width = 32;
+    p.mask_height = 32;
+    status = qzi_generate_zimage_inpaint(engine, &p, NULL, &y, error, error_cap);
+    CHECK(status == QZI_OK, "inpaint different mask geometry generate");
+    CHECK(status != QZI_OK ||
+          (b.size == y.size && memcmp(b.data, y.data, b.size) != 0),
+          "mask geometry changes output bytes");
+
+    p.mask_width = 64;
+    p.mask_height = 64;
+    status = qzi_generate_zimage_inpaint(engine, &p, NULL, &z, error, error_cap);
+    CHECK(status == QZI_OK, "identical inpaint generate");
+    CHECK(status != QZI_OK ||
+          (b.size == z.size && memcmp(b.data, z.data, b.size) == 0),
+          "identical inpaint request is byte-identical");
+
+    qzi_image_release(engine, &a);
+    qzi_image_release(engine, &b);
+    qzi_image_release(engine, &x);
+    qzi_image_release(engine, &y);
+    qzi_image_release(engine, &z);
+}
+
 /* A backend built against the pre-edit qzi_backend.h has no edit slot.
  * Registering one must keep text-to-image intact, and the additive edit entry
  * point must answer QZI_ERR_UNSUPPORTED instead of calling a NULL pointer.
@@ -599,10 +766,12 @@ static void check_legacy_backend(const qzi_engine_config *config,
                                  char *error, size_t cap)
 {
     static uint8_t rgb[3 * 64 * 64];
+    static uint8_t mask[64 * 64];
     qzi_backend legacy;
     qzi_qwen21_edit_request e;
     qzi_qwen21_edit_ex_request x;
     qzi_zimage_control_request c;
+    qzi_zimage_inpaint_request p;
     qzi_zimage_request z;
     qzi_image image;
     qzi_engine *engine = NULL;
@@ -612,9 +781,11 @@ static void check_legacy_backend(const qzi_engine_config *config,
     memset(&e, 0, sizeof(e));
     memset(&x, 0, sizeof(x));
     memset(&c, 0, sizeof(c));
+    memset(&p, 0, sizeof(p));
     memset(&z, 0, sizeof(z));
     memset(&image, 0, sizeof(image));
     memset(rgb, 0x33, sizeof(rgb));
+    memset(mask, 255, sizeof(mask));
     z.prompt = "a red fox in snow";
     z.width = 64;
     z.height = 64;
@@ -625,6 +796,10 @@ static void check_legacy_backend(const qzi_engine_config *config,
     c.control_height = 64;
     c.control_type = "pose";
     c.control_scale = 0.65f;
+    p.base = c;
+    p.mask = mask;
+    p.mask_width = 64;
+    p.mask_height = 64;
     legacy.abi_version = QZI_ABI_VERSION;
     legacy.name = "legacy-v1";
     legacy.init = legacy_init;
@@ -634,9 +809,12 @@ static void check_legacy_backend(const qzi_engine_config *config,
     legacy.health = legacy_health;
     legacy.unload = legacy_unload;
     legacy.release_image = legacy_release;
+    /* All four additive slots stay NULL: a backend compiled before the
+     * inpaint increment must still load and answer UNSUPPORTED. */
     legacy.generate_qwen21_edit = NULL;
     legacy.generate_zimage_control = NULL;
     legacy.generate_qwen21_edit_ex = NULL;
+    legacy.generate_zimage_inpaint = NULL;
 
     CHECK(qzi_register_backend(&legacy) == QZI_OK, "register legacy backend");
     status = qzi_engine_create(config, &engine, error, cap);
@@ -657,6 +835,9 @@ static void check_legacy_backend(const qzi_engine_config *config,
         CHECK(qzi_generate_qwen21_edit_ex(engine, &x, NULL, &image, error, cap) ==
                   QZI_ERR_UNSUPPORTED,
               "legacy backend rejects advanced image editing");
+        CHECK(qzi_generate_zimage_inpaint(engine, &p, NULL, &image, error, cap) ==
+                  QZI_ERR_UNSUPPORTED,
+              "legacy backend rejects Z-Image inpainting");
         qzi_engine_destroy(engine);
     }
     CHECK(qzi_register_backend(NULL) == QZI_OK, "restore default backend");
@@ -732,12 +913,17 @@ int main(void)
           "Z-Image ControlNet feature advertised");
     CHECK((qzi_abi_features() & QZI_FEATURE_QWEN21_EDIT_ADV) != 0,
           "advanced image editing feature advertised");
+    CHECK((qzi_abi_features() & QZI_FEATURE_ZIMAGE_INPAINT) != 0,
+          "Z-Image inpainting feature advertised");
+    CHECK(qzi_abi_features() == 0xFu, "feature mask is 0xF");
     CHECK(qzi_qwen21_edit_layout() == sizeof(qzi_qwen21_edit_request),
           "edit request layout size");
     CHECK(qzi_zimage_control_layout() == sizeof(qzi_zimage_control_request),
           "control request layout size");
     CHECK(qzi_qwen21_edit_ex_layout() == sizeof(qzi_qwen21_edit_ex_request),
           "advanced edit request layout size");
+    CHECK(qzi_zimage_inpaint_layout() == sizeof(qzi_zimage_inpaint_request),
+          "inpaint request layout size");
     CHECK(strcmp(qzi_status_text(QZI_ERR_BUSY),
                  "a generation owns the device") == 0, "status text");
     CHECK(qzi_abi_layout(sizes, QZI_LAYOUT_SLOTS) == QZI_OK, "abi layout");
@@ -839,6 +1025,10 @@ int main(void)
         qzi_image_release(engine, &a);
 
         check_control_generation(engine, &zimage, error, sizeof(error));
+        /* Keep the Z-Image generations together: the last four requests must
+         * remain qwen21 advanced edits so the resident-model assertion below
+         * still expects QZI_MODEL_QWEN21. */
+        check_inpaint_generation(engine, &zimage, error, sizeof(error));
         check_edit_generation(engine, &qwen, error, sizeof(error));
         check_edit_ex_generation(engine, &qwen, error, sizeof(error));
     } else {
@@ -878,13 +1068,16 @@ int main(void)
                                                sizeof(error));
     extra_rejected += check_edit_ex_validation(engine, &qwen, error,
                                                sizeof(error));
+    extra_rejected += check_inpaint_validation(engine, &zimage, error,
+                                               sizeof(error));
 
     CHECK(qzi_engine_health(engine, &health, error, sizeof(error)) == QZI_OK,
           "health");
     if (reference) {
         /* 2 baseline + 2 LoRA + 1 zimage + 6 control (1 plain t2i + 5
-         * control) + 3 image-edit + 4 advanced-edit generations. */
-        CHECK(health.served == 18, "served counter");
+         * control) + 5 inpaint (1 plain control + 4 inpaint) + 3 image-edit
+         * + 4 advanced-edit generations. */
+        CHECK(health.served == 23, "served counter");
         CHECK(health.rejected == 2 + extra_rejected, "rejected counter");
         CHECK(health.reference_backend == 1, "reference backend flag");
         /* The last four generations are qwen21 advanced edits, so the resident

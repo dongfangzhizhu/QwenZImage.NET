@@ -135,7 +135,7 @@ Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**�
 
 真实后端流程：懒加载 Union 2.1 权重（`zimage_control_dir`）→ VAE 编码控制图为 16 通道 1/8 latent → 拼成 **33 通道 control context**（`control_latent | keep_mask(全 0) | inpaint_latent(全 0)`）→ 每个去噪步重算 15 条 control layer skip + 2 条 noise refiner skip，并在主 DiT 对应层之后以 `control_scale` 注入。普通 t2i 完全不走这条路径。参考后端把控制图像素、规范后的 `control_type`、`control_scale` 与尺寸纳入确定性哈希，并多上报一个 `"image encode"` phase。
 
-边界：仅支持 Union **v2 / v2.1**（33 通道、15 control layers + 2 个独立 control noise refiner），v1（16 通道）在权重加载时明确拒绝；无 inpaint mask / outpainting 入口；约 3.7 GiB 权重叠加常驻 DiT + 文本塔，24 GiB 卡上可能触发 GPU 上传失败并回退 CPU hint 路径（结果正确但更慢）。未配置 `zimage_control_dir` 时真实后端返回 `QZI_ERR_NOT_CONFIGURED`。
+边界：仅支持 Union **v2 / v2.1**（33 通道、15 control layers + 2 个独立 control noise refiner），v1（16 通道）在权重加载时明确拒绝；**普通 ControlNet 请求没有 mask / outpainting 入口**，带遮罩重绘请用下面的 `ZImageInpaintOptions`；约 3.7 GiB 权重叠加常驻 DiT + 文本塔，24 GiB 卡上可能触发 GPU 上传失败并回退 CPU hint 路径（结果正确但更慢）。未配置 `zimage_control_dir` 时真实后端返回 `QZI_ERR_NOT_CONFIGURED`。
 
 **与 WanGP 的两处取值核对**（避免把 UI 标签误当推理参数）：
 
@@ -143,6 +143,32 @@ Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**�
 - `control_type` 保留 `pose` / `canny` / `depth` / `scribble` / `raw`（`auto` 为默认别名）。WanGP 三份 `defaults/z_image_control*.json` 的 description 都写「Pose, Canny, Depth, and Scribble」；`z_image_handler.py` 的 `guide_preprocessing.selection = ["", "PV", "DV", "EV", "V"]` 描述的是**预处理方式**（姿态 / 深度 / 边缘 / 原始格式），不是控制类型枚举。本库固定走 `"V"`（Use Z-Image Raw Format），不运行任何预处理器，因此 `control_type` 只作为描述性元数据参与参数校验与确定性哈希，保留 `scribble` 不会造成推理行为偏差。
 
 WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`control_image` / `control_type` / `control_scale`，`model = "zimage-control"`）。
+
+## Z-Image 遮罩重绘（`ZImageInpaintOptions`）
+
+`ZImageInpaintOptions` 继承 `ZImageControlOptions`，复用其全部字段（`Prompt` / `Width` / `Height` / `Seed` / `Checkpoint` / `ControlImage` / `ControlType` / `ControlScale` / `Flags`），只增加一个必填 mask。它是 WanGP `models/z_image/pipeline_z_image.py` 中 `control_in_dim == 33` 且 `inpaint_mask is not None` 分支的完整实现：普通 ControlNet 的 33 通道 context 里 `keep_mask` 与 `inpaint_latent` 恒为 0，本入口才把它们填上。对应 native 结构体 `qzi_zimage_inpaint_request`，入口 `qzi_generate_zimage_inpaint()`，`.NET` 侧 `GenerateZImageInpaint(Async)`；老 native 库缺该能力时 `SupportsInpaint == false`，调用抛 `QziException(QziStatus.Unsupported)`。
+
+| 字段 | 默认值 | 规则 |
+| --- | --- | --- |
+| `Mask` | **必填** | `QziRasterImage`，**单通道** 8 位。WHITE(255) = 按 prompt 重绘，BLACK(0) = 保留控制图，中间值按线性比例参与。每边 `1..4096`，总像素 `≤ 2048×2048`。可用 `QziRasterImage.SolidMask(w, h, value)` 构造，或用 `FromPngBase64(data, mask: true)` 解码 PNG |
+| `ControlImage` | **必填** | 与 `Mask` **尺寸可以不同**：两者分别独立做居中裁剪 cover fit 到输出画布，不做尺寸相等校验（这与 `Qwen21EditOptions` 要求参考图 / mask 同尺寸不同） |
+| `Flags` | `0` | 内嵌的 ControlNet `Flags` 与外层 inpaint `Flags` 都必须为 `0` |
+
+校验：`RequestValidator.Validate(ZImageInpaintOptions)` 先跑完整的 ControlNet 规则，再要求 `Mask` 非空、`Channels == 1`、尺寸在上限内；native 侧 `qzi_validate_zimage_inpaint()` 做同样的事（`mask` 指针非空、`mask_width/height` 有效、`flags == 0`）。非法值一律 `ArgumentException` / `QZI_ERR_INVALID_ARGUMENT`，不静默 coerce。
+
+真实后端流程（与 WanGP 逐值对齐）：
+
+```
+inpaint_image  = control_image * (1 - mask)
+inpaint_latent = vae.encode(inpaint_image)     # 第二次 VAE 编码
+control_latent = vae.encode(control_image)     # 与普通 ControlNet 相同
+keep_mask      = 1 - mask                      # 8×8 面积均值收缩到 1/8 latent 网格
+context        = [control_latent(16) | keep_mask(1) | inpaint_latent(16)]
+```
+
+`keep_mask` 用面积均值得到 `[0,1]` 软平面；WanGP 用 `F.interpolate(..., mode='nearest')`，硬笔刷边界上最多相差 8 像素，软边 mask 反而更平滑。参考后端把 mask 内容 / 尺寸纳入确定性哈希并上报两个 `"image encode"` 阶段，`adv == NULL` / `inpaint == NULL` 的 t2i、普通编辑与 ControlNet 路径逐位不变。
+
+边界：仅 Union **v2 / v2.1** 支持，v1 权重在加载时明确拒绝；不运行 pose / canny / depth 预处理器，`control_type` 只是元数据；WanGP 的 `input_ref_images` 替换 `control_latent` 分支（其 UI 选项上游已禁用）不在本库范围内。未配置 `zimage_control_dir` 返回 `QZI_ERR_NOT_CONFIGURED`。WebUI 等价字段见 [WEBUI.md](WEBUI.md)（`control_image` + `mask_image`，`model = "zimage-inpaint"`）。
 
 ## 画布示例
 
@@ -163,6 +189,11 @@ WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`control_image` / `control_type`
 | 高级编辑：LanPaint + 任意非零边距 | ❌ 两者互斥（WanGP 对 Red Canvas 禁用 LanPaint） |
 | 高级编辑：LanPaint 但无 `Mask` | ❌ LanPaint 只在遮罩编辑区做 Langevin 精修 |
 | 高级编辑：LanPaint 且 `Strength = 0.6` | ❌ 该模式强制两个 strength 为 `1.0`，显式传其它值直接报错 |
+| Inpaint：控制图 `512×512` + mask `256×256` + 输出 `512×512` | ✅ 合法，两者各自独立 cover fit |
+| Inpaint：`Mask` 为 3 通道 RGB | ❌ 必须单通道，托管 / native 双侧都拒绝 |
+| Inpaint：缺 `Mask` | ❌ mask 必填，不会退化成普通 ControlNet |
+| Inpaint：`mask_width = 4097` | ❌ 超出每边 `4096` 上限 |
+| Inpaint：`mask = 4096×4096` | ❌ 超出 `2048×2048` 总像素预算 |
 
 ## 预设
 
@@ -182,7 +213,7 @@ native 侧通过 `qzi_progress_fn` 上报的 `phase` 是**静态字面量**，�
 | --- | --- | --- |
 | `"model load"` | `ModelLoad` | 权重加载阶段 |
 | `"text"` | `Text` | 文本编码 |
-| `"image encode"` | `ImageEncode` | **图像编辑 / Z-Image ControlNet**：把参考图或控制图 VAE 编码成 latents（0/1 → 1/1） |
+| `"image encode"` | `ImageEncode` | **图像编辑 / Z-Image ControlNet / inpaint**：把参考图、控制图（inpaint 时还有遮罩后的源图）VAE 编码成 latents。真实后端一律按**单个**阶段上报（`0/1 → 1/1`），inpaint 的第二次编码折算在里面；只有 GPU-free 参考后端把 inpaint 拆成**两个**独立阶段（`0/2 → 1/2 → 2/2`）供无 GPU 测试断言 |
 | `"dit"` | `Dit` | 去噪步数（Turbo 为 8 步；编辑时只跑 `steps - first_step` 步） |
 | `"vae"` | `Vae` | VAE 解码 |
 | `"encode"` | `Encode` | PNG 编码 |
