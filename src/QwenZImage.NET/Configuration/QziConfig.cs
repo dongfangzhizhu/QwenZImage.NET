@@ -61,10 +61,18 @@ public sealed record QziConfig
     /// <summary>Environment variable overriding <c>device_id</c>.</summary>
     public const string DeviceIdVariable = "QZI_DEVICE_ID";
 
+    /// <summary>
+    /// Environment variable naming the optional ControlNet guide-preprocessor
+    /// asset directory (WanGP ONNX models). Read by host applications such as
+    /// the WebUI; the native engine ignores it.
+    /// </summary>
+    public const string PreprocessDirectoryVariable = "QZI_PREPROCESS_DIR";
+
     private static readonly HashSet<string> KnownKeys = new(StringComparer.Ordinal)
     {
         "qwen21_dir", "zimage_dir", "zimage_nunchaku_dir", "zimage_control_dir",
-        "qwen21_lora_dir", "text_cache_dir", "device_id", "thread_count", "native_library"
+        "qwen21_lora_dir", "text_cache_dir", "device_id", "thread_count", "native_library",
+        "preprocess_dir"
     };
 
     private static readonly HashSet<string> PlatformKeys = new(StringComparer.Ordinal)
@@ -98,6 +106,14 @@ public sealed record QziConfig
 
     /// <summary>Explicit path to the native backend library.</summary>
     public string? NativeLibraryPath { get; init; }
+
+    /// <summary>
+    /// Optional host-layer directory holding WanGP ONNX guide-preprocessor
+    /// assets. The core library keeps the C ABI's raw control-raster contract
+    /// and never loads these models itself; the WebUI reads this value to
+    /// offer learned pose / depth / contour estimators.
+    /// </summary>
+    public string? PreprocessDirectory { get; init; }
 
     /// <summary>Absolute path of the file the values came from, or null.</summary>
     public string? SourcePath { get; init; }
@@ -143,6 +159,7 @@ public sealed record QziConfig
             Qwen21LoraDirectory = Expand(Str(values, "qwen21_lora_dir", path)),
             TextCacheDirectory = Expand(Str(values, "text_cache_dir", path)),
             NativeLibraryPath = Expand(Str(values, "native_library", path)),
+            PreprocessDirectory = Expand(Str(values, "preprocess_dir", path)),
             DeviceId = Int(values, "device_id", path, -1),
             ThreadCount = Int(values, "thread_count", path, 0),
             SourcePath = path
@@ -214,6 +231,7 @@ public sealed record QziConfig
             "qwen21_lora_dir" => this with { Qwen21LoraDirectory = expanded },
             "text_cache_dir" => this with { TextCacheDirectory = expanded },
             "native_library" => this with { NativeLibraryPath = expanded },
+            "preprocess_dir" => this with { PreprocessDirectory = expanded },
             "device_id" => this with { DeviceId = ParseInt(key, value, -1) },
             "thread_count" => this with { ThreadCount = ParseInt(key, value, 0) },
             _ => this
@@ -282,6 +300,7 @@ public sealed record QziConfig
         result = Env(result, LoraDirectoryVariable, c => c with { Qwen21LoraDirectory = Expand(Environment.GetEnvironmentVariable(LoraDirectoryVariable)) });
         result = Env(result, ModelCacheVariable, c => c with { TextCacheDirectory = Expand(Environment.GetEnvironmentVariable(ModelCacheVariable)) });
         result = Env(result, NativeLibraryVariable, c => c with { NativeLibraryPath = Expand(Environment.GetEnvironmentVariable(NativeLibraryVariable)) });
+        result = Env(result, PreprocessDirectoryVariable, c => c with { PreprocessDirectory = Expand(Environment.GetEnvironmentVariable(PreprocessDirectoryVariable)) });
         if (int.TryParse(Environment.GetEnvironmentVariable(DeviceIdVariable), out int device))
             result = result with { DeviceId = device };
         return result;

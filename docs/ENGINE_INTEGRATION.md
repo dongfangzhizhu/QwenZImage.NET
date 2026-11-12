@@ -72,6 +72,7 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 | `text_cache_dir` | 文本编码缓存 |
 | `device_id` / `thread_count` | `-1` / `0` = 自动 |
 | `native_library` | 可选，显式 native 库路径 |
+| `preprocess_dir` | **仅 host 层**：WebUI 控制图预处理器（WanGP ONNX 权重）根目录，`QZI_PREPROCESS_DIR` 可覆盖。native 引擎与 C ABI **完全忽略**该键，核心 NuGet 包不加载任何预处理模型 |
 
 两侧都要读这个文件，原因是 **C ABI 装不下全部字段**：
 
@@ -88,6 +89,8 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 4. 进程里直接设置 `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_ZIMAGE_CONTROL_DIR`（没有配置文件也可以）。
 
 优先级为 **显式代码值 / `QZI_*` 环境变量 > 配置文件**；native 侧不会把已覆盖的值再改回去。
+
+> `QZI_PREPROCESS_DIR` **不在**上面这张作用域变量表里。它是 WebUI 专用的 host 层配置（控制图预处理器 ONNX 资产目录），由 `QziConfig` 解析成 `PreprocessDirectory` 后直接交给 `PreprocessAssets.Discover()`，不经过 `NativeConfigScope`、不发布给 native、也不进入 `qzen_config.c:env_overrides[]`。这样 `QZI_*` 作用域契约仍是 6 个目录变量，同时 WebUI 可以引入 `Microsoft.ML.OnnxRuntime` 等三方依赖而不污染核心包。
 
 ### 作用域发布与多实例隔离
 
@@ -276,7 +279,7 @@ ABI 是可替换的，`engine/` 只是本仓库提供的默认真实实现。
 - **LanPaint 的约束不要在 backend 里放宽**：`model_mode 2/3/4/5` 必须有 mask、不能与任何非零边距并用、两个 strength 必须为 `1.0`（`qzi.c` 已归一化）；`qzen_qwen21_pipeline.c` 在缺 `init_latent` / `latent_mask` 时会直接报 `denoise: LanPaint requires ...`，因为它的 Langevin 迭代需要一个可精修的遮罩区域。擅自去掉这些约束会静默产出无意义结果。
 - **RGBA 别在托管侧再合成一次 alpha**：VAE `conv_out` 本来就是 `144→4`，`qzen_qwen21_vae_decode_ex()` 已经用与 RGB 相同的量化写出第 4 通道，`qzi_png_encode_rgba8()` 直接输出 colour type 6；参考后端用同一个编码器做确定性对照。`rgba == 0` 走原 RGB 路径且字节不变，不要给 RGB 图硬塞一个全 255 的 alpha 平面。
 - **ControlNet 权重是独立配置**：`zimage_control_dir` 不在 C ABI 里，也不在 `qzi_engine_config` 中；只在 `QwenZImage.config.json` / `QziConfig.With` / `QZI_ZIMAGE_CONTROL_DIR` 这条配置链上传。没配就提交 `zimage-control` 会返回 `QZI_ERR_NOT_CONFIGURED`（明确提示文件名），不会退化成无控制的 t2i。只支持 **Union v2 / v2.1**（33 通道）；指到 v1 权重会在加载阶段被拒绝。
-- **不要上传未预处理的照片**：`control_type` 不触发任何姿态 / 边缘 / 深度估计，控制图会按原样 VAE 编码。对齐 WanGP 的 `guide_preprocessing = "V"`，调用方须自备已预处理的控制图，否则生成结果只是「被一张照片轻微扰动」，不会得到结构控制。
+- **不要把未预处理的照片直接送进 C ABI / 核心库**：`control_type` 不触发任何姿态 / 边缘 / 深度估计，`control_rgb` 会按原样 VAE 编码。对齐 WanGP 的 `guide_preprocessing = "V"`，**直接调用 NuGet 包或 C ABI 的调用方**须自备已成形的 guide，否则生成结果只是「被一张照片轻微扰动」，不会得到结构控制。**这不等于要求 WebUI 用户手工预处理**：`QwenZImage.NET.WebUI` 在 host 层用 `POST /api/preprocess` 把普通照片转成 guide（对齐 WanGP `wgp.py::process_map_video_guide` 的 `P/D/E/S/C/V`），再把得到的栅格作为普通 `control_rgb` 提交；`preprocess_dir` / `QZI_PREPROCESS_DIR` 只被 WebUI 读取，native 引擎完全忽略。
 - **ControlNet 与常驻模型叠加显存**：Union 2.1 权重约 3.7 GiB，加上常驻 DiT 与文本塔，24 GiB 卡可能上传失败并退回 CPU hint 路径；这不是错误（结果正确但慢），但从 phase 耗时会明显看出差别。切换 Z-Image checkpoint 会释放 DiT，第一次再跑 ControlNet 会重新上传。
 - **主机内存与 block staging**：`qzen_zimage_block_forward_gpu_host()` 每个去噪步会被调用约 50 次（15 control layers 两遍 + 2+2 refiner + 主 DiT）。早期实现每次都 `malloc(seq*dim*2)` 再 `free`，在双份主机 / 设备权重（本机约 45 GiB 私有提交量）压力下，冷启动首个 ControlNet 请求偶发返回 `denoise: cannot stage Z-Image GPU input`。现在 `qzen_zimage_gpu` 持有 grow-only 的 `host_stage`，在 `qzen_zimage_gpu_reserve()` 里一次性按 `plane = seq*dim` 分配，`zimg_read_bf16_f32()` 与 `qzen_zimage_t_embedder_forward_gpu()` 复用它；`qzen_gpu_tensor_from_bf16()` / `qzen_gpu_tensor_read_bf16()` 都是同步 `cudaMemcpy`，H2D 与 D2H 共用同一主机缓冲是安全的。若在更小的机器上仍看到 `cannot allocate Z-Image host staging buffer`，错误会带出行数与 MiB，说明是宿主内存/提交上限不足，而不是 kernel 失败。
 - **LoRA 目录覆盖**：`qwen21_lora_dir` 不在 C ABI 里。用 `QwenZImage.config.json`、`QziClientOptions.Qwen21LoraDirectory` 或 `QZI_QWEN21_LORA_DIR` 指定；只改 `qzi_engine_config.qwen21_dir` 不会改变 LoRA 目录。目录未配置且有 LoRA 时返回 `QZI_ERR_NOT_CONFIGURED`。

@@ -235,21 +235,43 @@
       </select>
     </div>
 
-    <!-- Z-Image Turbo Fun ControlNet Union. The control image must ALREADY be
-         preprocessed (pose / canny / depth / scribble): the library does NOT
-         run any edge / pose / depth estimator, it only consumes the planar RGB
-         control raster. Real Union weights come from zimage_control_dir. -->
+    <!-- Z-Image Turbo Fun ControlNet Union. Upload an ordinary photo: the
+         WebUI builds the guide (canny / scribble / depth / pose / gray) and
+         only the resulting planar RGB raster reaches the native C ABI, which
+         deliberately keeps its "raw" semantics. Real Union weights come from
+         zimage_control_dir. -->
     <div class="edit-block control-block" data-only="zimage-control">
-      <h3 class="section-title">ControlNet Union</h3>
+      <h3 class="section-title">ControlNet Union · guide preprocessing</h3>
       <p class="note edit-note" data-only="zimage-inpaint">Inpaint mode: this control image is paired with the brush mask above. The job is posted as <code>model=zimage-inpaint</code> (or a control request carrying <code>mask_image</code>); both rasters are required.</p>
       <div class="field">
-        <label for="control-file">Control image <span class="hint">PNG / JPEG / WebP · required · preprocessed</span></label>
+        <label for="control-file">Control image <span class="hint">PNG / JPEG / WebP · required · an ordinary photo is fine</span></label>
         <input id="control-file" type="file" accept="image/*">
       </div>
-      <p id="control-empty" class="note edit-empty">Upload an <strong>already preprocessed</strong> control image (pose / canny / depth / scribble). This library does <strong>not</strong> run edge / pose / depth estimation — it consumes the control raster exactly as supplied ("raw" semantics).</p>
+      <div class="grid-2">
+        <div class="field">
+          <label for="control-preprocess">Guide preprocessing</label>
+          <select id="control-preprocess">
+            <option value="auto">auto (follow control type)</option>
+            <option value="raw">raw (keep pixels, WanGP "V")</option>
+            <option value="canny" selected>canny edges (WanGP "EV")</option>
+            <option value="scribble">scribble (WanGP "S")</option>
+            <option value="depth">depth (WanGP "DV")</option>
+            <option value="pose">pose / DWPose (WanGP "PV")</option>
+            <option value="gray">gray (WanGP "C")</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="control-preprocess-side">Guide max side <span class="hint" id="control-preprocess-side-hint">1024 px</span></label>
+          <input id="control-preprocess-side" type="range" min="256" max="2048" step="256" value="1024">
+        </div>
+      </div>
+      <p class="note edit-note">The WebUI runs the estimator, not the native library. <strong>canny / scribble / gray / depth</strong> work out of the box with dependency-free operators; <strong>pose</strong> and learned depth / contour use WanGP ONNX assets from <code>preprocess_dir</code> in <code>QwenZImage.config.json</code> (or <code>QZI_PREPROCESS_DIR</code>). Only the resulting guide is posted to <code>/api/jobs</code>.</p>
+      <p id="control-empty" class="note edit-empty">Upload a photo (or an already-formatted guide). The selected preprocessing mode turns it into a Z-Image ControlNet guide; choose <strong>raw</strong> to keep the pixels exactly as supplied.</p>
       <div id="control-editor" hidden>
-        <img id="control-preview" class="control-preview" alt="Control image preview">
+        <img id="control-preview" class="control-preview" alt="Preprocessed control guide preview">
+        <p id="control-preprocess-info" class="note edit-note" hidden></p>
         <div class="button-row">
+          <button id="control-reprocess" class="btn btn-ghost btn-sm" type="button">Re-run preprocessing</button>
           <button id="control-remove" class="btn btn-ghost btn-sm" type="button">Remove image</button>
         </div>
         <div class="grid-2">

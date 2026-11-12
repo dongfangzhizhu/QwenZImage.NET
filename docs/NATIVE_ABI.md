@@ -185,7 +185,7 @@ typedef struct qzi_zimage_control_request {
 | `base` | 先走完整的 `qzi_validate_zimage()`，t2i 的全部约束（宽高为 16 的倍数、≤ 2048²、checkpoint）都适用 |
 | `control_rgb` | **必填**，平面 RGB8（R/G/B 三个连续平面），只在本次调用期间被读取，所有权归调用方。会做**居中裁剪的 cover fit** 缩放到输出画布 |
 | `control_width` / `control_height` | 每边 `1..4096`，总像素 `≤ 2048×2048` |
-| `control_type` | 大小写不敏感，归一化成 `auto`/`pose`/`canny`/`depth`/`scribble`/`raw` 之一；`NULL` → `auto`。**仅为描述性元数据**，本库不运行姿态 / 边缘 / 深度估计器，对齐 WanGP 的 `guide_preprocessing = "V"`（Use Z-Image Raw Format）：调用方需自行提供已预处理的控制图 |
+| `control_type` | 大小写不敏感，归一化成 `auto`/`pose`/`canny`/`depth`/`scribble`/`raw` 之一；`NULL` → `auto`。**仅为描述性元数据**，本库不运行姿态 / 边缘 / 深度估计器，对齐 WanGP 的 `guide_preprocessing = "V"`（Use Z-Image Raw Format）：调用方需自行提供已预处理的控制图。ABI 层面这是**永久的 raw 契约**，不会新增预处理参数；`QwenZImage.NET.WebUI` 在应用层用 `POST /api/preprocess` 生成该栅格后作为普通 `control_rgb` 传入 |
 | `control_scale` | WanGP 的 `control_context_scale`。`0.0f` 是「用 Union 2.1 默认 `0.65`」的 sentinel，其余合法值 `0.05..2.0` 且必须有限；v1/v2 权重用 `0.75` 时可显式传入 |
 | `flags` | 必须为 `0` |
 

@@ -128,7 +128,7 @@ Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**�
 | 字段 | 默认值 | 规则 |
 | --- | --- | --- |
 | `ControlImage` | **必填** | `QziRasterImage`，3 通道**平面** RGB8。每边 `1..4096`，总像素 `≤ 2048×2048`。与 `Reference` 共用 `FromPng` / `FromPngBase64` 等解码器；输出到画布时做**居中裁剪 cover fit** |
-| `ControlType` | `null` → `auto` | 大小写不敏感，合法值 `auto` / `pose` / `canny` / `depth` / `scribble` / `raw`；`EffectiveControlType` 返回规范后的小写值。**描述性元数据**：本库不运行姿态 / 边缘 / 深度估计器，对齐 WanGP `guide_preprocessing = "V"`，调用方需提供已预处理的控制图 |
+| `ControlType` | `null` → `auto` | 大小写不敏感，合法值 `auto` / `pose` / `canny` / `depth` / `scribble` / `raw`；`EffectiveControlType` 返回规范后的小写值。**描述性元数据**：本库不运行姿态 / 边缘 / 深度估计器，对齐 WanGP `guide_preprocessing = "V"`，核心库调用方需提供已成形的控制栅格；WebUI 用 `POST /api/preprocess` 从普通照片生成 |
 | `ControlScale` | `0`（sentinel）→ `0.65` | WanGP 的 `control_context_scale`（Union 2.1 默认 `0.65`；v1/v2 权重习惯 `0.75`）。`0.05..2.0` 且必须有限；`0` 与不设等价。`EffectiveControlScale` 是实际发送值 |
 
 归一化与校验：native 侧 `qzi_validate_zimage_control()` 先复用 `qzi_validate_zimage()` 校验 `base`，再校验控制图与两个控制字段；非法值（NaN / Inf、越界、未知 `control_type`、`flags != 0`、缺 `control_rgb`、尺寸超限）一律返回 `QZI_ERR_INVALID_ARGUMENT`，不静默 coerce。`.NET` 侧 `RequestValidator.Validate(ZImageControlOptions)` 先于 native 执行同一套规则。
@@ -140,7 +140,7 @@ Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**�
 **与 WanGP 的两处取值核对**（避免把 UI 标签误当推理参数）：
 
 - `ControlScale = 0.65` 对应 WanGP `defaults/z_image_control2_1.json` 与 `settings/z_image_control2_1_settings.json` 的 `control_net_weight_alt`。实际传参链是 `wgp.py` 把该 UI 值装进 `context_scale[0]` → `z_image_main.py` 赋给 `control_context_scale` → `pipeline_z_image.py` 用作 hint 的缩放系数；后者函数签名里的 `0.75` 只是未被覆盖时的兜底（v1 / v2 的习惯值，`defaults/z_image_control*.json` 也确为 `0.75`）。本库只支持 33 通道权重且配置指向 **Union 2.1**，故默认取 `0.65`；若要复现 v2 的 `0.75`，显式传 `ControlScale = 0.75f` 即可，范围 `0.05..2.0` 已覆盖。
-- `control_type` 保留 `pose` / `canny` / `depth` / `scribble` / `raw`（`auto` 为默认别名）。WanGP 三份 `defaults/z_image_control*.json` 的 description 都写「Pose, Canny, Depth, and Scribble」；`z_image_handler.py` 的 `guide_preprocessing.selection = ["", "PV", "DV", "EV", "V"]` 描述的是**预处理方式**（姿态 / 深度 / 边缘 / 原始格式），不是控制类型枚举。本库固定走 `"V"`（Use Z-Image Raw Format），不运行任何预处理器，因此 `control_type` 只作为描述性元数据参与参数校验与确定性哈希，保留 `scribble` 不会造成推理行为偏差。
+- `control_type` 保留 `pose` / `canny` / `depth` / `scribble` / `raw`（`auto` 为默认别名）。WanGP 三份 `defaults/z_image_control*.json` 的 description 都写「Pose, Canny, Depth, and Scribble」；`z_image_handler.py` 的 `guide_preprocessing.selection = ["", "PV", "DV", "EV", "V"]` 描述的是**预处理方式**（姿态 / 深度 / 边缘 / 原始格式），不是控制类型枚举。核心库固定走 `"V"`（Use Z-Image Raw Format），不运行任何预处理器，因此 `control_type` 只作为描述性元数据参与参数校验与确定性哈希，保留 `scribble` 不会造成推理行为偏差。**预处理属于应用层**：`QwenZImage.NET.WebUI` 的 `POST /api/preprocess` 按 WanGP `wgp.py::process_map_video_guide`（`P→pose` / `D→depth` / `E→canny` / `S→scribble` / `C→gray` / `V→raw`）把普通照片转成控制栅格，再以 `control_type` 标注后提交；核心 NuGet 包因此保持零三方依赖。
 
 WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`control_image` / `control_type` / `control_scale`，`model = "zimage-control"`）。
 

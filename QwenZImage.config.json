@@ -1,5 +1,5 @@
 {
-  "_comment": "Model pack locations for the QwenZImageNative backend. Read automatically unless a path is given with --config / QZI_CONFIG. Top-level keys apply to every platform; a windows/linux/osx object overrides them there. Values may start with ~. Unknown keys are an error, keys starting with _ are comments. Model packs are data on disk: these example paths are the development machine's existing pack directories and can be renamed freely.",
+  "_comment": "Model pack locations for the QwenZImageNative backend. Read automatically unless a path is given with --config / QZI_CONFIG. Top-level keys apply to every platform; a windows/linux/osx object overrides them there. Values may start with ~. Unknown keys are an error, keys starting with _ are comments. Model packs are data on disk: these example paths are the development machine's existing pack directories and can be renamed freely. 'preprocess_dir' points at optional WanGP ONNX guide-preprocessor assets (used by the WebUI, ignored by the native engine); QZI_PREPROCESS_DIR overrides it.",
   "_note": "The Windows paths below are absolute so this file works as-is on the machine that owns the weights. The 'h3-models' segment is just that machine's existing on-disk data directory name (inherited from the upstream project); it is NOT a product, symbol or artifact name - no QwenZImageNative artifact uses it. Rename it freely, or edit these values / set QZI_QWEN21_DIR and QZI_ZIMAGE_DIR on any other host.",
   "device_id": -1,
   "thread_count": 0,
@@ -9,7 +9,8 @@
     "zimage_dir": "D:/AI/convert/minimax/h3-models/zimage",
     "zimage_nunchaku_dir": "D:/AI/convert/minimax/h3-models/zimage_nunchaku",
     "zimage_control_dir": "D:/AI/Wan2GP/ckpts/Z-Image-Turbo-Fun-Controlnet-Union2.1_quanto_bf16_int8.safetensors",
-    "text_cache_dir": "D:/AI/convert/minimax/h3-models/config/text-cache"
+    "text_cache_dir": "D:/AI/convert/minimax/h3-models/config/text-cache",
+    "preprocess_dir": "D:/AI/Wan2GP/ckpts"
   },
   "linux": {
     "qwen21_dir": "~/h3-models/qwen21",

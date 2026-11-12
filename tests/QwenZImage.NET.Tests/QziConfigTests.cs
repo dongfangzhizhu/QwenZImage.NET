@@ -74,6 +74,24 @@ public class QziConfigTests : IDisposable
     }
 
     [Fact]
+    public void Preprocess_Dir_Is_A_Recognised_Host_Layer_Key()
+    {
+        // The WebUI reads this key to find WanGP ONNX guide-preprocessor
+        // assets. The native engine ignores it, but the strict parser must not
+        // reject a config file that a host application legitimately uses.
+        QziConfig config = Write("""
+            {
+              "windows": { "preprocess_dir": "/wan2gp/ckpts" },
+              "linux":   { "preprocess_dir": "/wan2gp/ckpts" },
+              "osx":     { "preprocess_dir": "/wan2gp/ckpts" }
+            }
+            """);
+
+        Assert.Equal("/wan2gp/ckpts", config.PreprocessDirectory);
+        Assert.Equal(QziConfig.PreprocessDirectoryVariable, "QZI_PREPROCESS_DIR");
+    }
+
+    [Fact]
     public void Unknown_Key_Is_Rejected()
     {
         File.WriteAllText(_path, """{ "qwen21dir": "/packs/qwen21" }""");

@@ -68,10 +68,12 @@ public sealed class GenerateRequest
 
     /// <summary>
     /// Z-Image Turbo Fun ControlNet Union only: a base64 PNG (optionally a
-    /// <c>data:image/png;base64,...</c> URL) carrying the preprocessed control
-    /// image. The browser canvas re-encodes uploads so JPEG / WebP also work.
-    /// This library does NOT run edge / pose / depth estimation: the caller
-    /// supplies an already-preprocessed control image ("raw" semantics).
+    /// <c>data:image/png;base64,...</c> URL) carrying the control guide. The
+    /// browser uploads an ordinary photo and asks <c>POST /api/preprocess</c>
+    /// to build this guide (canny / scribble / depth / pose / gray), or submits
+    /// a ready-made Z-Image-format guide with <c>control_type=raw</c>.
+    /// The core library keeps the C ABI's raw-raster contract: it consumes the
+    /// planar RGB bytes exactly as supplied and never runs an estimator itself.
     /// </summary>
     public string? ControlImage { get; set; }
 
@@ -84,6 +86,36 @@ public sealed class GenerateRequest
 
     /// <summary>Control context scale. 0 uses the engine default 0.65, else 0.05..2.0.</summary>
     public float? ControlScale { get; set; }
+}
+
+/// <summary>
+/// Body of <c>POST /api/preprocess</c>. <c>image</c> is an ordinary browser
+/// upload re-encoded as an 8-bit PNG; the WebUI turns it into a ControlNet
+/// guide map and returns a replacement <c>control_image</c> data URL.
+/// </summary>
+public sealed class PreprocessRequest
+{
+    /// <summary>Base64 PNG, optionally a <c>data:image/png;base64,...</c> URL.</summary>
+    public string? Image { get; set; }
+
+    /// <summary>
+    /// <c>auto</c> (derive from <c>control_type</c>), <c>raw</c>, <c>gray</c>,
+    /// <c>canny</c>, <c>scribble</c>, <c>depth</c> or <c>pose</c>. WanGP
+    /// letters (V/C/E/S/D/P, with the V suffix) are accepted too.
+    /// </summary>
+    public string? Mode { get; set; }
+
+    /// <summary>Used to resolve <c>mode=auto</c>; also reported back as the recommended control type.</summary>
+    public string? ControlType { get; set; }
+
+    /// <summary>Relative Canny low threshold (0..1, default 0.15).</summary>
+    public float? LowThreshold { get; set; }
+
+    /// <summary>Relative Canny high threshold (0..1, default 0.35).</summary>
+    public float? HighThreshold { get; set; }
+
+    /// <summary>Downscale the guide to this longest side (64..4096, default 1024).</summary>
+    public int? MaxSide { get; set; }
 }
 
 /// <summary>Batch delete / restore body.</summary>

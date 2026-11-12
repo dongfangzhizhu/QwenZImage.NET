@@ -5,6 +5,7 @@ using System.Threading.Channels;
 using Microsoft.AspNetCore.Http.Features;
 using QwenZImage.NET;
 using QwenZImage.NET.WebUI;
+using QwenZImage.NET.WebUI.Preprocessing;
 
 // `dotnet run` uses the project directory (where wwwroot lives); a published
 // deployment may be launched from any working directory, so fall back to the
@@ -135,9 +136,85 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         supports_controlnet = controlnet,
         supports_advanced_editing = advancedEditing,
         supports_inpaint = inpaint,
+        preprocessing = rt.Preprocessor.Describe(),
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
     });
+});
+
+// ------------------------------------------------------- guide preprocessing
+
+// The native C ABI consumes an already-formatted planar RGB control raster
+// ("raw" semantics). Estimating that raster is an application-layer concern:
+// the WebUI owns it, which keeps the NuGet package dependency-free while
+// giving the browser the same pose / canny / depth / scribble guides WanGP
+// offers. ONNX sessions are created lazily, and a single gate serialises
+// inference so a learned estimator is never entered concurrently.
+SemaphoreSlim preprocessGate = new(1, 1);
+
+app.MapGet("/api/preprocess", (WebUiRuntime rt) =>
+    Json(new
+    {
+        available = true,
+        modes = ControlImagePreprocessor.Modes,
+        learned = rt.Preprocessor.Assets.Describe()
+    }));
+
+app.MapPost("/api/preprocess", async (HttpContext context, WebUiRuntime rt) =>
+{
+    IHttpMaxRequestBodySizeFeature? maxBody = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+    if (maxBody is { IsReadOnly: false }) maxBody.MaxRequestBodySize = 64L << 20;
+
+    PreprocessRequest? body;
+    try
+    {
+        body = await context.Request.ReadFromJsonAsync<PreprocessRequest>(
+            WebUiJson.Options, context.RequestAborted);
+    }
+    catch (BadHttpRequestException)
+    {
+        return Json(new ErrorResponse("request body too large"),
+                    StatusCodes.Status413PayloadTooLarge);
+    }
+    catch (JsonException ex)
+    {
+        return BadRequest("invalid JSON body: " + ex.Message);
+    }
+    if (body is null) return BadRequest("request body must be a JSON object");
+    if (!ControlImagePreprocessor.TryParse(body.Mode, out ControlPreprocessMode mode))
+        return BadRequest($"unknown preprocessing mode '{body.Mode}'. " +
+                          $"Use one of: {string.Join(", ", ControlImagePreprocessor.Modes)}.");
+
+    bool acquired = false;
+    try
+    {
+        await preprocessGate.WaitAsync(context.RequestAborted);
+        acquired = true;
+        // CPU/ONNX work is synchronous; keep the ASP.NET thread pool free.
+        ControlPreprocessResult result = await Task.Run(() => rt.Preprocessor.Process(
+            body.Image!, mode, body.ControlType,
+            body.LowThreshold ?? 0.15f, body.HighThreshold ?? 0.35f,
+            body.MaxSide ?? 1024), context.RequestAborted);
+        return Json(result);
+    }
+    catch (ArgumentException ex)
+    {
+        return BadRequest(ex.Message);
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+    {
+        throw;
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "Control image preprocessing failed");
+        return Json(new ErrorResponse("preprocessing failed", ex.Message),
+                    StatusCodes.Status500InternalServerError);
+    }
+    finally
+    {
+        if (acquired) preprocessGate.Release();
+    }
 });
 
 // ----------------------------------------------------------------- presets
@@ -428,6 +505,13 @@ app.Lifetime.ApplicationStarted.Register(() =>
                               runtime.Config.ConfigPath ?? "(none - using defaults)");
     app.Logger.LogInformation("Model pack: {ModelDirectory}", runtime.Config.ModelDirectory);
     app.Logger.LogInformation("Transport: in-process P/Invoke into QwenZImageNative");
+    app.Logger.LogInformation(
+        "Control guide preprocessing: {Modes} (learned pose={Pose}, depth={Depth}, contour={Contour}; asset dir {Assets})",
+        string.Join("/", ControlImagePreprocessor.Modes),
+        runtime.Preprocessor.Assets.PoseAvailable,
+        runtime.Preprocessor.Assets.DepthAvailable,
+        runtime.Preprocessor.Assets.ContourAvailable,
+        runtime.Preprocessor.Assets.Root ?? "(none - QZI_PREPROCESS_DIR)");
     try
     {
         if (runtime.Engine?.GetHealth().IsReferenceBackend == true)

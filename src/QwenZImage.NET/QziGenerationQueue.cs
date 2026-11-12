@@ -215,15 +215,47 @@ public sealed class QziGenerationQueue : IDisposable
         }
     }
 
+    /// <summary>
+    /// Best-effort notification. This runs on the native generation thread for
+    /// progress ticks, so no subscriber exception may escape into the native
+    /// frame (that is a fatal CLR failure, not a normal job error). Failures
+    /// are deliberately swallowed: job state itself is still updated by the
+    /// dispatcher and the terminal transition is published again in
+    /// <c>finally</c>.
+    /// </summary>
     private void Publish(QziJob job)
     {
-        JobChanged?.Invoke(this, job);
+        try
+        {
+            JobChanged?.Invoke(this, job);
+        }
+        catch (Exception)
+        {
+            // A broken observer must never abort a GPU generation.
+        }
         foreach (Channel<QziJob> channel in _subscribers.Values)
-            channel.Writer.TryWrite(job);
+        {
+            try
+            {
+                channel.Writer.TryWrite(job);
+            }
+            catch (Exception)
+            {
+                // Same reasoning: a completed / faulted subscriber channel is
+                // removed by DrainAsync's finally block on its own thread.
+            }
+        }
     }
 
     private sealed class SynchronousProgress<T>(Action<T> action) : IProgress<T>
     {
-        public void Report(T value) => action(value);
+        public void Report(T value)
+        {
+            // IProgress<T>.Report is invoked synchronously from the native
+            // callback. Contain any residual failure here as a last line of
+            // defence in addition to Publish's own guards.
+            try { action(value); }
+            catch (Exception) { }
+        }
     }
 }

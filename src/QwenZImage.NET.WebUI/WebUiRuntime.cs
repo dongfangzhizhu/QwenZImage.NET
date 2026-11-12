@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using QwenZImage.NET;
+using QwenZImage.NET.WebUI.Preprocessing;
 
 namespace QwenZImage.NET.WebUI;
 
@@ -8,6 +9,12 @@ public sealed class WebUiConfig
 {
     public string Urls { get; init; } = "http://127.0.0.1:7860";
     public string OutputDirectory { get; init; } = "";
+
+    /// <summary>
+    /// Directory the server was launched from. Used to walk upwards when
+    /// looking for <c>preprocess_dir</c> in QwenZImage.config.json.
+    /// </summary>
+    public string LaunchDirectory { get; init; } = "";
 
     /// <summary>
     /// Fully resolved options handed to <see cref="QziClient"/>. Model pack
@@ -110,6 +117,7 @@ public sealed class WebUiConfig
             Urls = string.IsNullOrWhiteSpace(urls) ? "http://127.0.0.1:7860" : urls,
             OutputDirectory = string.IsNullOrWhiteSpace(output)
                 ? Path.Combine(contentRoot, "outputs") : output,
+            LaunchDirectory = Path.GetFullPath(contentRoot),
             ClientOptions = options,
             NativeLibrarySource = nativeSource,
             RequireRealBackend = requireReal
@@ -164,6 +172,8 @@ public sealed class WebUiRuntime : IDisposable
         Config = config;
         StartedAt = DateTimeOffset.UtcNow;
         Outputs = new OutputStore(config.OutputDirectory);
+        Preprocessor = new ControlImagePreprocessor(
+            PreprocessAssets.Discover(config.ConfigPath, config.LaunchDirectory));
 
         try
         {
@@ -200,6 +210,14 @@ public sealed class WebUiRuntime : IDisposable
     public OutputStore Outputs { get; }
     public WebUiEngine? Engine { get; }
     public QziGenerationQueue? Queue { get; }
+
+    /// <summary>
+    /// Application-layer ControlNet guide preprocessing. Unlike the native
+    /// engine this is always available, even when model weights or a CUDA
+    /// build are missing, so uploads can still be prepared and previewed.
+    /// </summary>
+    public ControlImagePreprocessor Preprocessor { get; }
+
     public string? InitError { get; }
     public DateTimeOffset StartedAt { get; }
 
@@ -218,6 +236,7 @@ public sealed class WebUiRuntime : IDisposable
     {
         Queue?.Dispose();
         Engine?.Dispose();
+        Preprocessor.Dispose();
         GC.SuppressFinalize(this);
     }
 }

@@ -205,6 +205,8 @@ unchanged.
 | `QZI_WEBUI_NATIVE` | `auto` | `auto` (detect a local `-cuda` build), `reference` (force the bundled stub), or an explicit library path |
 | `QZI_REQUIRE_REAL_BACKEND` | unset | `1` makes the WebUI refuse generation jobs (HTTP 503, `ok=false`) when the reference backend is loaded; set by the one-click launcher scripts |
 | `QZI_DEVICE_ID` | `-1` | CUDA device selector passed to the native backend |
+| `QZI_PREPROCESS_DIR` | from config | Root of optional WanGP ONNX guide-preprocessor assets (`pose/*.onnx`, `depth*.onnx`, `netG_A_latest.onnx`). Overrides `preprocess_dir`; the native engine ignores it |
+| `preprocess_dir` (config key) | unset | Same value stored in `QwenZImage.config.json` (top level or the `windows` / `linux` / `osx` section). Recognised by the strict config parser; read by the WebUI only |
 | `device_id` / `thread_count` (config keys) | `-1` / `0` | Auto device / thread count; only in the config file, no env override |
 
 `QziClient` resolves config → `QZI_*` overrides → explicit `QziClientOptions`
@@ -227,7 +229,9 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet`, `supports_advanced_editing`, `supports_inpaint` |
+| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet`, `supports_advanced_editing`, `supports_inpaint` and the `preprocessing` capability block |
+| `GET` | `/api/preprocess` | `{"available":true,"modes":[...],"learned":{...}}` — available guide operators and discovered WanGP ONNX assets |
+| `POST` | `/api/preprocess` | Turn an uploaded photo into a ControlNet guide PNG (see [Guide preprocessing](#guide-preprocessing-getpost-apipreprocess)) |
 | `GET` | `/api/presets` | `{"presets":[...]}` — all `QziPresets` with a `model` discriminator |
 | `POST` | `/api/jobs` | Validate + enqueue; `202` with the job snapshot |
 | `GET` | `/api/jobs` | `{"jobs":[...]}` newest first; optional `?client=` filter |
@@ -242,6 +246,77 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 | `POST` | `/api/outputs/restore` | Batch restore from `.trash`; never overwrites a newer file |
 | `GET` | `/api/events` | Server-sent events: `job`, `progress`, `error`, 15 s heartbeat |
 | `GET` | `/` | Static single-page console |
+
+### Guide preprocessing (`GET/POST /api/preprocess`)
+
+The **core NuGet library** keeps the C ABI's raw-raster contract: it consumes
+the planar RGB `control_image` exactly as supplied and never runs an edge /
+pose / depth estimator. Building that raster is an application-layer concern,
+so the WebUI owns it. This keeps `QwenZImage.NET` dependency-free while the
+WebUI is free to use ONNX Runtime and WanGP's own weights.
+
+Upload an ordinary photograph (PNG / JPEG / WebP — the browser re-encodes it
+as an 8-bit PNG) and the WebUI produces the guide that is posted to
+`/api/jobs`. Nothing is "used as-is" unless `mode: "raw"` is chosen.
+
+```json
+// POST /api/preprocess
+{
+  "image": "data:image/png;base64,iVBORw0KGgo...",
+  "mode": "canny",
+  "control_type": "auto",
+  "low_threshold": 0.15,
+  "high_threshold": 0.35,
+  "max_side": 1024
+}
+
+// 200 OK
+{
+  "control_image": "data:image/png;base64,iVBORw0KGgo...",
+  "mode": "canny",
+  "control_type": "canny",
+  "provider": "managed-canny",
+  "learned": false,
+  "width": 1024,
+  "height": 683
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `image` | **Required.** Base64 8-bit PNG or a `data:image/png;base64,...` URL, at most `4096` per side and `2048×2048` pixels total (the native raster limits) |
+| `mode` | `auto` (derive from `control_type`), `raw`, `gray`, `canny`, `scribble`, `depth`, `pose`. WanGP guide letters are accepted too: `V`, `C`, `E` / `EV`, `S`, `D` / `DV`, `P` / `PV`; default `auto`. Unknown values → `400` |
+| `control_type` | Used only to resolve `mode=auto`. The response always carries the recommended canonical `control_type` — post that alongside `control_image` so the Union weights are not told "pose" while receiving an edge map |
+| `low_threshold` / `high_threshold` | Relative Canny hysteresis thresholds, `0 < low < high ≤ 1`, defaults `0.15` / `0.35` |
+| `max_side` | Guide downscale limit, `64..4096`, default `1024`. Also capped by the native `2048×2048` pixel budget |
+
+| Mode | WanGP | Provider when no ONNX assets | With WanGP ONNX assets |
+| --- | --- | --- | --- |
+| `raw` | `V` "Use Z-Image Raw Format" | `raw` | — |
+| `gray` | `C` | `managed-gray` | — |
+| `canny` | `E` / `EV` | `managed-canny` (Sobel + NMS + hysteresis) | `onnx-wan2gp-contour` |
+| `scribble` | `S` | `managed-scribble` (Canny + Zhang-Suen thinning + invert) | `onnx-wan2gp-scribble` |
+| `depth` | `D` / `DV` | `managed-depth-proxy` + a `warning` | `onnx-depth-anything-v2` |
+| `pose` | `P` / `PV` | `400` with configuration guidance | `onnx-wan2gp-dwpose` (YOLOX-L + DWPose, OpenPose 18-point skeleton) |
+
+The four dependency-free operators need no package and work even on a host
+with no GPU or model weights. Learned estimators are discovered lazily from
+`QZI_PREPROCESS_DIR` / `preprocess_dir`:
+
+```text
+<root>/pose/yolox_l.onnx            # person detector
+<root>/pose/dw-ll_ucoco_384.onnx    # DWPose SimCC whole-body keypoints
+<root>/**/*depth*.onnx              # Depth Anything V2 ONNX export
+<root>/**/netG_A_latest.onnx        # contour / scribble ONNX export
+```
+
+WanGP ships `.pth` weights for depth and contour, so export them to ONNX
+first; the pose models are already ONNX in a standard WanGP `ckpts` tree.
+A missing or failing learned estimator falls back to the managed operator and
+returns a `warning`; `pose` is the exception because a classic edge map is not
+a pose guide. `GET /api/preprocess` and the `preprocessing` block of
+`/api/health` report exactly which assets were found. ONNX sessions are
+created on first use and serialised by a single in-process gate.
 
 ### Request envelope (`POST /api/jobs`)
 
@@ -387,7 +462,7 @@ sets in one envelope is rejected explicitly.
 
 | Field | Rule |
 | --- | --- |
-| `control_image` | **Required for ControlNet mode.** Base64 PNG, optionally a `data:image/png;base64,...` URL. The browser canvas re-encodes uploads, so JPEG / WebP files also work. Decoded to planar RGB8; each side `1..4096`, total pixels `≤ 2048×2048`. Must be **already preprocessed** — the library does not run pose / edge / depth estimation |
+| `control_image` | **Required for ControlNet mode.** Base64 PNG, optionally a `data:image/png;base64,...` URL. Decoded to planar RGB8; each side `1..4096`, total pixels `≤ 2048×2048`. The core library consumes this raster exactly as supplied ("raw" semantics), but the browser builds it from an ordinary photo (PNG / JPEG / WebP) through `POST /api/preprocess`, so an already-formatted guide is no longer required. Choose preprocessing `mode: "raw"` to pass a ready-made guide through unchanged |
 | `control_type` | Optional, `auto` / `pose` / `canny` / `depth` / `scribble` / `raw` (case-insensitive), default `auto`. Descriptive metadata only; it does not change inference. WanGP's weights support all four control types, and `guide_preprocessing = "V"` means the raster is consumed as-is |
 | `control_scale` | Optional `0.05..2.0`, `0` / omitted → engine default `0.65` (WanGP Union 2.1 `control_net_weight_alt`). Must be finite |
 
@@ -494,15 +569,23 @@ do not close idle connections. `EventSource` reconnects automatically.
   `supports_advanced_editing: false` the panel shows an explicit
   "Unavailable" warning while ordinary editing keeps working. Gallery / job
   rows add `advanced_edit` / `outpaint` / `rgba` badges.
-- **ControlNet mode** (`zimage-control`): upload an already-preprocessed
-  control image (PNG / JPEG / WebP, re-encoded by the canvas), preview it,
-  choose a descriptive `control type` (`auto` / `pose` / `canny` / `depth` /
-  `scribble` / `raw`) and a live `Control scale` slider (`0..2`, default
-  0.65). The upload note states explicitly that no edge / pose / depth
-  estimator runs, and that real Union 2.1 weights must be configured via
-  `zimage_control_dir`. Edit mode and ControlNet mode are mutually exclusive;
+- **ControlNet mode** (`zimage-control`): upload an **ordinary photo**
+  (PNG / JPEG / WebP, re-encoded by the canvas as 8-bit PNG). The
+  **Guide preprocessing** selector turns it into `canny` (default),
+  `scribble`, `depth`, `pose`, `gray` or `raw`, with a `Guide max side`
+  slider and a "Re-run preprocessing" button; `auto` derives the operator from
+  the selected `control type`. The preview and the value posted to
+  `/api/jobs` are always the **generated guide**, never the raw upload. The
+  server reports the provider (`managed-*` or `onnx-*`) and any fallback
+  warning next to the preview. The core NuGet library stays dependency-free
+  and keeps the C ABI's raw-raster contract; only the WebUI runs estimators.
+  Also available: the descriptive `control type` (`auto` / `pose` / `canny` /
+  `depth` / `scribble` / `raw`) and a live `Control scale` slider (`0..2`,
+  default 0.65). Real Union 2.1 weights must be configured via
+  `zimage_control_dir`; inpaint mode defaults to `raw` so the photo itself is
+  the mask backdrop. Edit mode and ControlNet mode are mutually exclusive;
   the option is disabled when `/api/health` reports
-  `supports_controlnet: false`.
+  `supports_controlnet: false`. See [Guide preprocessing](#guide-preprocessing-getpost-apipreprocess).
 - **Inpaint mode** (`zimage-inpaint`): a strict superset of ControlNet. It
   reuses the same control-image upload / type / scale controls **and** the
   shared brush mask canvas from edit mode (the control image becomes the mask

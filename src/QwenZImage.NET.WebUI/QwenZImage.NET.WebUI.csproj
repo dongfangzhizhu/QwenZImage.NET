@@ -5,10 +5,24 @@
     <IsPackable>false</IsPackable>
     <RootNamespace>QwenZImage.NET.WebUI</RootNamespace>
     <AssemblyName>QwenZImage.NET.WebUI</AssemblyName>
+    <!-- .NET 9+ marks executables as CET (Control-flow Enforcement Technology,
+         shadow stack / indirect branch tracking) compatible by default. This
+         host calls a third-party CUDA DLL that invokes managed function-pointer
+         callbacks (progress / cancellation) from native frames. A CET-enabled
+         host plus those reverse P/Invoke transitions is a known source of the
+         fatal CLR error 0x80131506 (System.ExecutionEngineException) when a
+         debugger or func-eval is attached. Opt the host out; the managed side
+         is still hardened by CallbackScope, which never lets an exception
+         escape an [UnmanagedCallersOnly] entry point. -->
+    <CETCompat>false</CETCompat>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../QwenZImage.NET/QwenZImage.NET.csproj" />
+    <!-- Optional learned ControlNet guide estimators (DWPose / Depth Anything
+         V2 / contour). Loaded lazily and only when the matching WanGP ONNX
+         assets are configured; the pure managed operators need no package. -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.31.1" />
     <InternalsVisibleTo Include="QwenZImage.NET.WebUI.Tests" />
   </ItemGroup>
 

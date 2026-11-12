@@ -473,7 +473,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         QziQwen21Request request = BuildQwen21Request(options, prompt, negative,
                                                        tier, lora);
 
-        return Invoke(&request, null, null, null, null, null, callbacks.Callbacks,
+        return Invoke(&request, null, null, null, null, null, callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -522,7 +522,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so both pins stay alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, &request, null, null, null, callbacks.Callbacks,
+            return Invoke(null, null, &request, null, null, null, callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -588,7 +588,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so both pins stay alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, null, null, &request, null, callbacks.Callbacks,
+            return Invoke(null, null, null, null, &request, null, callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -639,7 +639,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             Flags = 0
         };
 
-        return Invoke(null, &request, null, null, null, null, callbacks.Callbacks,
+        return Invoke(null, &request, null, null, null, null, callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -690,7 +690,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so the pin stays alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, null, &request, null, null, callbacks.Callbacks,
+            return Invoke(null, null, null, &request, null, null, callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -756,7 +756,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
                 // carry options.Flags and the validator keeps both at zero.
                 Flags = 0
             };
-            return Invoke(null, null, null, null, null, &request, callbacks.Callbacks,
+            return Invoke(null, null, null, null, null, &request, callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -764,10 +764,13 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     private QziImage Invoke(QziQwen21Request* qwen, QziZImageRequest* zimage,
                             QziQwen21EditRequest* edit, QziZImageControlRequest* control,
                             QziQwen21EditExRequest* editEx, QziZImageInpaintRequest* inpaint,
-                            QziCallbacks callbacks,
+                            CallbackScope scope,
                             CancellationToken cancellationToken, out TimeSpan elapsed)
     {
-        // Exactly one of the six request pointers is non-null.
+        // Exactly one of the six request pointers is non-null. The callbacks
+        // struct is a local copy whose address stays valid for the whole
+        // synchronous call; the owning scope keeps the live-token entry alive.
+        QziCallbacks callbacks = scope.Callbacks;
         QziImage image = default;
         IntPtr engine = _handle.DangerousGetHandle();
         byte* error = stackalloc byte[NativeMethods.ErrorCapacity];
@@ -799,6 +802,25 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
                                                       error, NativeMethods.ErrorCapacity);
 
             elapsed = Stopwatch.GetElapsedTime(start);
+
+            // A progress / cancellation callback failed while native frames
+            // were on the stack. CallbackScope contained it at the unmanaged
+            // boundary and asked the engine to stop; rethrow here, where a
+            // normal managed catch (or the WebUI job queue) can report it.
+            // Letting such an exception unwind through CUDA / ggml frames is
+            // what produced the fatal System.ExecutionEngineException
+            // (HResult 0x80131506) at this call site.
+            if (scope.TakeFault() is { } fault)
+            {
+                if (image.Data is not null) NativeMethods.ImageRelease(engine, &image);
+                throw new InvalidOperationException(
+                    "A generation progress callback threw an exception while the native " +
+                    "engine was running. The failure was contained at the unmanaged " +
+                    "callback boundary and the generation was stopped. Inspect the inner " +
+                    "exception (typically an IProgress<T>.Report handler or an SSE " +
+                    "subscriber) for the real cause.", fault);
+            }
+
             if (status != 0)
             {
                 if (image.Data is not null) NativeMethods.ImageRelease(engine, &image);

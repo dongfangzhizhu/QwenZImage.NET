@@ -236,10 +236,14 @@ public static class RequestMapper
     /// <summary>
     /// Decodes the browser's control-image PNG data URL into a planar RGB
     /// raster. Copying the common fields from <see cref="MapZImage"/> keeps t2i
-    /// and ControlNet validation from drifting apart. The control image must
-    /// already be preprocessed upstream: this library never estimates edges,
-    /// poses or depth. The library validator still checks the type whitelist,
-    /// scale bounds, flags and raster dimensions.
+    /// and ControlNet validation from drifting apart. By the time a job reaches
+    /// this mapper the guide has already been built by
+    /// <c>POST /api/preprocess</c> (canny / scribble / depth / pose / gray), or
+    /// the caller deliberately supplied a ready-made guide with
+    /// <c>control_type=raw</c>. The core NuGet library keeps the C ABI's raw
+    /// raster contract and never estimates edges, poses or depth itself. The
+    /// library validator still checks the type whitelist, scale bounds, flags
+    /// and raster dimensions.
     /// </summary>
     private static ZImageControlOptions MapZImageControl(GenerateRequest request)
     {

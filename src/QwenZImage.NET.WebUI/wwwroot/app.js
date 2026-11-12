@@ -19,10 +19,21 @@ const state = {
   editingAvailable: true,
   // Third additive ABI v1 increment: outpainting / LanPaint / RGBA.
   advancedEditingAvailable: true,
-  // Z-Image Turbo Fun ControlNet Union state. The control image is a PNG data
-  // URL re-encoded by a canvas; it must already be preprocessed upstream.
+  // Z-Image Turbo Fun ControlNet Union state. `controlSourcePng` is the raw
+  // browser upload; `controlPng` is the guide produced by /api/preprocess and
+  // is the only raster ever posted to /api/jobs. The native C ABI keeps its
+  // raw-raster contract — estimation is an application-layer WebUI concern.
+  controlSourcePng: null,
+  controlSourceWidth: 0,
+  controlSourceHeight: 0,
   controlPng: null,
+  controlWidth: 0,
+  controlHeight: 0,
+  controlMeta: null,
   controlnetAvailable: true,
+  preprocessCapabilities: null,
+  preprocessTouched: false,
+  preprocessing: false,
   // Fourth additive ABI v1 increment: Z-Image Union 2.x inpaint. It reuses
   // the control image above plus the shared brush mask canvas (white =
   // repaint, black = keep); no second image component is introduced.
@@ -86,6 +97,10 @@ async function refreshHealth() {
         `served: ${h.engine?.served ?? 0}`,
       ].join("\n");
       $("backend-banner").hidden = !reference;
+      // /api/preprocess advertises its operators and which WanGP ONNX
+      // estimators are actually installed. It works without a native engine.
+      state.preprocessCapabilities = h.preprocessing || null;
+      syncPreprocessAvailability();
       // Editing is additive in ABI v1: an older native library simply has no
       // qzi_generate_qwen21_edit export. Do not offer a mode that would fail.
       state.editingAvailable = h.supports_image_editing === true;
@@ -221,6 +236,8 @@ function syncModelUI() {
   syncMaskControls();
   syncControlScaleHint();
   syncAdvancedControls();
+  syncPreprocessDefaults();
+  syncPreprocessSideHint();
 }
 
 function switchModel() {
@@ -384,9 +401,118 @@ function maskPng() {
 
 // ------------------------------------------ Z-Image ControlNet Union
 
-/* The control image must already be preprocessed. Re-encode every upload
- * through a canvas to 8-bit PNG (the only format the native decoder accepts)
- * and downscale to the QziRasterImage limits. No server-side estimator. */
+/* The native C ABI consumes a pre-formatted planar RGB control raster. The
+ * WebUI — not the NuGet library — builds that raster: an ordinary photo is
+ * re-encoded to 8-bit PNG by a canvas, POSTed to /api/preprocess, and the
+ * returned guide is what /api/jobs receives. WanGP's pose / canny / depth /
+ * scribble guide choices are therefore available without adding any imaging
+ * dependency to the core package. */
+
+function syncPreprocessDefaults() {
+  if (state.preprocessTouched) return;
+  const select = $("control-preprocess");
+  if (!select) return;
+  // Inpaint needs the photograph itself as its canvas (WanGP "V" / raw).
+  // Standalone ControlNet defaults to a canny guide so an upload is never
+  // silently consumed "as-is" any more.
+  select.value = isInpaintMode() ? "raw" : "canny";
+}
+
+function syncPreprocessAvailability() {
+  const learned = state.preprocessCapabilities?.learned;
+  const pose = document.querySelector('#control-preprocess option[value="pose"]');
+  if (pose) pose.title = learned?.learned_pose === true
+    ? "WanGP YOLOX-L + DWPose ONNX assets found"
+    : "Requires QZI_PREPROCESS_DIR with pose/yolox_l.onnx and pose/dw-ll_ucoco_384.onnx";
+  const depth = document.querySelector('#control-preprocess option[value="depth"]');
+  if (depth) depth.title = learned?.learned_depth === true
+    ? "Depth Anything V2 ONNX model found"
+    : "Uses the built-in deterministic relative-depth proxy (no ONNX model configured)";
+}
+
+function syncPreprocessSideHint() {
+  $("control-preprocess-side-hint").textContent = `${$("control-preprocess-side").value} px`;
+}
+
+function setControlInfo(text) {
+  const el = $("control-preprocess-info");
+  if (!el) return;
+  el.textContent = text || "";
+  el.hidden = !text;
+}
+
+function renderControlPreview() {
+  $("control-preview").src = state.controlPng;
+  $("control-empty").hidden = true;
+  $("control-editor").hidden = false;
+  // Inpaint reuses the qwen21-edit brush mask canvas verbatim: the guide is
+  // its backdrop and sets the mask resolution. Only reset the painted mask
+  // when that resolution actually changed (e.g. re-running with a new
+  // max-side), so changing canny -> scribble does not erase brush work.
+  if (isInpaintMode()) {
+    const mask = $("mask-canvas");
+    if (mask.width !== state.controlWidth || mask.height !== state.controlHeight) {
+      mask.width = state.controlWidth;
+      mask.height = state.controlHeight;
+      clearMask();
+    }
+    $("reference-preview").src = state.controlPng;
+    $("mask-editor").hidden = false;
+  }
+}
+
+async function runPreprocess() {
+  if (!state.controlSourcePng || state.preprocessing) return;
+  const mode = $("control-preprocess").value;
+  const button = $("control-reprocess");
+  state.preprocessing = true;
+  if (button) button.disabled = true;
+  setControlInfo(`Building ${mode} control guide…`);
+  try {
+    const result = await api("/api/preprocess", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image: state.controlSourcePng,
+        mode,
+        control_type: $("control-type").value,
+        max_side: Number($("control-preprocess-side").value),
+      }),
+    });
+    state.controlPng = result.control_image;
+    state.controlWidth = result.width;
+    state.controlHeight = result.height;
+    state.controlMeta = result;
+    // Keep the descriptive control_type in step with the guide actually
+    // produced (posing a canny map as "auto" would mislead the Union
+    // weights). "raw" has no dedicated canonical type, so an explicit
+    // "auto" selection is left alone — that is the inpaint default.
+    if (result.control_type && !(result.control_type === "raw" && $("control-type").value === "auto"))
+      $("control-type").value = result.control_type;
+    renderControlPreview();
+    const provider = result.learned ? `${result.provider} (ONNX)` : result.provider;
+    setControlInfo(`Guide: ${result.mode} · ${result.width}×${result.height} · ${provider}` +
+      (result.warning ? ` — ${result.warning}` : ""));
+    showToast(`Control guide ready (${result.width}×${result.height}) · ${result.mode} via ${provider}.`);
+  } catch (error) {
+    // A failed estimator must never leave the form unusable. Fall back to
+    // the raw upload; the API error for `pose` already names the missing
+    // asset directory, so the operator knows exactly what to configure.
+    state.controlPng = state.controlSourcePng;
+    state.controlWidth = state.controlSourceWidth;
+    state.controlHeight = state.controlSourceHeight;
+    state.controlMeta = null;
+    $("control-type").value = "raw";
+    renderControlPreview();
+    const message = String(error.message || error);
+    setControlInfo(`Preprocessing failed: ${message}. Using the uploaded image as a raw guide.`);
+    showToast(message);
+  } finally {
+    state.preprocessing = false;
+    if (button) button.disabled = false;
+  }
+}
+
 async function loadControlImage(file) {
   if (!file) return;
   const url = URL.createObjectURL(file);
@@ -404,22 +530,14 @@ async function loadControlImage(file) {
     canvas.width = width;
     canvas.height = height;
     canvas.getContext("2d").drawImage(image, 0, 0, width, height);
-    state.controlPng = canvas.toDataURL("image/png");
-    $("control-preview").src = state.controlPng;
-    $("control-empty").hidden = true;
-    $("control-editor").hidden = false;
-    // Inpaint reuses the qwen21-edit brush mask canvas verbatim: the control
-    // image becomes its backdrop and sets the mask resolution. maskPng()
-    // (canvas -> data URL) and the pointer handlers are shared unchanged.
-    if (isInpaintMode()) {
-      const mask = $("mask-canvas");
-      mask.width = width;
-      mask.height = height;
-      $("reference-preview").src = state.controlPng;
-      clearMask();
-      $("mask-editor").hidden = false;
-    }
-    showToast(`Control image loaded (${width}×${height}). Used as-is (no preprocessing).`);
+    state.controlSourcePng = canvas.toDataURL("image/png");
+    state.controlSourceWidth = width;
+    state.controlSourceHeight = height;
+    state.controlPng = state.controlSourcePng;
+    state.controlWidth = width;
+    state.controlHeight = height;
+    renderControlPreview();
+    await runPreprocess();
   } catch (error) {
     showToast(`Could not read the control image: ${error.message || error}`);
   } finally {
@@ -428,11 +546,18 @@ async function loadControlImage(file) {
 }
 
 function removeControlImage() {
+  state.controlSourcePng = null;
+  state.controlSourceWidth = 0;
+  state.controlSourceHeight = 0;
   state.controlPng = null;
+  state.controlWidth = 0;
+  state.controlHeight = 0;
+  state.controlMeta = null;
   $("control-file").value = "";
   $("control-preview").removeAttribute("src");
   $("control-editor").hidden = true;
   $("control-empty").hidden = false;
+  setControlInfo(null);
   if (isInpaintMode()) {
     clearMask();
     $("reference-preview").removeAttribute("src");
@@ -552,8 +677,12 @@ async function submit() {
     return;
   }
   if (isControlLike() && !state.controlPng) {
-    showToast("Upload a preprocessed control image before queueing a ControlNet / inpaint job.");
+    showToast("Upload a control image before queueing a ControlNet / inpaint job.");
     $("control-file").focus();
+    return;
+  }
+  if (isControlLike() && state.preprocessing) {
+    showToast("Control guide preprocessing is still running — please wait a moment.");
     return;
   }
   if (isInpaintMode() && !maskPng()) {
@@ -811,9 +940,19 @@ function wire() {
     $(id).addEventListener("change", markCustom);
   });
 
-  // Z-Image ControlNet Union: control-image upload, removal and scale slider.
+  // Z-Image ControlNet Union: upload, guide preprocessing, removal and scale.
   $("control-file").addEventListener("change", (event) => loadControlImage(event.target.files?.[0]));
   $("control-remove").addEventListener("click", removeControlImage);
+  $("control-reprocess").addEventListener("click", runPreprocess);
+  $("control-preprocess").addEventListener("change", () => {
+    state.preprocessTouched = true;
+    if (state.controlSourcePng) runPreprocess();
+  });
+  $("control-preprocess-side").addEventListener("input", syncPreprocessSideHint);
+  $("control-preprocess-side").addEventListener("change", () => {
+    syncPreprocessSideHint();
+    if (state.controlSourcePng) runPreprocess();
+  });
   $("control-scale").addEventListener("input", syncControlScaleHint);
   $("seed-dice").addEventListener("click", () => {
     $("seed").value = String(crypto.getRandomValues(new Uint32Array(1))[0]);
