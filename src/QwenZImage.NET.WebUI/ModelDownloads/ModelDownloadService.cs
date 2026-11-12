@@ -64,6 +64,12 @@ public sealed class ModelDownloadService : IDisposable
     // put that abandoned job back into the queue when its cancellation lands.
     private long _generation;
 
+    // Targets whose partial files were deleted by Reset() while the worker
+    // still owned an open FileStream. On Windows File.Delete() cannot remove
+    // an open file (and the worker may recreate it), so the worker performs a
+    // second deletion in its finally block, after the stream is disposed.
+    private readonly HashSet<string> _discardParts = new(StringComparer.Ordinal);
+
     public ModelDownloadService(HttpClient? client = null)
     {
         if (client is not null)
@@ -156,8 +162,9 @@ public sealed class ModelDownloadService : IDisposable
         lock (_sync)
         {
             _generation++;
-            if (_current is not null && (fileId is null || _current.FileId == fileId))
-                _currentCts?.Cancel();
+            bool abandonCurrent = _current is not null &&
+                                  (fileId is null || _current.FileId == fileId);
+            if (abandonCurrent) _currentCts?.Cancel();
             if (fileId is null) _pending.Clear();
             else _pending.RemoveAll(p => p.FileId == fileId);
 
@@ -166,8 +173,14 @@ public sealed class ModelDownloadService : IDisposable
                 : _states.ContainsKey(fileId) ? [fileId] : [];
             foreach (string id in ids)
             {
-                DeletePart(_states[id].TargetPath);
+                string? target = _states[id].TargetPath;
+                DeletePart(target);
                 _states.Remove(id);
+                // The active transfer may still hold (or be about to open) its
+                // FileStream, so schedule a second deletion after it unwinds.
+                if (abandonCurrent && !string.IsNullOrWhiteSpace(target) &&
+                    _current is not null && _current.FileId == id)
+                    _discardParts.Add(target);
             }
             return ids.Length;
         }
@@ -333,11 +346,17 @@ public sealed class ModelDownloadService : IDisposable
             finally
             {
                 cts.Dispose();
+                bool discard;
                 lock (_sync)
                 {
+                    discard = generation != _generation &&
+                              _discardParts.Remove(job.TargetPath);
                     _current = null;
                     _currentCts = null;
                 }
+                // FileStream is closed by now: this second deletion actually
+                // succeeds on Windows and cannot be undone by a late write.
+                if (discard) DeletePart(job.TargetPath);
             }
         }
     }

@@ -20,21 +20,37 @@ public class ModelDownloadsTests : IDisposable
         $"qzi-models-{Guid.NewGuid():N}");
     private readonly string _configPath;
 
+    // The config writer merges into the section for the *current* OS, so the
+    // fixture must make that section writable on every runner. Hard-coded
+    // "/keep/..." values used to land in the real filesystem on Linux (where
+    // they are root-owned) and made the "already installed" test throw.
+    private static string ActiveSection => OperatingSystem.IsWindows() ? "windows"
+                                         : OperatingSystem.IsLinux() ? "linux" : "osx";
+
+    private static string InactiveSection => ActiveSection == "linux" ? "windows" : "linux";
+
     public ModelDownloadsTests()
     {
         Directory.CreateDirectory(_dir);
         _configPath = Path.Combine(_dir, QziConfig.FileName);
-        File.WriteAllText(_configPath, JsonSerializer.Serialize(new
+        var configRoot = new Dictionary<string, object>(StringComparer.Ordinal)
         {
-            _comment = "keep me",
-            device_id = 7,
-            windows = new Dictionary<string, object>
+            ["_comment"] = "keep me",
+            ["device_id"] = 7,
+            [ActiveSection] = new Dictionary<string, object>
             {
-                ["qwen21_dir"] = Path.Combine(_dir, "qwen21"),
+                ["qwen21_dir"] = Path.Combine(_dir, "models", "qwen21"),
                 ["text_cache_dir"] = "/keep/cache"
             },
-            linux = new Dictionary<string, object> { ["qwen21_dir"] = "/keep/linux" }
-        }, new JsonSerializerOptions { WriteIndented = true }));
+            // Only ever compared as a string: the writer must leave it alone.
+            [InactiveSection] = new Dictionary<string, object>
+            {
+                ["qwen21_dir"] = "/keep/linux",
+                ["text_cache_dir"] = "/keep/other-cache"
+            }
+        };
+        File.WriteAllText(_configPath, JsonSerializer.Serialize(configRoot,
+            new JsonSerializerOptions { WriteIndented = true }));
     }
 
     public void Dispose() => Directory.Delete(_dir, recursive: true);
@@ -258,7 +274,9 @@ public class ModelDownloadsTests : IDisposable
             JsonElement root = doc.RootElement;
             Assert.Equal("keep me", root.GetProperty("_comment").GetString());
             Assert.Equal(7, root.GetProperty("device_id").GetInt32());
-            Assert.Equal("/keep/linux", root.GetProperty("linux").GetProperty("qwen21_dir").GetString());
+            JsonElement untouched = root.GetProperty(InactiveSection);
+            Assert.Equal("/keep/linux", untouched.GetProperty("qwen21_dir").GetString());
+            Assert.Equal("/keep/other-cache", untouched.GetProperty("text_cache_dir").GetString());
             JsonElement section = root.GetProperty(catalog.ConfigPlatform);
             Assert.Equal("/keep/cache", section.GetProperty("text_cache_dir").GetString());
             foreach ((string key, string value) in applied.Keys)
