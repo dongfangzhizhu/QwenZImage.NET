@@ -4,7 +4,9 @@ name: Release to NuGet
 # (or a manual dispatch). NuGet packages are published with Trusted
 # Publishing: NuGet/login@v1 exchanges the GitHub OIDC token for a short-lived
 # NuGet API key, so NO long-lived NUGET_API_KEY secret is stored in this repo.
-# One-time setup on nuget.org + GitHub is documented in PLAN.md section 5.
+# One-time setup: a nuget.org Trusted Publishing policy scoped to this repo
+# and workflow + environment, plus a `NUGET_USER` repository secret holding the
+# policy owner's nuget.org profile name (not an email address).
 # The publish job declares `environment: production` so the GitHub OIDC token
 # carries an `environment: production` claim; the nuget.org Trusted Publishing
 # policy is scoped to that same environment. Changing either side alone makes
@@ -161,7 +163,7 @@ jobs:
         shell: bash
         run: |
           if [ -z "$NUGET_USER" ]; then
-            echo "::error::NUGET_USER secret is missing. Set it to the nuget.org profile name (not an email address) that owns the Trusted Publishing policy. See PLAN.md section 5."
+            echo "::error::NUGET_USER secret is missing. Create a repository secret named exactly NUGET_USER whose value is the nuget.org profile name (not an email address) of the Trusted Publishing policy owner."
             exit 1
           fi
           # If NuGet/login returns 401 "No matching trust policy", compare the
