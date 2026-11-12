@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using QwenZImage.NET;
+using QwenZImage.NET.WebUI.ModelDownloads;
 using QwenZImage.NET.WebUI.Preprocessing;
 
 namespace QwenZImage.NET.WebUI;
@@ -31,6 +32,13 @@ public sealed class WebUiConfig
 
     /// <summary>How the native backend was selected, surfaced by /api/health.</summary>
     public string NativeLibrarySource { get; init; } = "bundled reference runtime";
+
+    /// <summary>
+    /// True when <c>--models</c> / <c>QZI_MODEL_DIR</c> replaced the config
+    /// file's model directories. The config writer warns about this, because
+    /// editing the file alone would then have no effect.
+    /// </summary>
+    public bool ModelOverrideActive { get; init; }
 
     /// <summary>
     /// When true, the app refuses to serve generation jobs with the
@@ -120,6 +128,7 @@ public sealed class WebUiConfig
             LaunchDirectory = Path.GetFullPath(contentRoot),
             ClientOptions = options,
             NativeLibrarySource = nativeSource,
+            ModelOverrideActive = model is not null,
             RequireRealBackend = requireReal
         };
     }
@@ -175,6 +184,13 @@ public sealed class WebUiRuntime : IDisposable
         Preprocessor = new ControlImagePreprocessor(
             PreprocessAssets.Discover(config.ConfigPath, config.LaunchDirectory));
 
+        // Model downloads live entirely in the host layer. The core library /
+        // C ABI keeps loading weights from disk exactly as before; the WebUI
+        // merely fetches WanGP's Hugging Face files into those directories.
+        Downloads = new ModelDownloadService();
+        Models = new ModelCatalog(config, Preprocessor.Assets.Root, Downloads,
+            Environment.GetEnvironmentVariable(ModelManifest.MirrorEnvironmentVariable));
+
         try
         {
             WebUiEngine engine = new(config.ClientOptions);
@@ -218,6 +234,15 @@ public sealed class WebUiRuntime : IDisposable
     /// </summary>
     public ControlImagePreprocessor Preprocessor { get; }
 
+    /// <summary>
+    /// Serial, resumable weight downloader (host layer only). Works even when
+    /// the native engine failed to initialise or no CUDA build is present.
+    /// </summary>
+    public ModelDownloadService Downloads { get; }
+
+    /// <summary>Catalogue bound to the effective config paths.</summary>
+    public ModelCatalog Models { get; }
+
     public string? InitError { get; }
     public DateTimeOffset StartedAt { get; }
 
@@ -236,6 +261,7 @@ public sealed class WebUiRuntime : IDisposable
     {
         Queue?.Dispose();
         Engine?.Dispose();
+        Downloads.Dispose();
         Preprocessor.Dispose();
         GC.SuppressFinalize(this);
     }

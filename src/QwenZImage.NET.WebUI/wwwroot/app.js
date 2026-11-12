@@ -40,6 +40,15 @@ const state = {
   inpaintAvailable: true,
   drawing: false,
   lastPoint: null,
+  // Model weight downloads: /api/models is a snapshot polled while transfers
+  // are active. Per-file variant overrides are kept out of the rebuilt DOM so
+  // a progress refresh never resets an operator's quantisation choice.
+  models: null,
+  globalVariant: "int8",
+  modelVariants: {},
+  modelGroupsOpen: {},
+  manualGuide: null,
+  configPreview: null,
 };
 
 // modelFamily already covers the new mode: every non-qwen21 model (zimage,
@@ -909,6 +918,302 @@ async function unloadEngine() {
   } catch (error) { showToast(String(error.message || error)); }
 }
 
+// ------------------------------------------------------- model downloads
+
+/* The weight catalogue is served by /api/models. It is entirely read-only
+ * until the operator presses a button: the browser sends file ids / variant
+ * ids / control actions only, never URLs or destination paths. Progress is
+ * polled instead of streamed so a refresh, a proxy or a reconnect can never
+ * lose a transfer (the server keeps .qzi-part files across restarts). */
+
+function formatBytes(value) {
+  const n = Number(value) || 0;
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+function formatSpeed(bps) {
+  const n = Number(bps) || 0;
+  return n > 0 ? `${(n / 1024 ** 2).toFixed(1)} MB/s` : "—";
+}
+
+function copyText(text, label) {
+  if (!text) { showToast(`Nothing to copy for ${label}.`); return; }
+  const fallback = () => {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { /* unsupported */ }
+    area.remove();
+    showToast(ok ? `${label} copied.` : `Could not copy ${label}; select the text manually.`);
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text)
+      .then(() => showToast(`${label} copied.`))
+      .catch(fallback);
+  } else fallback();
+}
+
+function findModelFile(id) {
+  for (const group of state.models?.groups || []) {
+    const found = group.files.find((f) => f.id === id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function selectedVariant(file) {
+  if (!file?.variants?.length) return null;
+  const wanted = state.modelVariants[file.id] || state.globalVariant;
+  return file.variants.find((v) => v.id === wanted)
+      || file.variants.find((v) => v.recommended)
+      || file.variants[0];
+}
+
+function modelsActive(snapshot) {
+  if (!snapshot) return false;
+  if (snapshot.paused || snapshot.queue_length > 0) return true;
+  return snapshot.groups.some((g) => g.files.some((f) =>
+    ["downloading", "queued", "paused"].includes(f.status)));
+}
+
+async function refreshModels(showErrors = true) {
+  try {
+    state.models = await api("/api/models");
+    renderModels();
+  } catch (error) {
+    $("models-pill").className = "pill pill-bad";
+    $("models-pill").textContent = "● /api/models unavailable";
+    if (showErrors) showToast(String(error.message || error));
+  }
+}
+
+function renderModels() {
+  const snapshot = state.models;
+  if (!snapshot) return;
+  // Rebuilding the group DOM every 1.2 s is fine for progress, but must not
+  // steal focus from an open <select> or a checkbox the operator is using.
+  const focused = document.activeElement;
+  const container = $("models-groups");
+  if (focused && container.contains(focused) && /^(SELECT|INPUT|TEXTAREA)$/.test(focused.tagName)) return;
+
+  const allFiles = snapshot.groups.flatMap((g) => g.files);
+  const installed = allFiles.filter((f) => f.status === "installed").length;
+  const downloading = allFiles.filter((f) => f.status === "downloading").length;
+  const pill = $("models-pill");
+  pill.className = snapshot.paused ? "pill pill-wait"
+    : downloading ? "pill pill-ok" : "pill pill-ok";
+  pill.textContent = snapshot.paused ? "● paused"
+    : downloading ? `● downloading ${downloading}`
+    : `● ${installed}/${allFiles.length} installed`;
+  $("models-summary").textContent =
+    `${formatBytes(snapshot.installed_bytes)} / ${formatBytes(snapshot.total_bytes)} · ` +
+    `mirror ${snapshot.mirror || "none"} · queue ${snapshot.queue_length}`;
+  $("config-target-path").textContent = snapshot.config_target_path || "QwenZImage.config.json";
+  $("config-platform-name").textContent = snapshot.config_platform || "platform";
+  $("models-pause").disabled = snapshot.paused === true;
+  $("models-resume").disabled = snapshot.paused !== true;
+
+  container.innerHTML = snapshot.groups.map((group) => {
+    const open = state.modelGroupsOpen[group.id] !== false;
+    const groupInstalled = group.files.filter((f) => f.status === "installed").length;
+    return `<details class="model-group" data-group="${escapeHtml(group.id)}" ${open ? "open" : ""}>
+      <summary data-group="${escapeHtml(group.id)}">
+        ${escapeHtml(group.name)}
+        <span class="model-tag ${group.optional ? "optional" : "required"}">${group.optional ? "optional" : "core"}</span>
+        <span class="model-group-head-meta">${groupInstalled}/${group.files.length} installed · ${escapeHtml(group.config_key)}</span>
+      </summary>
+      <div class="model-group-body">
+        <p class="model-group-path">
+          <code>${escapeHtml(group.config_key)}</code> → <code>${escapeHtml(group.resolved_path)}</code>
+          · ${escapeHtml(group.path_source)}${group.configured ? "" : " · <strong>not configured</strong>"}
+          · env <code>${escapeHtml(group.environment_variable)}</code>
+        </p>
+        <p class="model-file-desc">${escapeHtml(group.description)}</p>
+        ${group.note ? `<p class="model-file-note">${escapeHtml(group.note)}</p>` : ""}
+        ${group.files.map((file) => renderModelFile(file)).join("")}
+      </div>
+    </details>`;
+  }).join("");
+}
+
+function renderModelFile(file) {
+  const variant = selectedVariant(file);
+  const total = Number(file.total_bytes) || 0;
+  const done = Number(file.downloaded_bytes) || 0;
+  const pct = total > 0 ? Math.min(100, Math.max(0, (done / total) * 100)) : 0;
+  const showProgress = ["downloading", "queued", "paused", "partial"].includes(file.status);
+  const busy = ["downloading", "queued"].includes(file.status);
+  return `<div class="model-file" data-file="${escapeHtml(file.id)}">
+    <div class="model-file-top">
+      <span class="model-file-name">${escapeHtml(file.name)}</span>
+      <span class="model-tag ${file.required ? "required" : "optional"}">${file.required ? "required" : "optional"}</span>
+      <span class="model-status ${escapeHtml(file.status)}">${escapeHtml(file.status)}</span>
+      <span class="hint">${escapeHtml(file.id)} · ${formatBytes(file.installed_bytes)} installed</span>
+      <div class="model-file-actions" style="margin-left:auto">
+        <select data-model-action="variant" data-file="${escapeHtml(file.id)}" aria-label="Variant for ${escapeHtml(file.name)}">
+          ${(file.variants || []).map((v) => `<option value="${escapeHtml(v.id)}" ${v.id === variant?.id ? "selected" : ""}>${escapeHtml(v.label)}</option>`).join("")}
+        </select>
+        <button class="btn btn-primary btn-sm" data-model-action="download" data-file="${escapeHtml(file.id)}" ${busy ? "disabled" : ""} type="button">Download</button>
+        <button class="btn btn-ghost btn-sm" data-model-action="reset" data-file="${escapeHtml(file.id)}" type="button">Reset</button>
+      </div>
+    </div>
+    <div class="model-file-desc">${escapeHtml(file.description)}</div>
+    ${file.note ? `<div class="model-file-note">${escapeHtml(file.note)}</div>` : ""}
+    ${file.error ? `<div class="model-error">${escapeHtml(file.error)}</div>` : ""}
+    ${showProgress ? `<div class="model-progress">
+      <div class="progress-track"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div>
+      <div class="model-progress-text">${formatBytes(done)} / ${formatBytes(total)} (${pct.toFixed(1)}%) · resume from ${formatBytes(file.resume_from)} · ${formatSpeed(file.speed_bps)}</div>
+    </div>` : ""}
+    <div class="model-target">Target: <code>${escapeHtml(file.target_path)}</code>
+      <button class="btn btn-ghost btn-sm" data-model-action="copy-path" data-file="${escapeHtml(file.id)}" type="button">Copy path</button>
+    </div>
+    ${(file.variants || []).map((v) => `<div class="model-variant-row">
+      <span class="model-variant-label">${escapeHtml(v.label)}${v.recommended ? " ★" : ""}</span>
+      <a class="model-url" href="${escapeHtml(v.url)}" target="_blank" rel="noopener">${escapeHtml(v.url)}</a>
+      <button class="btn btn-ghost btn-sm" data-model-action="copy-url" data-file="${escapeHtml(file.id)}" data-variant="${escapeHtml(v.id)}" type="button">Copy URL</button>
+      ${v.source_url && v.source_url !== v.url ? `<div class="model-source-url">WanGP source: <code>${escapeHtml(v.source_url)}</code></div>` : ""}
+    </div>`).join("")}
+    ${variant ? `<pre class="models-pre model-command">${escapeHtml(variant.curl_command)}</pre>
+      <div class="model-file-actions">
+        <button class="btn btn-ghost btn-sm" data-model-action="copy-curl" data-file="${escapeHtml(file.id)}" type="button">Copy resumable curl command</button>
+        <span class="hint">${formatBytes(variant.size)} → <code>${escapeHtml(variant.target_path)}</code></span>
+      </div>` : ""}
+  </div>`;
+}
+
+function downloadPayload(extra = {}) {
+  return Object.assign({
+    variant: $("models-variant-select").value,
+    force: $("models-force").checked,
+  }, extra);
+}
+
+async function postModelsDownload(payload) {
+  try {
+    const result = await api("/api/models/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    showToast(`Queued ${result.queued} download(s)` +
+      (result.skipped?.length ? ` · skipped ${result.skipped.length} already present` : "") +
+      (result.note ? ` · ${result.note}` : ""));
+    await refreshModels(false);
+  } catch (error) { showToast(String(error.message || error)); }
+}
+
+async function postModelsControl(payload) {
+  try {
+    const result = await api("/api/models/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    showToast(`${result.action}: ${result.reset} partial(s) cleared · queue ${result.queue_length}` +
+      (result.paused ? " · paused" : ""));
+    await refreshModels(false);
+  } catch (error) { showToast(String(error.message || error)); }
+}
+
+async function onModelsAction(event) {
+  const el = event.target.closest("[data-model-action]");
+  if (!el || el.tagName === "SELECT") return;
+  const action = el.dataset.modelAction;
+  const fileId = el.dataset.file;
+  const file = findModelFile(fileId);
+  if (!file) return;
+  const variant = selectedVariant(file);
+  if (action === "download") {
+    await postModelsDownload(downloadPayload({ files: [fileId], variant: variant?.id }));
+  } else if (action === "reset") {
+    await postModelsControl({ action: "reset", file: fileId });
+  } else if (action === "copy-path") {
+    copyText(file.target_path, "target path");
+  } else if (action === "copy-url") {
+    const v = file.variants.find((x) => x.id === el.dataset.variant);
+    copyText(v?.url, "download URL");
+  } else if (action === "copy-curl") {
+    copyText(variant?.curl_command, "resumable curl command");
+  }
+}
+
+function onModelsVariantChange(event) {
+  const el = event.target.closest("select[data-model-action='variant']");
+  if (!el) return;
+  state.modelVariants[el.dataset.file] = el.value;
+  renderModels();
+}
+
+async function loadManualGuide() {
+  try {
+    const response = await fetch("/api/models/manual");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    state.manualGuide = await response.text();
+    $("manual-content").textContent = state.manualGuide;
+    showToast("Manual download guide loaded.");
+  } catch (error) { showToast(String(error.message || error)); }
+}
+
+function downloadManualGuide() {
+  const text = state.manualGuide;
+  if (!text) { showToast("Load the guide first."); return; }
+  const url = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "QwenZImage-models.md";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function renderConfigStatus(result) {
+  const overrides = (result.active_overrides || []);
+  $("config-status").textContent = result.message +
+    (overrides.length ? ` Active overrides: ${overrides.join("; ")}.` : "") +
+    (result.backup_path ? ` Backup: ${result.backup_path}.` : "") +
+    " Restart the WebUI to apply.";
+}
+
+async function previewConfig() {
+  try {
+    state.configPreview = await api("/api/models/config");
+    $("config-content").textContent = state.configPreview.merged_json || "";
+    renderConfigStatus(state.configPreview);
+  } catch (error) { showToast(String(error.message || error)); }
+}
+
+async function applyConfig() {
+  const target = state.models?.config_target_path || "QwenZImage.config.json";
+  if (!confirm(`Merge the six resolved model directories into the ${state.models?.config_platform || "platform"} section of\n${target}?\n\nA timestamped backup is made first, and the WebUI must be restarted afterwards.`)) return;
+  try {
+    const result = await api("/api/models/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apply: true }),
+    });
+    state.configPreview = result;
+    $("config-content").textContent = result.merged_json || "";
+    renderConfigStatus(result);
+    showToast(`Config updated (backup: ${result.backup_path || "new file"}). Restart the WebUI.`);
+    await refreshModels(false);
+  } catch (error) { showToast(String(error.message || error)); }
+}
+
+// Fast polling while a transfer is active, slow polling otherwise. Skipping
+// hidden tabs keeps a long download from burning CPU in a background window.
+async function modelsPollLoop() {
+  if (!document.hidden) await refreshModels(false);
+  setTimeout(modelsPollLoop, modelsActive(state.models) ? 1200 : 12000);
+}
+
 // ------------------------------------------------------------------- wiring
 
 function wire() {
@@ -981,13 +1286,56 @@ function wire() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closeLightbox();
   });
+
+  // Model weights: downloads, resumable transfer controls, manual addresses
+  // and the config-file merge. Every action goes through a snake_case API
+  // that only accepts file ids / variant ids / control verbs.
+  $("models-refresh").addEventListener("click", () => refreshModels());
+  $("models-download-required").addEventListener("click", () =>
+    postModelsDownload(downloadPayload({ files: [] })));
+  $("models-download-all").addEventListener("click", () =>
+    postModelsDownload(downloadPayload({ all: true })));
+  $("models-pause").addEventListener("click", () => postModelsControl({ action: "pause" }));
+  $("models-resume").addEventListener("click", () => postModelsControl({ action: "resume" }));
+  $("models-reset-all").addEventListener("click", () => {
+    if (!confirm("Discard all .qzi-part / .qzi-etag temporary files? Completed weights are untouched.")) return;
+    postModelsControl({ action: "reset-all" });
+  });
+  $("models-variant-select").addEventListener("change", (event) => {
+    state.globalVariant = event.target.value;
+    state.modelVariants = {};
+    renderModels();
+  });
+  $("models-groups").addEventListener("click", (event) => {
+    const summary = event.target.closest("summary[data-group]");
+    if (summary) {
+      const groupId = summary.dataset.group;
+      // The browser toggles <details> after this event, so read it next tick.
+      setTimeout(() => {
+        const details = [...$("models-groups").querySelectorAll("details.model-group")]
+          .find((d) => d.dataset.group === groupId);
+        if (details) state.modelGroupsOpen[groupId] = details.open;
+      }, 0);
+    }
+    onModelsAction(event);
+  });
+  $("models-groups").addEventListener("change", onModelsVariantChange);
+  $("manual-load").addEventListener("click", loadManualGuide);
+  $("manual-download").addEventListener("click", downloadManualGuide);
+  $("manual-copy").addEventListener("click", () => copyText(state.manualGuide, "manual guide"));
+  $("config-preview").addEventListener("click", previewConfig);
+  $("config-copy").addEventListener("click", () =>
+    copyText(state.configPreview?.merged_json, "merged config JSON"));
+  $("config-apply").addEventListener("click", applyConfig);
 }
 
 async function boot() {
   wire();
   syncModelUI();
-  await Promise.all([refreshHealth(), refreshPresets(), refreshJobs(), refreshOutputs()]);
+  await Promise.all([refreshHealth(), refreshPresets(), refreshJobs(),
+                     refreshOutputs(), refreshModels(false)]);
   connectEvents();
+  modelsPollLoop();
   // Safety net for browsers/proxies that buffer SSE: reflect job state anyway.
   setInterval(() => {
     const busy = [...state.jobs.values()].some((j) => j.state === "queued" || j.state === "running");

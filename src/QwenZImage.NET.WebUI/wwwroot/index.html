@@ -17,6 +17,7 @@
   </div>
   <div class="topbar-actions">
     <span id="health-pill" class="pill pill-wait">checking…</span>
+    <a class="btn btn-ghost btn-sm" href="#models-panel">Model weights ↓</a>
     <button id="unload-btn" class="btn btn-ghost" type="button">Unload model</button>
   </div>
 </header>
@@ -335,6 +336,89 @@
     </section>
   </div>
 </main>
+
+<!-- Model weights. Every URL below comes from the WanGP checkout's
+     `resolve/main` links and is served by /api/models; the browser may only
+     pick a file id + variant, never supply an arbitrary URL or path. -->
+<div class="wide">
+  <section class="panel" id="models-panel" aria-label="Model downloads">
+    <div class="panel-head">
+      <h2>Model weights</h2>
+      <div class="head-actions">
+        <span id="models-pill" class="pill pill-wait">loading…</span>
+        <button id="models-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+        <button id="models-download-required" class="btn btn-primary btn-sm" type="button">Download required</button>
+        <button id="models-download-all" class="btn btn-ghost btn-sm" type="button">Download everything</button>
+        <button id="models-pause" class="btn btn-ghost btn-sm" type="button">Pause</button>
+        <button id="models-resume" class="btn btn-ghost btn-sm" type="button">Resume</button>
+        <button id="models-reset-all" class="btn btn-ghost btn-sm" type="button">Reset partials</button>
+      </div>
+    </div>
+
+    <div class="models-meta">
+      <label class="models-check">
+        Variant
+        <select id="models-variant-select" aria-label="Preferred weight variant">
+          <option value="int8">int8 / quanto (recommended, smaller)</option>
+          <option value="bf16">bf16 (full precision, larger)</option>
+          <option value="vitl">vitl (Depth Anything V2 ViT-L)</option>
+          <option value="vitb">vitb (Depth Anything V2 ViT-B)</option>
+          <option value="default">default (single-variant assets)</option>
+        </select>
+      </label>
+      <label class="models-check">
+        <input id="models-force" type="checkbox"> Re-download installed files
+      </label>
+      <span id="models-summary" class="hint"></span>
+    </div>
+
+    <p class="note models-note">
+      Downloads are <strong>resumable</strong>: each transfer writes
+      <code>&lt;target&gt;.qzi-part</code> and continues with an HTTP <code>Range</code>
+      request after a pause, a restart or a network failure. All addresses are the
+      WanGP Hugging Face <code>resolve/main</code> links (no weights are bundled with
+      this project; respect each upstream licence). Set <code>QZI_HF_MIRROR</code> before
+      starting the WebUI to route the fixed Hugging Face prefix through a mirror.
+    </p>
+
+    <div id="models-groups" class="models-groups"></div>
+
+    <details class="models-details" id="manual-details">
+      <summary>Manual download — exact addresses, resumable commands &amp; config changes</summary>
+      <p class="note">
+        Prefer a download manager or <code>curl</code>? The guide lists every URL, its exact
+        destination path, a copy/paste-able <code>curl -L -C -</code> command and the config
+        fragment. You can also copy a single URL / command from each row above.
+      </p>
+      <div class="button-row">
+        <button id="manual-load" class="btn btn-ghost btn-sm" type="button">Load guide</button>
+        <button id="manual-download" class="btn btn-ghost btn-sm" type="button">Download .md</button>
+        <button id="manual-copy" class="btn btn-ghost btn-sm" type="button">Copy all</button>
+      </div>
+      <pre id="manual-content" class="models-pre">Click “Load guide” to fetch the Markdown manual.</pre>
+    </details>
+
+    <details class="models-details" id="config-details">
+      <summary>Configuration file — preview / apply</summary>
+      <p class="note">
+        The WebUI can merge the six resolved model directories into the current
+        <code id="config-platform-name">platform</code> section of
+        <code id="config-target-path">QwenZImage.config.json</code>. Only those keys are
+        touched, a timestamped <code>.bak.*</code> copy is made first, and the write is
+        atomic. <strong>Restart the WebUI afterwards</strong> — the native engine reads its
+        config once at startup. Environment variables (<code>QZI_*</code>) and
+        <code>--models</code> take precedence over the file.
+      </p>
+      <div class="button-row">
+        <button id="config-preview" class="btn btn-ghost btn-sm" type="button">Preview merged JSON</button>
+        <button id="config-copy" class="btn btn-ghost btn-sm" type="button">Copy JSON</button>
+        <button id="config-apply" class="btn btn-danger btn-sm" type="button">Apply to config file</button>
+      </div>
+      <p id="config-status" class="note"></p>
+      <pre id="config-content" class="models-pre">Click “Preview merged JSON” to see the exact file that would be written.</pre>
+    </details>
+  </section>
+</div>
 
 <div id="lightbox" class="lightbox" hidden>
   <div class="lightbox-bar">

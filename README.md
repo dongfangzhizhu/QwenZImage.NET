@@ -49,13 +49,14 @@
 | **Z-Image 遮罩重绘 / Inpaint**（Union 2.x 33 通道后 17 平面，对齐 WanGP `pipeline_z_image.py` 带 mask 分支） | ✅ 第四个 ABI v1 增量扩展（`qzi_zimage_inpaint_request` + `QZI_FEATURE_ZIMAGE_INPAINT = 0x8` + `qzi_generate_zimage_inpaint()`）；真实后端两次 VAE 编码（控制图 + `control*(1-mask)`）、`keep_mask = 1-mask` 收缩到 1/8 latent、复用 `qzen_zpipe_control_context_ex()` 拼 33 通道 context；普通 t2i / ControlNet 逐位不变；.NET `ZImageInpaintOptions` / `SupportsInpaint`、WebUI `zimage-inpaint` 模式与 `supports_inpaint`、能力前置依赖 ControlNet |
 | **反向回调崩溃修复**（`QziClient.cs` 的 `System.ExecutionEngineException` / `0x80131506`） | ✅ `CallbackScope` 改用进程级 token 表替代裸 `GCHandle`；`[UnmanagedCallersOnly]` 回调捕获全部托管异常并记录首个 fault，`ShouldCancel` 据此停止 native loop，P/Invoke 返回后在托管侧抛出带 inner exception 的 `InvalidOperationException`；`QziGenerationQueue` 的 observer / channel 异常同样封在边界内；WebUI `<CETCompat>false</CETCompat>`；7 项专门回归测试 + 真实 CUDA 下 SSE 断连仍出图 |
 | **WebUI 控制图预处理 / 对齐 WanGP `guide_preprocessing`**（核心库保持 raw raster 契约） | ✅ `QwenZImage.NET.WebUI` 新增 `GET\|POST /api/preprocess`：`auto` / `raw` / `gray` / `canny` / `scribble` / `depth` / `pose`，兼容 WanGP 字母 `V/C/E/EV/S/D/DV/P/PV`；`Microsoft.ML.OnnxRuntime` 仅 host 层引用，加载 WanGP YOLOX-L + DWPose / Depth Anything V2 / contour 权重，缺资产时回退纯托管算子；前端上传普通照片即自动生成 guide，删除「Used as-is (no preprocessing)」提示；核心 NuGet 零三方依赖、C ABI 不变 |
+| **WebUI 模型权重下载**（对齐 WanGP 地址，全模型覆盖 + 断点续传 + 手动下载地址 + 配置写回） | ✅ `src/QwenZImage.NET.WebUI/ModelDownloads/`：静态 WanGP manifest（6 组 / 32 个文件 / 4 个 HF repo）、`GET /api/models` 快照、`POST /api/models/download`（`.qzi-part` + `.qzi-etag` + HTTP `Range` / `If-Range`）、`POST /api/models/control`（pause / resume / reset）、`GET /api/models/manual`（精确 `resolve/main` 地址 + `curl -L -C -` 命令 + 配置片段）、`GET|POST /api/models/config`（默认只读预览，`{"apply":true}` 才备份并原子写回）；前端全宽 Models 面板；核心 NuGet 与 C ABI **完全不变** |
 | **真图回归矩阵**（`tools/RealImageRegression`，需 GPU + 权重） | ✅ Windows CUDA 10/10 通过：turbo / base、LoRA scale 1.0 与 0.6、512 与 1024、Z-Image bf16 与 Nunchaku r32/r256；重复请求字节级确定性一致 |
 | **多实例配置隔离**（`QZI_*` 作用域发布 + 实时环境读取） | ✅ 每个 engine 在 `qzi_engine_create()` 时快照自己的配置，构造结束即还原；Windows CRT 环境快照陷阱已用 `qzi_getenv()` 消除 |
 | native 产物统一命名 `QwenZImageNative.dll` / `libQwenZImageNative.so` | ✅ 已完成，无 `h3` 命名产物 |
 | 单个 NuGet 包含 .NET 程序集 + win-x64 + linux-x64 native | ✅ 已完成，`QziEnsureNativeRuntimes` 缺平台即拒绝打包 |
 | 本地 git 仓库与提交 | ✅ 已完成 |
 | 推送 GitHub / 发布 NuGet | ✅ 仓库 `dongfangzhizhu/QwenZImage.NET`；发布走 **NuGet Trusted Publishing**（GitHub Actions OIDC 换短期密钥，仓库不存长期 secret），由 `v*` tag 触发，见 [PLAN.md](PLAN.md) |
-| 模型权重 | ❌ 不含，需使用方自备并在配置文件里指向它们 |
+| 模型权重 | ❌ 包内不含、仓库不分发；WebUI 的 Models 面板可一键下载全部权重（支持断点续传），也可按 `/api/models/manual` 给出的精确地址手动下载后修改 `QwenZImage.config.json` |
 
 ## 配置文件：`QwenZImage.config.json`
 
@@ -83,6 +84,29 @@
 > Windows 上 C 运行时的 `getenv()` 持有启动时的环境快照，看不到 `.NET` 之后设置的值；native 统一通过 `qzi_getenv()`（`native/include/qzi_env.h`，库内部符号、不是 ABI 导出）读实时进程环境，所以这条通道在两个平台都有效。自行实现 backend 时若要读 `QZI_*`，请从仓库源码编译 `native/src/qzi_env.c`（Windows 用 `GetEnvironmentVariableA`），不要裸用 `getenv()`。
 
 仓库根目录的 `QwenZImage.config.json` 是开发机示例，路径指向本机已有的权重目录；部署时改成自己的路径即可。权重文件本身不在仓库里。
+
+## 模型权重下载（WebUI Models 面板）
+
+本仓库**不分发任何权重**。WebUI 的 Models 面板把 WanGP 用到的全部权重列成一张可操作的清单，覆盖 Qwen-Image 2.1（DiT / VAE / 文本塔 / tokenizer / config）、Qwen-Image 2.1 LoRA、Z-Image Turbo（bf16 / Nunchaku INT4）、Z-Image ControlNet Union 2.1、以及控制图预处理 ONNX / `.pth` 资产，共 **6 组 32 个文件**。下载地址全部来自本机 WanGP 源码（`D:/AI/Wan2GP` 的 `defaults/*.json`、各 model handler 与 `preprocessing/*/assets.py`），即 `https://huggingface.co/<repo>/resolve/main/<path>`（repo 为 `DeepBeepMeep/Qwen_image_2`、`DeepBeepMeep/Ideogram4`、`DeepBeepMeep/Z-Image`、`DeepBeepMeep/Wan2.1`）。WanGP 未 pin commit，revision 跟随 `main`。
+
+**三种使用方式：**
+
+1. **WebUI 直接下载**：打开页面下方 Models 面板 → 选择全局 variant（默认 `int8`，即更小的 quanto / ConvRot 重打包）→ `Download required` 或缺什么点什么。下载器串行工作，每个文件写入 `<target>.qzi-part` 并保存 ETag 到 `<target>.qzi-etag`；中断 / 暂停 / 重启进程后以 `Range: bytes=N-` + `If-Range` 续传，完成后校验长度并原子替换目标文件。`Pause` / `Resume` / `Reset partials` 只操作临时文件，**不删除已完成的权重**。
+2. **手动下载**：`GET /api/models/manual` 返回一份 Markdown，逐个文件列出**精确的 WanGP 原始地址**、目标绝对路径、可复制的断点续传命令（`curl -L -C - --retry 3 --fail -o "<target>" "<url>"`），以及第 2 步要合并进配置文件的 JSON 片段；面板里也能加载 / 复制 / 下载该文档。设置了 `QZI_HF_MIRROR` 时文档会**同时**给出 WanGP 原始地址和镜像后的有效地址。
+3. **改配置文件**：`GET /api/models/config` 默认只返回**预览**（不写盘）；确认后 `POST /api/models/config` 带 `{"apply":true}` 才把 6 个模型目录键合并进当前平台 section，保留其他平台 / 注释 / 未知合法键，先生成 `QwenZImage.config.json.bak.<时间戳>` 备份，再用 `.qzi-tmp` + 原子替换写入。返回 `restart_required=true`，因为 native 引擎只在 `qzi_engine_create()` 时读一次配置。
+
+**API 一览**（全部 snake_case，浏览器只能提交文件 id / variant，不能提交 URL 或目标路径）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/models` | 完整快照：分组 / 每个文件的状态、目标路径、variant、大小、进度、已安装字节 |
+| `GET` | `/api/models/manual` | Markdown 手动下载指引（精确地址 + `curl -L -C -` + 配置片段） |
+| `GET` | `/api/models/config` | 配置写回预览（只读） |
+| `POST` | `/api/models/config` | `{"apply":true}` 时备份并写回配置文件 |
+| `POST` | `/api/models/download` | `{"files":[...],"variant":"int8","force":false,"all":false}` → `202` |
+| `POST` | `/api/models/control` | `{"action":"pause|resume|reset|reset-all","file":"<id>"}` |
+
+可用 `QZI_HF_MIRROR`（绝对 http(s) 地址，如 `https://hf-mirror.com`）只重写固定的 Hugging Face 前缀；清单里的 repo / 路径不可由调用方指定，避免 SSRF。下载功能**只存在于 host 层** `QwenZImage.NET.WebUI`（`IsPackable=false`），核心 NuGet 包与 C ABI 仍只含模型与推理、零运行期三方依赖。详见 [docs/WEBUI.md](docs/WEBUI.md)。
 
 ## 环境要求
 
@@ -281,7 +305,7 @@ QZI_WEBUI_URLS=http://127.0.0.1:51234 dotnet run --project src/QwenZImage.NET.We
 dotnet run --project src/QwenZImage.NET.WebUI -c Release -- --config /path/to/QwenZImage.config.json
 ```
 
-主要端点：`GET /api/health`、`GET /api/presets`、`GET|POST /api/preprocess`（控制图预处理）、`POST|GET /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel|/retry`、`GET /api/events`（SSE）、`GET|DELETE /api/outputs`、`POST /api/outputs/restore`、`GET|POST /api/unload`。可用环境变量：`QZI_CONFIG`、`QZI_WEBUI_URLS`、`QZI_WEBUI_OUTPUT`、`QZI_MODEL_DIR`、`QZI_MODEL_CACHE`、`QZI_NATIVE_LIBRARY`、`QZI_WEBUI_NATIVE`、`QZI_REQUIRE_REAL_BACKEND`、`QZI_DEVICE_ID`、`QZI_PREPROCESS_DIR`（或配置键 `preprocess_dir`，指向 WanGP ONNX 预处理权重；仅 WebUI 读取，native 引擎忽略）。完整说明见 [docs/WEBUI.md](docs/WEBUI.md)。
+主要端点：`GET /api/health`、`GET /api/presets`、`GET|POST /api/preprocess`（控制图预处理）、`POST|GET /api/jobs`、`GET /api/jobs/{id}`、`POST /api/jobs/{id}/cancel|/retry`、`GET /api/events`（SSE）、`GET|DELETE /api/outputs`、`POST /api/outputs/restore`、`GET|POST /api/unload`。可用环境变量：`QZI_CONFIG`、`QZI_WEBUI_URLS`、`QZI_WEBUI_OUTPUT`、`QZI_MODEL_DIR`、`QZI_MODEL_CACHE`、`QZI_NATIVE_LIBRARY`、`QZI_WEBUI_NATIVE`、`QZI_REQUIRE_REAL_BACKEND`、`QZI_DEVICE_ID`、`QZI_PREPROCESS_DIR`（或配置键 `preprocess_dir`，指向 WanGP ONNX 预处理权重；仅 WebUI 读取，native 引擎忽略）、`QZI_HF_MIRROR`（模型下载镜像，只重写固定的 Hugging Face 前缀）。模型权重相关端点：`GET /api/models`、`GET /api/models/manual`、`GET|POST /api/models/config`、`POST /api/models/download`、`POST /api/models/control`，见上一节。完整说明见 [docs/WEBUI.md](docs/WEBUI.md)。
 
 > WebUI 是**手动测试工具**，不打进 NuGet 包。`/api/health` 的 `transport` 恒为 `native-pinvoke`，并返回 `config_path`、`engine.reference_backend`、`supports_image_editing`、`supports_controlnet`、`supports_advanced_editing`、`supports_inpaint` 与 `preprocessing`（可用算子、已发现的 ONNX 资产）；编辑请求用 `POST /api/jobs` 的 `reference_image` / `mask_image` / `strength` / `masking_strength` 字段（或 `model: qwen21-edit`），ControlNet 请求用 `control_image` / `control_type` / `control_scale`（或 `model: zimage-control`），遮罩重绘在此基础上再加 `mask_image`（或 `model: zimage-inpaint`），高级编辑在 `qwen21-edit` 基础上再加 `margin_*` / `model_mode` / `rgba`。四项能力都是 ABI v1 增量导出，旧 native 库会让对应开关为 `false` 并禁用界面选项（只出现普通编辑字段时仍走旧的 `qwen21-edit` 请求；inpaint 还前置依赖 ControlNet 能力）。当加载到参考后端时页面显示黄色噪点告警横幅；换成 CUDA 构建后横幅消失。
 
@@ -372,7 +396,9 @@ engine/                         vendored + 改名的真实 C/CUDA 推理引擎
 src/QwenZImage.NET/             .NET 10 库（NuGet 包体）
   Configuration/QziConfig.cs    配置文件加载器
 src/QwenZImage.NET.WebUI/       跨平台手动测试 WebUI（不打包）
-tests/                          xUnit 托管测试
+  ModelDownloads/               WanGP 权重清单 / 断点续传下载器 / 配置写回（仅 host 层）
+  Preprocessing/                控制图 guide 预处理（仅此处引用 OnnxRuntime）
+tests/                          xUnit 托管测试（含 ModelDownloadsTests.cs）
 samples/                        端到端示例
 integration/                    自定义 qzi_backend 模板
 tools/RealImageRegression/      真图回归 harness（需 GPU + 权重，刻意不进 sln / CI）
@@ -392,7 +418,7 @@ dotnet test QwenZImage.NET.sln -c Release               # 托管测试
 
 Linux 上 `ctest` 另有 `posix_unicode_with_icu` / `posix_unicode_without_icu` 两项，验证 POSIX ICU 兼容层的两条运行时路径：前者 `dlopen` 命中宿主 ICU 并把 `e + U+0301` 组合成 `é`，后者用 `-Wl,--wrap=dlopen` 强制「无 ICU」走内置回退（恒等 NFC）。二者共同覆盖字符分类、空白判断、含 4 字节代理对的 UTF-8 ↔ UTF-16 round-trip 与非法 UTF-8 报错。因为 `qzen_posix_unicode.c` 用 `pthread_once` 只解析一次 ICU，两条路径由两个独立可执行分担；链接器不支持 `--wrap` 时 configure 会优雅跳过该变体，宿主无 ICU 时对应测试记为 SKIP。这两项**不需要 CUDA**，GPU-less 的 Linux CI 在 reference 构建里就会跑。
 
-托管测试共 **162 项**（110 库 + 52 WebUI）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射、`QZI_*` 作用域发布 / 还原、构造失败回滚、多 engine 配置快照与并发构造隔离，以及 native 后端选择（自动探测 CUDA / 显式路径优先 / 强制 reference / 拒绝噪点开关）。
+托管测试共 **217 项**（118 库 + 99 WebUI；阶段 20 为 202 项，阶段 21 新增 `ModelDownloadsTests.cs` 15 项）：配置文件加载与平台覆盖、`QziConfig` / 环境变量 / 代码级 options 覆盖链、参数校验（含 LoRA 裸文件名、长度、finite scale、双 tier）、ABI 布局、PNG 生成与阶段回调、确定性输出、零拷贝写流、health 计数、异步包装、预取消、native 层重复校验、队列串行/取消/重试/事件流、WebUI 运行时配置与双 tier LoRA 映射、`QZI_*` 作用域发布 / 还原、构造失败回滚、多 engine 配置快照与并发构造隔离，以及 native 后端选择（自动探测 CUDA / 显式路径优先 / 强制 reference / 拒绝噪点开关）。
 
 编辑相关测试覆盖：`QziRasterImage` 的平面通道顺序 / 尺寸校验与 PNG 解码（灰阶 / RGB / RGBA、alpha 合成、base64 data URL、非法与不支持的输入）、`Qwen21EditOptions` 的校验（mask 尺寸、strength / masking_strength 边界与依赖）、编辑能力探测、编辑请求生成与确定性（换参考图 / mask / strength 都会改变输出字节）、WanGP 步数换算与 `"image encode"` phase、同步 / 异步 / 零拷贝 / 队列四条调用路径，以及 WebUI 的 `reference_image` / `mask_image` / `strength` / `masking_strength` 字段映射、编辑别名与缺字段时的 `400` 语义。
 
@@ -401,6 +427,8 @@ ControlNet 相关测试覆盖：`ZImageControlOptions` 的控制图尺寸 / `con
 **真实 CUDA 编辑验证**（不属于 CI，需 CUDA 构建 + 权重）：以 512×512 的「左蓝底白圆 / 右橙色」参考图配「左黑 / 右白」mask、`masking_strength=1.0` 提交 `qwen21-edit` 任务。`strength=0.6` 时参考图与输出的半幅平均绝对差为左 **0.541** / 右 **17.115**，`strength=1.0` 时为左 **0.981** / 右 **88.468**：黑 mask 区始终逐像素锁定，白 mask 区被完全重绘成雪地红狐，且重绘幅度随 `strength` 按 WanGP 的步数比例规则放大。phase 序列出现 `ImageEncode`，确认参考图确实经过 VAE 编码而非走文本生成路径。详见 [PLAN.md](PLAN.md) 的「阶段 15 本机验证结果」。
 
 **真实 CUDA 遮罩重绘验证**（不属于 CI，需 CUDA 构建 + Union 2.1 权重）：以 256×256「左蓝底白圆 / 右橙色」控制图配「左黑 / 右白」单通道 mask 提交 `zimage-inpaint` 任务。相对全黑（全 keep）的 mask，`inpaint_half` 左 / 右半幅平均绝对差为 **36.765 / 118.612**，反转 mask 后为 **104.578 / 8.243**：白区被明显重绘、黑区更贴近控制图，且极性随 mask 精确翻转；普通 ControlNet 对 t2i 的 MAD 为 **55.701**，inpaint 对普通 ControlNet 为 129.610 / 130.589，确认 33 通道 context 的后 17 个平面真实参与采样而非退化成 plain ControlNet。7 例真图（含 `control_scale=0.2`、128×256 异尺寸 mask 的独立 cover fit、两次独立运行的逐项 SHA-256 一致）全部产出合法 PNG；缺 mask / 缺控制图 / 非法 `control_type` / 越界 `control_scale` 四种请求均在 `/api/jobs` 返回 `400`。真实后端把两次 VAE 编码折算进**单个** `ImageEncode` 阶段（`0/1 → 1/1`），只有 GPU-free 参考后端拆成 `0/2 → 1/2 → 2/2` 两段。详见 [PLAN.md](PLAN.md) 的「阶段 19 本机验证结果」。
+
+模型下载相关测试（15 项，全部用可注入 `HttpClient` + 本地 `RangeHandler` / `ThrottledStream`，**不需要真实网络或权重**）覆盖：manifest 的 URL / 大小 / 路径安全性、`QZI_HF_MIRROR` 重写、快照与手动指引、下载计划展开、配置写回（预览只读 / 备份 / 保留其他 section）、完整下载、HTTP `Range` + `If-Range` 续传、服务器忽略 Range 时重新全量下载、截断续传、pause / resume / reset / `Reset()` 竞态。另用本地 HTTP Range server 对真实 WebUI 端点做过端到端验证（暂停在 512 KiB → 带 `Range: bytes=524288-` 与 ETag 续传 → 2 MiB 载荷逐字节一致 → 临时文件清理 → 配置真实写回），21/21 检查通过。
 
 CI 另做 WebUI Linux 运行时冒烟：启动 Kestrel → 验证 `/api/health` 的 `ok=true` / `transport=native-pinvoke` / `config_path` → 检查 presets → 提交 zimage job → 轮询到完成 → 确认输出出现在 `/api/outputs`。
 
@@ -418,7 +446,7 @@ bash scripts/run-real-image-regression.sh --out artifacts/regress/full
 
 仓库：`https://github.com/dongfangzhizhu/QwenZImage.NET`。
 
-见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）、阶段 12c（**LoRA / 参数全链路一致性**）、阶段 12d（**真图回归矩阵 10/10**，覆盖 LoRA、base、1024×1024、Z-Image bf16 与 Nunchaku r32/r256）、阶段 12e（**POSIX ICU 双路径检查接入 CTest**）、阶段 12f（**消除 `QZI_*` 进程级环境变量串扰**）、阶段 13（Trusted Publishing）与阶段 14（WebUI 默认不再产出噪点图）亦已完成；**阶段 15（Qwen-Image 2.1 图像编辑 / 对齐 WanGP）** 完成 ABI v1 增量扩展 + native 校验与归一化 + 真实 CUDA 后端 VAE 编码 / mask 恢复 + .NET API + WebUI 上传与绘制 mask；真实 CUDA 双轮编辑真图验证（白 mask 区重绘 / 黑 mask 区锁定、`strength` 生效）已通过。**阶段 16（Z-Image Turbo Fun ControlNet Union 2.1 / 对齐 WanGP `z_image_control2_1`）** 完成第二个 ABI v1 增量扩展、33 通道权重加载器、真实 CUDA 后端 hint 注入与逐步重算、.NET `ZImageControlOptions` / `SupportsControlNet` 与 WebUI `zimage-control` 模式。**阶段 17（Qwen-Image 2.1 高级编辑）** 是第三个增量（`0x4` 能力位、`qzi_generate_qwen21_edit_ex`），在同一份 7B 权重上补齐 Red Canvas 外扩（32 对齐四边距）、LanPaint（`model_mode` 2/3/4/5）与 VAE 生成 alpha 的 RGBA PNG 输出。**阶段 18** 收尾审计把高级编辑的 C smoke 检查接进 `main()` 并按本机 WanGP `5b63ae9d` 源码复核边界。**阶段 19（Z-Image Union 2.x 遮罩重绘）**：第四个 ABI v1 增量扩展（`qzi_zimage_inpaint_request` + `QZI_FEATURE_ZIMAGE_INPAINT = 0x8` + `qzi_generate_zimage_inpaint()`），补齐 WanGP `pipeline_z_image.py` 中 33 通道 context 的带 mask 分支——两次 VAE 编码、`keep_mask = 1 - mask` 收缩到 1/8 latent、`context = [control_latent(16) | keep_mask(1) | inpaint_latent(16)]`；`qzi_abi_features()` 现为 `0xF`、`qzi_backend` 共 11 个回调。.NET 新增 `ZImageInpaintOptions` / `SupportsInpaint`，WebUI 加 `zimage-inpaint` 模式并复用控制图上传与笔刷 mask；6 份文档与 **162 项测试**同步。**阶段 20（回调崩溃根治 + WebUI 控制图预处理 / 继续对齐 WanGP）为最新一轮**：不改 C ABI 与推理引擎，只在 `.NET` 与 host 层收口三个现场问题——① `QziClient.cs` 的 `System.ExecutionEngineException` / `0x80131506` 由 `CallbackScope` 的 token 表 + 异常封边根治；② 允许 `QwenZImage.NET.WebUI` 引入 `Microsoft.ML.OnnxRuntime` 与图像算子，新增 `GET|POST /api/preprocess`，把「必须上传已预处理控制图」从 WebUI 的默认路径中移除；③ 前端删除「Used as-is (no preprocessing)」，改为上传普通照片即生成 guide 并可重跑。核心 NuGet 包仍只含模型与推理、保持零三方依赖与 raw raster 契约。全量 **202 项测试**全绿（118 库 + 84 WebUI），真实 CUDA 后端下「普通照片 → canny guide → `zimage-control` → SSE 断连 → 合法 PNG」端到端通过。按用户要求不做 macOS 适配。
+见 [PLAN.md](PLAN.md)：阶段 0–12 已完成（调研 → C ABI → .NET 封装 → 队列/预设 → 文档/CI → 跨平台 WebUI + 双平台 native 包 → 噪点根因排查 → **D10 直接绑定真实 native 后端**），阶段 12b（双平台 fat binary / 无 ICU 的 Linux 运行时）、阶段 12c（**LoRA / 参数全链路一致性**）、阶段 12d（**真图回归矩阵 10/10**，覆盖 LoRA、base、1024×1024、Z-Image bf16 与 Nunchaku r32/r256）、阶段 12e（**POSIX ICU 双路径检查接入 CTest**）、阶段 12f（**消除 `QZI_*` 进程级环境变量串扰**）、阶段 13（Trusted Publishing）与阶段 14（WebUI 默认不再产出噪点图）亦已完成；**阶段 15（Qwen-Image 2.1 图像编辑 / 对齐 WanGP）** 完成 ABI v1 增量扩展 + native 校验与归一化 + 真实 CUDA 后端 VAE 编码 / mask 恢复 + .NET API + WebUI 上传与绘制 mask；真实 CUDA 双轮编辑真图验证（白 mask 区重绘 / 黑 mask 区锁定、`strength` 生效）已通过。**阶段 16（Z-Image Turbo Fun ControlNet Union 2.1 / 对齐 WanGP `z_image_control2_1`）** 完成第二个 ABI v1 增量扩展、33 通道权重加载器、真实 CUDA 后端 hint 注入与逐步重算、.NET `ZImageControlOptions` / `SupportsControlNet` 与 WebUI `zimage-control` 模式。**阶段 17（Qwen-Image 2.1 高级编辑）** 是第三个增量（`0x4` 能力位、`qzi_generate_qwen21_edit_ex`），在同一份 7B 权重上补齐 Red Canvas 外扩（32 对齐四边距）、LanPaint（`model_mode` 2/3/4/5）与 VAE 生成 alpha 的 RGBA PNG 输出。**阶段 18** 收尾审计把高级编辑的 C smoke 检查接进 `main()` 并按本机 WanGP `5b63ae9d` 源码复核边界。**阶段 19（Z-Image Union 2.x 遮罩重绘）**：第四个 ABI v1 增量扩展（`qzi_zimage_inpaint_request` + `QZI_FEATURE_ZIMAGE_INPAINT = 0x8` + `qzi_generate_zimage_inpaint()`），补齐 WanGP `pipeline_z_image.py` 中 33 通道 context 的带 mask 分支——两次 VAE 编码、`keep_mask = 1 - mask` 收缩到 1/8 latent、`context = [control_latent(16) | keep_mask(1) | inpaint_latent(16)]`；`qzi_abi_features()` 现为 `0xF`、`qzi_backend` 共 11 个回调。.NET 新增 `ZImageInpaintOptions` / `SupportsInpaint`，WebUI 加 `zimage-inpaint` 模式并复用控制图上传与笔刷 mask；6 份文档与 **162 项测试**同步。**阶段 20（回调崩溃根治 + WebUI 控制图预处理 / 继续对齐 WanGP）**：不改 C ABI 与推理引擎，只在 `.NET` 与 host 层收口三个现场问题——① `QziClient.cs` 的 `System.ExecutionEngineException` / `0x80131506` 由 `CallbackScope` 的 token 表 + 异常封边根治；② 允许 `QwenZImage.NET.WebUI` 引入 `Microsoft.ML.OnnxRuntime` 与图像算子，新增 `GET|POST /api/preprocess`，把「必须上传已预处理控制图」从 WebUI 的默认路径中移除；③ 前端删除「Used as-is (no preprocessing)」，改为上传普通照片即生成 guide 并可重跑。核心 NuGet 包仍只含模型与推理、保持零三方依赖与 raw raster 契约。全量 **202 项测试**全绿（118 库 + 84 WebUI），真实 CUDA 后端下「普通照片 → canny guide → `zimage-control` → SSE 断连 → 合法 PNG」端到端通过。**阶段 21（WebUI 模型权重下载 / 断点续传 / 手动地址 / 配置写回）为最新一轮**：下载地址全部取自本机 WanGP 源码，新增 `ModelDownloads/` 静态清单与下载服务、6 个 `/api/models*` 端点、前端 Models 面板、手动下载 Markdown 指引与安全的配置写回；下载能力只在 host 层，核心 NuGet 与 C ABI 不变。全量 **217 项测试**全绿（118 库 + 99 WebUI），并用本地 HTTP Range server 对真实端点完成 21/21 端到端检查。按用户要求不做 macOS 适配。
 
 **发布采用 NuGet Trusted Publishing**：`.github/workflows/release.yml` 在 `v*` tag 上触发，`publish` job 以 `permissions.id-token: write` 申请 GitHub OIDC token，`NuGet/login@v1` 用它换取有效期 1 小时的短期 API key，随后发布 `.nupkg` / `.snupkg`；仓库**不保存长期 `NUGET_API_KEY`**。首次发布前需完成两项外部配置：
 

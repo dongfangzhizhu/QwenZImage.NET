@@ -206,6 +206,7 @@ unchanged.
 | `QZI_REQUIRE_REAL_BACKEND` | unset | `1` makes the WebUI refuse generation jobs (HTTP 503, `ok=false`) when the reference backend is loaded; set by the one-click launcher scripts |
 | `QZI_DEVICE_ID` | `-1` | CUDA device selector passed to the native backend |
 | `QZI_PREPROCESS_DIR` | from config | Root of optional WanGP ONNX guide-preprocessor assets (`pose/*.onnx`, `depth*.onnx`, `netG_A_latest.onnx`). Overrides `preprocess_dir`; the native engine ignores it |
+| `QZI_HF_MIRROR` | unset (direct `huggingface.co`) | Absolute http(s) mirror base used **only** to rewrite the fixed Hugging Face prefix of model-download URLs from the static WanGP manifest. The repo / path always come from the manifest; callers cannot supply a URL |
 | `preprocess_dir` (config key) | unset | Same value stored in `QwenZImage.config.json` (top level or the `windows` / `linux` / `osx` section). Recognised by the strict config parser; read by the WebUI only |
 | `device_id` / `thread_count` (config keys) | `-1` / `0` | Auto device / thread count; only in the config file, no env override |
 
@@ -245,6 +246,12 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 | `DELETE` | `/api/outputs` | Batch delete; body `{"names":[...]}` |
 | `POST` | `/api/outputs/restore` | Batch restore from `.trash`; never overwrites a newer file |
 | `GET` | `/api/events` | Server-sent events: `job`, `progress`, `error`, 15 s heartbeat |
+| `GET` | `/api/models` | Full model-weight snapshot: groups, per-file status, resolved target path, variants, sizes, progress (see [Model weights](#model-weights-getpost-apimodels)) |
+| `GET` | `/api/models/manual` | `text/markdown` manual download guide with every exact WanGP URL and a resumable `curl -L -C -` command |
+| `GET` | `/api/models/config` | Read-only preview of the config write-back |
+| `POST` | `/api/models/config` | `{"apply":true}` merges six model keys into the active platform section, with a timestamped backup |
+| `POST` | `/api/models/download` | Queue transfers by file id / variant; `202` |
+| `POST` | `/api/models/control` | `pause` / `resume` / `reset` / `reset-all` for the download queue |
 | `GET` | `/` | Static single-page console |
 
 ### Guide preprocessing (`GET/POST /api/preprocess`)
@@ -317,6 +324,124 @@ returns a `warning`; `pose` is the exception because a classic edge map is not
 a pose guide. `GET /api/preprocess` and the `preprocessing` block of
 `/api/health` report exactly which assets were found. ONNX sessions are
 created on first use and serialised by a single in-process gate.
+
+### Model weights (`GET/POST /api/models*`)
+
+Weight acquisition is a **host-layer** feature. The core NuGet package and the
+C ABI still load safetensors from disk exactly as before; nothing in
+`src/QwenZImage.NET/` changed for this feature. All URLs come from a static
+manifest derived from the local WanGP sources (`defaults/*.json`, the model
+handlers and `preprocessing/*/assets.py`), so the browser can only choose file
+ids and a variant — it can never submit an arbitrary URL or destination path.
+
+The manifest covers six groups / 32 files:
+
+| Group id | Config key | Contents |
+| --- | --- | --- |
+| `qwen21` | `qwen21_dir` | Qwen-Image 2.1 DiT (bf16 / int8 variants), VAE + config, scheduler config, Qwen3-VL-8B text tower, tokenizer |
+| `qwen21-loras` | `qwen21_lora_dir` | Four LoRA adapters |
+| `zimage` | `zimage_dir` | Z-Image Turbo DiT, Qwen3 text encoder, tokenizer / vocab / merges, VAE + config, scheduler config |
+| `zimage-nunchaku` | `zimage_nunchaku_dir` | Nunchaku INT4 r32 / r256 checkpoints |
+| `zimage-control` | `zimage_control_dir` | Union 2.1 33-channel ControlNet weight |
+| `preprocess` | `preprocess_dir` | YOLOX-L / DWPose ONNX, depth and contour assets |
+
+URLs follow WanGP's `build_hf_url(repo_id, *parts)` form:
+`https://huggingface.co/<repo>/resolve/main/<path>`, with repos
+`DeepBeepMeep/Qwen_image_2`, `DeepBeepMeep/Ideogram4`,
+`DeepBeepMeep/Z-Image` and `DeepBeepMeep/Wan2.1`. WanGP does not pin a commit,
+so revision follows `main`. Sizes were checked against the Hugging Face API
+(32/32 present, 32/32 size matches).
+
+**Endpoints**
+
+```jsonc
+// GET /api/models -> snake_case snapshot (excerpt)
+{
+  "config_path": "D:/.../QwenZImage.config.json",
+  "config_platform": "windows",
+  "config_target_path": "D:/.../QwenZImage.config.json",
+  "config_exists": true,
+  "config_overrides": [],
+  "mirror": null,              // omitted entirely when QZI_HF_MIRROR is unset
+  "default_variant": "int8",
+  "paused": false,
+  "queue_length": 0,
+  "total_bytes": 49710732331,
+  "installed_bytes": 46316754706,
+  "groups": [
+    {
+      "id": "qwen21", "config_key": "qwen21_dir",
+      "resolved_path": "D:/.../qwen21", "path_source": "config file / CLI override",
+      "files": [
+        {
+          "id": "qwen21.vae_config", "status": "missing",
+          "target_path": "D:/.../qwen21/vae_config.json",
+          "downloaded_bytes": 0, "total_bytes": 2079, "resume_from": 0,
+          "variants": [
+            {
+              "id": "default", "label": "JSON · 2 KB",
+              "url": "https://huggingface.co/DeepBeepMeep/Qwen_image_2/resolve/main/qwen_image_21/vae_config.json",
+              "source_url": "...same canonical WanGP URL...",
+              "size": 2079, "target_path": "D:/.../qwen21/vae_config.json",
+              "curl_command": "...\ncurl -L -C - --retry 3 --fail -o \"...\" \"...\"",
+              "recommended": true
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`status` is one of `missing` / `installed` / `downloading` / `paused` / `done` /
+`failed` / `queued`; `installed_variant` and `installed_bytes` are detected
+from the target file (including WanGP's upstream alias names). A `.qzi-part`
+file from an interrupted run is reported as `resume_from`.
+
+```bash
+# Queue: ids only. Omit "files" to expand to all missing required files.
+curl -sS -X POST http://127.0.0.1:7860/api/models/download \
+  -H 'Content-Type: application/json' \
+  -d '{"files":["qwen21.vae_config"],"variant":"int8","force":false,"all":false}'
+# -> 202 {"queued":1,"skipped":[],"requested":[...],"paused":false,"queue_length":1}
+
+curl -sS -X POST http://127.0.0.1:7860/api/models/control \
+  -H 'Content-Type: application/json' -d '{"action":"pause"}'
+# actions: pause | resume | reset (needs "file") | reset-all
+```
+
+**Resumable transfer.** Each job writes `<target>.qzi-part` and stores the
+server ETag in `<target>.qzi-etag`. On resume the downloader sends
+`Range: bytes=<part length>-` plus `If-Range: <etag>`; a `206` with
+`Content-Range` determines the total, a `200` (server ignored Range) restarts
+the file from zero, and a mismatched / truncated body is rejected instead of
+being silently appended. Completion validates the length and uses
+`File.Move(part, target, overwrite: true)`. `pause` / `resume` / `reset` only
+touch these temporary files — finished weights are never deleted.
+`QZI_HF_MIRROR` rewrites only the fixed `https://huggingface.co/` prefix;
+`source_url` in the snapshot and the manual guide always keep the canonical
+WanGP address visible.
+
+**Manual download.** `GET /api/models/manual` returns a Markdown guide with,
+for every file, the exact `resolve/main` URL, the absolute destination, a
+copy/paste `curl -L -C - --retry 3 --fail -o ...` command (plus a `mkdir -p` /
+PowerShell `New-Item` line), the expected size, and a ready-to-paste config
+fragment. The Models panel can load, copy and download this file as `.md`.
+When a mirror is active, each entry shows both `WanGP source URL` and the
+effective mirror URL.
+
+**Config write-back.** `GET /api/models/config` is a **read-only preview** by
+default (`applied:false`, no file touched). Only
+`POST /api/models/config` with `{"apply":true}` writes: it merges the six
+model keys into the current platform section, preserves other platform
+sections, `_comment` / `_note` keys and other fields, creates
+`QwenZImage.config.json.bak.<yyyyMMdd-HHmmss>` (with an `-i` suffix on
+collision), and atomically replaces the file via `.qzi-tmp`. The response
+carries `backup_path`, `keys`, `merged_json`, `active_overrides` (any `QZI_*`
+environment variable that would override the new file values) and
+`restart_required: true` — the native engine reads its config once at
+`qzi_engine_create()`, so **restart the WebUI** after applying.
 
 ### Request envelope (`POST /api/jobs`)
 
@@ -595,6 +720,15 @@ do not close idle connections. `EventSource` reconnects automatically.
   `inpaint · mask` badge instead of a redundant `control` badge. The option is
   disabled (and an already-selected inpaint mode falls back to `zimage`) when
   `/api/health` reports `supports_inpaint: false`.
+- **Models panel** (full-width, below the job/output area): a live table of
+  every weight group with status, resolved target path, size, exact URL and a
+  resumable `curl` command. A global variant selector (default `int8`) plus a
+  per-file override, `Download required` / `Download everything`, and
+  Pause / Resume / Reset partials. Polling is 1.2 s while a transfer is active
+  and 12 s when idle. Collapsible details hold the manual download guide
+  (load / copy / download `.md`) and the config JSON (preview / copy / apply
+  with backup). When `QZI_HF_MIRROR` is set, each row also shows the canonical
+  WanGP source URL. See [Model weights](#model-weights-getpost-apimodels).
 - Health pill showing resident model / backend (`reference backend (noise)`
   vs `QwenZImageNative`), with `transport`, `config_path` and directories in
   the tooltip, plus an "Unload model" action.

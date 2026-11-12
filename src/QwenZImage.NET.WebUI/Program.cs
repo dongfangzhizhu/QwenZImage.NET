@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -5,6 +6,7 @@ using System.Threading.Channels;
 using Microsoft.AspNetCore.Http.Features;
 using QwenZImage.NET;
 using QwenZImage.NET.WebUI;
+using QwenZImage.NET.WebUI.ModelDownloads;
 using QwenZImage.NET.WebUI.Preprocessing;
 
 // `dotnet run` uses the project directory (where wwwroot lives); a published
@@ -215,6 +217,132 @@ app.MapPost("/api/preprocess", async (HttpContext context, WebUiRuntime rt) =>
     {
         if (acquired) preprocessGate.Release();
     }
+});
+
+// ------------------------------------------------------- model downloads
+
+// Weights are a host-layer concern: the core NuGet package and the C ABI keep
+// loading safetensors from disk exactly as before. Every URL comes from the
+// static WanGP-derived ModelManifest — the browser may only pick file ids and
+// a variant, never supply a URL or a destination path.
+
+app.MapGet("/api/models", (WebUiRuntime rt) => Json(rt.Models.Snapshot()));
+
+// A copy/paste-able Markdown guide: exact WanGP URLs, destination paths,
+// resumable curl commands and the config fragment. Also shown in the Models
+// panel so an operator can download by hand without using the downloader.
+app.MapGet("/api/models/manual", (WebUiRuntime rt) =>
+    Results.Content(rt.Models.BuildManualGuide(), "text/markdown", Encoding.UTF8));
+
+// Preview is the default: no file is written until the operator explicitly
+// POSTs {"apply":true}. The write merges only the six model keys into the
+// current platform section, keeps everything else and makes a backup first.
+app.MapGet("/api/models/config", (WebUiRuntime rt) =>
+    Json(ModelConfigWriter.Run(rt.Config, rt.Models, apply: false)));
+
+app.MapPost("/api/models/config", async (HttpContext context, WebUiRuntime rt) =>
+{
+    ModelConfigRequest? body;
+    try
+    {
+        body = await context.Request.ReadFromJsonAsync<ModelConfigRequest>(
+            WebUiJson.Options, context.RequestAborted);
+    }
+    catch (JsonException ex) { return BadRequest("invalid JSON body: " + ex.Message); }
+    if (body is null) return BadRequest("request body must be a JSON object");
+    if (!body.Apply) return Json(ModelConfigWriter.Run(rt.Config, rt.Models, apply: false));
+
+    try
+    {
+        ModelConfigApplyResult result = ModelConfigWriter.Run(rt.Config, rt.Models, apply: true);
+        app.Logger.LogInformation(
+            "Updated model config {ConfigPath} (backup: {Backup}); restart required",
+            result.ConfigPath, result.BackupPath ?? "(new file)");
+        return Json(result);
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
+                               InvalidDataException or JsonException)
+    {
+        app.Logger.LogError(ex, "Could not update the model config file");
+        return Json(new ErrorResponse("could not update config file", ex.Message),
+                    StatusCodes.Status500InternalServerError);
+    }
+});
+
+app.MapPost("/api/models/download", async (HttpContext context, WebUiRuntime rt) =>
+{
+    ModelDownloadRequest? body;
+    try
+    {
+        body = await context.Request.ReadFromJsonAsync<ModelDownloadRequest>(
+            WebUiJson.Options, context.RequestAborted);
+    }
+    catch (JsonException ex) { return BadRequest("invalid JSON body: " + ex.Message); }
+    if (body?.Files is { Count: > 512 }) return BadRequest("too many file ids (limit 512)");
+    if (body is null) return BadRequest("request body must be a JSON object");
+
+    IReadOnlyList<ModelDownloadJob> jobs;
+    IReadOnlyList<string> skipped;
+    try
+    {
+        (jobs, skipped) = rt.Models.CreateJobs(body.Files, body.Variant, body.Force, body.All);
+    }
+    catch (ArgumentException ex) { return BadRequest(ex.Message); }
+
+    int queued = rt.Downloads.Enqueue(jobs);
+    return Json(new
+    {
+        queued,
+        skipped,
+        requested = jobs.Select(j => j.FileId).ToArray(),
+        paused = rt.Downloads.Paused,
+        queue_length = rt.Downloads.QueueLength,
+        note = rt.Downloads.Paused ? "The download queue is paused; use resume to start it." : null
+    }, StatusCodes.Status202Accepted);
+});
+
+app.MapPost("/api/models/control", async (HttpContext context, WebUiRuntime rt) =>
+{
+    ModelControlRequest? body;
+    try
+    {
+        body = await context.Request.ReadFromJsonAsync<ModelControlRequest>(
+            WebUiJson.Options, context.RequestAborted);
+    }
+    catch (JsonException ex) { return BadRequest("invalid JSON body: " + ex.Message); }
+    if (body is null) return BadRequest("request body must be a JSON object");
+
+    string action = body.Action?.Trim().ToLowerInvariant() ?? "";
+    int reset = 0;
+    switch (action)
+    {
+        case "pause":
+            rt.Downloads.Pause();
+            break;
+        case "resume":
+            rt.Downloads.Resume();
+            break;
+        case "reset":
+            if (string.IsNullOrWhiteSpace(body.File))
+                return BadRequest("reset needs a file id (or use reset-all)");
+            try { rt.Models.Find(body.File); }
+            catch (ArgumentException ex) { return BadRequest(ex.Message); }
+            reset = rt.Downloads.Reset(body.File);
+            break;
+        case "reset-all":
+            reset = rt.Downloads.Reset(null);
+            break;
+        default:
+            return BadRequest($"unknown action '{body.Action}'. Use pause, resume, reset or reset-all.");
+    }
+    return Json(new
+    {
+        action,
+        reset,
+        paused = rt.Downloads.Paused,
+        queue_length = rt.Downloads.QueueLength,
+        note = "Only .qzi-part / .qzi-etag temporary files are removed; completed weights are untouched."
+    });
 });
 
 // ----------------------------------------------------------------- presets
@@ -504,6 +632,10 @@ app.Lifetime.ApplicationStarted.Register(() =>
     app.Logger.LogInformation("Config file: {ConfigPath}",
                               runtime.Config.ConfigPath ?? "(none - using defaults)");
     app.Logger.LogInformation("Model pack: {ModelDirectory}", runtime.Config.ModelDirectory);
+    app.Logger.LogInformation(
+        "Model downloads: GET /api/models · manual guide /api/models/manual · mirror {Mirror} · config target {Target}",
+        runtime.Models.Mirror ?? "(direct huggingface.co)",
+        ModelConfigWriter.TargetPath(runtime.Config));
     app.Logger.LogInformation("Transport: in-process P/Invoke into QwenZImageNative");
     app.Logger.LogInformation(
         "Control guide preprocessing: {Modes} (learned pose={Pose}, depth={Depth}, contour={Contour}; asset dir {Assets})",
