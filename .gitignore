@@ -58,3 +58,8 @@ src/QwenZImage.NET.WebUI/Properties/launchSettings.json
 
 # Local development plan / decision log - kept on disk, not published upstream
 PLAN.md
+
+# Local-only smoke test for the published NuGet package (not part of the repo)
+# It verifies the package via PackageReference and writes sample PNGs for
+# manual review; keeping it out of the repo avoids shipping a tools/ consumer.
+tools/VerifyNuGetPackage/

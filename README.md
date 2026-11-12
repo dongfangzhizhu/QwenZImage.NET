@@ -117,16 +117,6 @@ QwenZImage.NET.0.1.0.nupkg
 
 核心包**零运行期三方依赖**；WebUI、预处理 ONNX 资产与模型下载器都不在包内。native 库解析顺序：`QziClientOptions.NativeLibraryPath` / `QZI_NATIVE_LIBRARY` → 运行时的 `NATIVE_DLL_SEARCH_DIRECTORIES`（即 NuGet 的 `runtimes/<rid>/native/`）→ 程序集同目录及其上级 `artifacts/` → 系统默认探测。
 
-## 验证已发布的包
-
-`tools/VerifyNuGetPackage/` 是一个**只通过 `PackageReference` 引用 `QwenZImage.NET 0.1.0`** 的独立控制台程序，不引用仓库内任何项目，也不需要 GPU 或权重。它会校验程序集版本与公开类型、两个 RID 的 native 资产、真实 P/Invoke（ABI / health / 进度回调），以及生成结果是否为合法且按 seed 确定性的 PNG：
-
-```bash
-dotnet run --project tools/VerifyNuGetPackage -c Release
-```
-
-全部通过时退出码为 0，任一检查失败为 1。
-
 ## 从源码构建
 
 ```bash
