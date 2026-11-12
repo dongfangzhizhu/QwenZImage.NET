@@ -315,7 +315,7 @@ README.md / LICENSE / THIRD_PARTY_NOTICES.md / engine/LICENSE / docs/*.md
 2. **GitHub 仓库** → Settings → Secrets and variables → Actions → repository secret，名字必须**恰好是 `NUGET_USER`**，值 = **nuget.org 的 profile 用户名（不是邮箱，也不是 GitHub 用户名）**。secret 的**名字**不是用户名：2026-11-12 首次发布就是把 `wenlee` 填成了 secret 名 `WENLEE`，导致 `secrets.NUGET_USER` 为空。用户名本身是公开信息（profile 页可见），但 GitHub 无法读回 secret 值，配完请用一次 workflow 校验步骤确认非空。
    - 若 policy owner 选的是**组织**，`NuGet/login@v1` 的 `user` 按官方 action 的提示应为 **policy 创建者**的 nuget.org profile 名，而不是组织名；`user` 与 policy owner 不一致会直接 401。
 3. 本机已配置 git 推送凭据（或已登录 `gh`），且 GitHub 上目标仓库已创建、有推送权限。
-4. 确认 NuGet.org 上 `QwenZImage.NET` 这个 package ID 可用，policy owner 有权发布它（2026-11-12 实测 `https://api.nuget.org/v3-flatcontainer/qwenzimage.net/index.json` 返回 404，ID 未被占用）。
+4. 确认 NuGet.org 上 `QwenZImage.NET` 这个 package ID 可用、policy owner 有权发布它，且**待发版本号未被占用**（首次发布前 2026-11-12 实测 `https://api.nuget.org/v3-flatcontainer/qwenzimage.net/index.json` 返回 404，ID 未被占用；`0.1.0` 发布后该索引返回 `{"versions":["0.1.0"]}`，同一版本不可再推）。
 5. **CI 必须全绿**：`release.yml` 的 `publish` job 在 pack 之前执行 `dotnet test QwenZImage.NET.sln -c Release --no-build`，任一台 runner 上的测试失败都会让发布在 push 之前终止。阶段 22 之前 `add996d` 的 `CI` 在 Linux / Windows 各有失败用例，现已修复；打 tag 前先看 <https://github.com/dongfangzhizhu/QwenZImage.NET/actions> 里最新 `CI` run 的两个 `verify` job。
 
 > 官方文档：<https://learn.microsoft.com/nuget/nuget-org/trusted-publishing>（中文 `/zh-cn/nuget/nuget-org/trusted-publishing`）。policy 字段大小写不敏感。`NUGET_USER` 建议设为 **repository secret**；`publish` job 带 `environment: production`，若 `production` 环境里另设了同名 environment secret，它会**覆盖** repository secret，两者不一致会 401。改工作流的 `environment:` 或改 policy 的 Environment 时，必须同步另一侧。
@@ -343,6 +343,8 @@ git push origin v0.1.0
 
 发布触发后：<https://github.com/dongfangzhizhu/QwenZImage.NET/actions> 会出现 `Release to NuGet` run；成功后包在 <https://www.nuget.org/packages/QwenZImage.NET>，附带的 GitHub Release 在 <https://github.com/dongfangzhizhu/QwenZImage.NET/releases>。
 
+**`v0.1.0` 发布落地验证（首次发布已完成）**：tag run `43187809089` attempt 2 的 `NuGet login` / `Push to nuget.org` / `Create GitHub release` 全部 success，`CI` 在 `a455c66` 四个 job 全绿；GitHub Release `v0.1.0` 带 `.nupkg` / `.snupkg` 资产。nuget.org 包页 200、flatcontainer 索引 `{"versions":["0.1.0"]}`、registration 200、`.nupkg` blob 200（212,038 B，含 NuGet.org 追加的 `.signature.p7s`；本地打包为 198,953 B）。**端到端**：空 `NUGET_PACKAGES` 缓存 + `--source https://api.nuget.org/v3/index.json` 独立还原成功，最小程序反射加载 `QwenZImage.NET, Version=0.1.0.0`（77 个类型），`win-x64` / `linux-x64` 两个 native 资产都被复制到输出目录；已发布包内不含 WebUI / ONNX / Preprocessing 条目。**注意**：新 package ID 的 flatcontainer 索引 / CDN 有一段同步延迟——push 日志已 `Your package was pushed.` 且包页 200 时，索引可能仍短暂返回 `BlobNotFound`，不要误判为发布失败，更不要重复打 tag。
+
 > **修完配置不用重新打 tag**：只要 `Push to nuget.org` 被 skipped，该版本就还没发布（可用 `https://api.nuget.org/v3-flatcontainer/qwenzimage.net/index.json` 核对）。在 Actions 里对失败的 `Release to NuGet` run 点 **Re-run jobs** 即可——secret 与 nuget.org policy 都在 run 启动时重新读取，不需要删 tag、不需要改版本号。
 
 **失败排查**：
@@ -356,6 +358,7 @@ git push origin v0.1.0
 | `NuGet/login did not return a temporary API key` | `publish` job 缺 `id-token: write`，或一次 run 里调用了两次 `NuGet/login`（一个 OIDC token 只能换一个 key） |
 | push 成功但包没出现 / 版本没变 | `--skip-duplicate` 静默跳过已存在版本；换一个新 tag（如 `v0.1.1`），或用 `workflow_dispatch` 指定新 version |
 | `CI` 红 / `verify` job 失败 | 先修 CI：发布工作流跑的是同一套测试，CI 红必然阻塞发布 |
+| `Build and test` 偶发挂在 `QueueTests.WatchAsync_Streams_State_Transitions`（集合只有 `[Queued]`，找不到 `Done`） | 时序敏感用例，与发布配置无关：tag run `43187809089` attempt 1 出现过一次，同一提交的 `workflow_dispatch` run 与 attempt 2 均通过，直接 **Re-run failed jobs** 即可；若反复出现再加固订阅注册与枚举之间的同步，不要靠改版本号绕过 |
 
 发布前检查：
 
@@ -363,7 +366,7 @@ git push origin v0.1.0
 - [ ] README「当前状态」表与「路线与发布」段落已按 Trusted Publishing 更新，无 `alexhegit` 残留
 - [ ] NuGet.org Trusted Publishing policy 的 owner / repo / workflow file / environment 与 `dongfangzhizhu/QwenZImage.NET` + `release.yml` 精确一致
 - [x] GitHub repository secret `NUGET_USER` 已配置为 nuget.org profile 名（2026-11-12 已补建为 `wenlee`，run `43182886178` attempt 2 的第 10 步实测通过）；仓库内无 `secrets.NUGET_API_KEY` 依赖
-- [ ] nuget.org 上 Trusted Publishing policy 处于 active，且 owner = 创建者账号 / 四个 GitHub 字段精确匹配 / Scopes 允许发布新包（否则 `NuGet/login` 401，见排查表）
+- [x] nuget.org 上 Trusted Publishing policy 处于 active，且 owner = 创建者账号 / 四个 GitHub 字段精确匹配 / Scopes 允许发布新包（否则 `NuGet/login` 401，见排查表）——`v0.1.0` 实测通过：owner `wenlee`、owner/repo/workflow = `dongfangzhizhu` / `QwenZImage.NET` / `release.yml`、Environment `production`、Scopes 允许新包；首次成功发布后 policy 由 7 天部分激活转为永久 active
 - [ ] `release.yml` 的 `publish` job 具备 `id-token: write`，且只调用一次 `NuGet/login`（一个 OIDC token 只换一个 key）
 - [ ] `artifacts/` 下所有产物均被 `.gitignore` 忽略；待推送的 tree 只含源码、文档、配置、脚本与 CI 定义
 - [ ] `dotnet pack` / `dotnet test` 前确认 `artifacts/runtimes/win-x64/native` 与 `linux-x64/native` 是**参考后端**（本机约 123 KB DLL / 38 KB SO，而非 2.2 MB / 22 MB 的 CUDA flavour）。`scripts/build-native-cuda.bat` 会把 `win-x64` staging 覆盖成 CUDA 产物，此时托管测试会加载真后端、`IsReferenceBackend` 断言批量失败；用 `bash scripts/stage-native.sh`（不带 `QZI_STAGE_CUDA=1`）恢复即可
