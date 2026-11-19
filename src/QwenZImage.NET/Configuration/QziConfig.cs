@@ -62,6 +62,13 @@ public sealed record QziConfig
     public const string DeviceIdVariable = "QZI_DEVICE_ID";
 
     /// <summary>
+    /// Environment variable overriding <c>memory_profile</c>. Values:
+    /// auto / high / balanced / low / lowest (or 0..4). Published to the native
+    /// engine at create time so AUTO resolves against live device VRAM.
+    /// </summary>
+    public const string MemoryProfileVariable = "QZI_MEMORY_PROFILE";
+
+    /// <summary>
     /// Environment variable naming the optional ControlNet guide-preprocessor
     /// asset directory (WanGP ONNX models). Read by host applications such as
     /// the WebUI; the native engine ignores it.
@@ -72,7 +79,7 @@ public sealed record QziConfig
     {
         "qwen21_dir", "zimage_dir", "zimage_nunchaku_dir", "zimage_control_dir",
         "qwen21_lora_dir", "text_cache_dir", "device_id", "thread_count", "native_library",
-        "preprocess_dir"
+        "preprocess_dir", "memory_profile"
     };
 
     private static readonly HashSet<string> PlatformKeys = new(StringComparer.Ordinal)
@@ -103,6 +110,13 @@ public sealed record QziConfig
 
     /// <summary>CPU thread count; 0 selects the engine default.</summary>
     public int ThreadCount { get; init; }
+
+    /// <summary>
+    /// Low-VRAM memory profile: "auto" (default, picked from device VRAM),
+    /// "high", "balanced", "low" or "lowest". Passed to the native engine as
+    /// <c>QZI_MEMORY_PROFILE</c> at create time.
+    /// </summary>
+    public string? MemoryProfile { get; init; }
 
     /// <summary>Explicit path to the native backend library.</summary>
     public string? NativeLibraryPath { get; init; }
@@ -162,6 +176,7 @@ public sealed record QziConfig
             PreprocessDirectory = Expand(Str(values, "preprocess_dir", path)),
             DeviceId = Int(values, "device_id", path, -1),
             ThreadCount = Int(values, "thread_count", path, 0),
+            MemoryProfile = Str(values, "memory_profile", path),
             SourcePath = path
         };
 
@@ -209,6 +224,7 @@ public sealed record QziConfig
         ZImageControlDirectory = ZImageControlDirectory,
         DeviceId = DeviceId,
         ThreadCount = ThreadCount,
+        MemoryProfile = MemoryProfile,
         NativeLibraryPath = NativeLibraryPath,
         ConfigPath = SourcePath
     };
@@ -234,6 +250,7 @@ public sealed record QziConfig
             "preprocess_dir" => this with { PreprocessDirectory = expanded },
             "device_id" => this with { DeviceId = ParseInt(key, value, -1) },
             "thread_count" => this with { ThreadCount = ParseInt(key, value, 0) },
+            "memory_profile" => this with { MemoryProfile = value },
             _ => this
         };
     }
@@ -301,6 +318,7 @@ public sealed record QziConfig
         result = Env(result, ModelCacheVariable, c => c with { TextCacheDirectory = Expand(Environment.GetEnvironmentVariable(ModelCacheVariable)) });
         result = Env(result, NativeLibraryVariable, c => c with { NativeLibraryPath = Expand(Environment.GetEnvironmentVariable(NativeLibraryVariable)) });
         result = Env(result, PreprocessDirectoryVariable, c => c with { PreprocessDirectory = Expand(Environment.GetEnvironmentVariable(PreprocessDirectoryVariable)) });
+        result = Env(result, MemoryProfileVariable, c => c with { MemoryProfile = Environment.GetEnvironmentVariable(MemoryProfileVariable) });
         if (int.TryParse(Environment.GetEnvironmentVariable(DeviceIdVariable), out int device))
             result = result with { DeviceId = device };
         return result;

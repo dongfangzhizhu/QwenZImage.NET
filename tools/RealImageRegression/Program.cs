@@ -20,6 +20,10 @@ using QwenZImage.NET;
 //
 // Cases live in cases.json (copied next to the executable). Results are
 // written as one PNG per case plus report.md / report.json.
+//
+// Identity-reference cases need a user-supplied PNG (they are NOT part of the
+// default cases.json): copy identity_ref.png next to the working directory and
+// run with `--cases cases.identity.json`. Never commit a personal photo.
 
 Cli cli = Cli.Parse(args);
 if (cli.ShowHelp)
@@ -275,6 +279,9 @@ internal sealed class RegressionCase
     [JsonPropertyName("lora_scale")] public float? LoraScale { get; set; }
     [JsonPropertyName("checkpoint")] public string? Checkpoint { get; set; }
     [JsonPropertyName("compare_with")] public string? CompareWith { get; set; }
+    [JsonPropertyName("identity_refs")] public List<string>? IdentityRefs { get; set; }
+    [JsonPropertyName("identity_ref_weight")] public float? IdentityRefWeight { get; set; }
+    [JsonPropertyName("reference_encode_max_side")] public uint? ReferenceEncodeMaxSide { get; set; }
 
     public GenerationOptions ToOptions() => Model switch
     {
@@ -285,6 +292,17 @@ internal sealed class RegressionCase
                 ? QwenImageTier.Base : QwenImageTier.Turbo,
             Steps = Steps, Guidance = Guidance, NegativePrompt = NegativePrompt,
             Lora = Lora, LoraScale = LoraScale
+        },
+        "qwen21-identity" => new Qwen21IdentityRefOptions
+        {
+            Prompt = Prompt, Width = Width, Height = Height, Seed = Seed,
+            Tier = string.Equals(Tier, "base", StringComparison.OrdinalIgnoreCase)
+                ? QwenImageTier.Base : QwenImageTier.Turbo,
+            Steps = Steps, Guidance = Guidance, NegativePrompt = NegativePrompt,
+            Lora = Lora, LoraScale = LoraScale,
+            References = (IdentityRefs ?? []).Select(QziRasterImage.FromPngFile).ToList(),
+            IdentityRefWeight = IdentityRefWeight,
+            ReferenceEncodeMaxSide = ReferenceEncodeMaxSide
         },
         "zimage" => new ZImageOptions
         {

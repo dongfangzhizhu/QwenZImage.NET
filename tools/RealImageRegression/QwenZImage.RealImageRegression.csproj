@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <None Update="cases.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="cases.identity.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

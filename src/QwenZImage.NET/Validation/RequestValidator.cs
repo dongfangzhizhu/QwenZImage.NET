@@ -40,6 +40,9 @@ public static class RequestValidator
             // ordinary edit options, so it must come first.
             case Qwen21EditExOptions advanced: Validate(advanced); break;
             case Qwen21EditOptions edit: Validate(edit); break;
+            // Identity reference derives from the ordinary qwen21 options, so
+            // it must be matched before the base record or its rules are skipped.
+            case Qwen21IdentityRefOptions identity: Validate(identity); break;
             case QwenImageOptions qwen: Validate(qwen); break;
             // Inpaint derives from the ControlNet options, so it must be
             // matched first or its mask rules would be skipped.
@@ -200,6 +203,61 @@ public static class RequestValidator
                     "LanPaint forces masking strength to 1.0; leave MaskingStrength unset.",
                     nameof(options));
         }
+
+        if (options.Flags != 0)
+            throw new ArgumentException("Flags is reserved and must be 0.", nameof(options));
+    }
+
+    /// <summary>
+    /// Validates a Qwen-Image 2.1 identity-reference request. Mirrors
+    /// <c>qzi_validate_qwen21_identity_ref()</c>: the ordinary qwen21 rules
+    /// apply to the embedded base request, then the reference array, the
+    /// relative-size weight and the encode cap are checked. This is a
+    /// generation (not an edit), so there is no mask / strength coupling.
+    /// </summary>
+    public static void Validate(Qwen21IdentityRefOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        Validate((QwenImageOptions)options);
+
+        IReadOnlyList<QziRasterImage> references = options.References;
+        if (references is null || references.Count == 0 ||
+            references.Count > Qwen21IdentityRef.MaxReferences)
+            throw new ArgumentException(
+                $"References must contain 1..{Qwen21IdentityRef.MaxReferences} images.",
+                nameof(options));
+
+        foreach (QziRasterImage reference in references)
+        {
+            if (reference is null)
+                throw new ArgumentException("A reference image is null.", nameof(options));
+            if (reference.Channels != 3)
+                throw new ArgumentException(
+                    "Every reference must be a 3-channel planar RGB image.", nameof(options));
+            if (reference.Width <= 0 || reference.Height <= 0 ||
+                reference.Width > QziRasterImage.MaxSide ||
+                reference.Height > QziRasterImage.MaxSide ||
+                (long)reference.Width * reference.Height > QziRasterImage.MaxPixels)
+                throw new ArgumentException(
+                    $"Reference dimensions must be 1..{QziRasterImage.MaxSide} per side and " +
+                    "at most 2048*2048 total pixels.", nameof(options));
+        }
+
+        // 0 is the C ABI sentinel for "engine default", just like a null
+        // nullable property; qzi.c normalises both to the same effective value.
+        if (options.IdentityRefWeight is { } weight &&
+            weight != 0.0f &&
+            (!float.IsFinite(weight) || weight < 20.0f || weight > 100.0f))
+            throw new ArgumentException(
+                "IdentityRefWeight must be finite and in 20..100 " +
+                "(or null / 0 for 70).",
+                nameof(options));
+
+        if (options.ReferenceEncodeMaxSide is { } cap && cap != 0u &&
+            (cap < 16u || cap > 2048u || cap % 16u != 0u))
+            throw new ArgumentException(
+                "ReferenceEncodeMaxSide must be a multiple of 16 in 16..2048 " +
+                "(or null / 0 for 768).", nameof(options));
 
         if (options.Flags != 0)
             throw new ArgumentException("Flags is reserved and must be 0.", nameof(options));

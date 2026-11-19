@@ -46,13 +46,15 @@ Console.WriteLine(client.GetHealth().IsReferenceBackend
 | Qwen-Image 2.1 文生图（turbo / base / LoRA） | `GenerateQwen21(Async)` · `QwenImageOptions` |
 | 图像编辑（参考图 / mask / strength） | `GenerateQwen21Edit(Async)` · `Qwen21EditOptions` |
 | 高级编辑（外扩 / LanPaint / RGBA） | `GenerateQwen21EditEx(Async)` · `Qwen21EditExOptions` |
+| 身份参考（Wan2GP `image_refs`；1–10 张图 + 权重 + 编码上限，真实 CUDA condition-prefix DiT） | `GenerateQwen21IdentityRef(Async)` · `Qwen21IdentityRefOptions` |
 | Z-Image Turbo（bf16 / Nunchaku int4） | `GenerateZImage(Async)` · `ZImageOptions` |
 | Z-Image ControlNet Union 2.1 | `GenerateZImageControl(Async)` · `ZImageControlOptions` |
 | Z-Image 遮罩重绘 | `GenerateZImageInpaint(Async)` · `ZImageInpaintOptions` |
+| 低显存 / 内存 profile（WanGP mmgp 风格；设备显存上报 + 分配器/编码预算） | `SetMemoryProfile` / `GetMemoryPlan` · `QziMemoryProfile` |
 | 串行队列 / 取消 / 重试 / 进度事件 | `QziGenerationQueue` |
 | 零拷贝直写流 | `WriteTo(Async)` |
 
-四个增量能力都是 ABI v1 的可选导出，用 `client.SupportsImageEditing` / `SupportsControlNet` / `SupportsAdvancedEditing` / `SupportsInpaint` 探测（inpaint 前置依赖 ControlNet）。核心库按 **raw raster** 语义消费控制图，不做姿态 / 边缘 / 深度估计；WebUI 会把上传的普通照片预处理成 guide。
+六个增量能力都是 ABI v1 的可选导出，用 `client.SupportsImageEditing` / `SupportsControlNet` / `SupportsAdvancedEditing` / `SupportsInpaint` / `SupportsIdentityReference` / `SupportsLowVram` 探测（inpaint 前置依赖 ControlNet）。身份参考在真实 CUDA 后端从纯噪声起步，用 VAE 参考 latent 作为 condition prefix，可同时锁脸与大改服装；文本塔仍是 text-only，未移植 Qwen3-VL 视觉 embedding。低显存 profile 让同一份 7B 权重在 8 GiB 级显卡上也能通过收紧分配器释放阈值（24 GiB → 1 GiB / 256 MiB）与参考图编码上限（768 → 512 / 384 px）运行，`auto` 按设备总显存自动选择；WebUI 顶栏提供 `VRAM: auto/high/balanced/low/lowest` 下拉。核心库按 **raw raster** 语义消费控制图，不做姿态 / 边缘 / 深度估计；WebUI 会把上传的普通照片预处理成 guide。
 
 一个 engine 同时只服务一个请求，并发会返回 `QZI_ERR_BUSY`；多调用方请用 `QziGenerationQueue` 串行分发，它提供 `Queued / Running / Done / Error / Cancelled` 状态、`WatchAsync()` 事件流、取消与重试。
 
@@ -64,6 +66,7 @@ Console.WriteLine(client.GetHealth().IsReferenceBackend
 {
   "device_id": -1,
   "thread_count": 0,
+  "memory_profile": "auto",
   "qwen21_dir": "/models/qwen21",
   "qwen21_lora_dir": "/models/qwen21/loras",
   "zimage_dir": "/models/zimage",
@@ -74,7 +77,7 @@ Console.WriteLine(client.GetHealth().IsReferenceBackend
 }
 ```
 
-查找顺序：`QZI_CONFIG` / `--config` → 程序目录 → 工作目录 → 二者向上最多 8 级 → `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量（`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_ZIMAGE_CONTROL_DIR`、`QZI_MODEL_CACHE`、`QZI_DEVICE_ID`）优先于文件，代码里显式传入的 `QziClientOptions` 优先于环境变量。每个 engine 在创建时快照自己的配置，多实例互不串扰。
+查找顺序：`QZI_CONFIG` / `--config` → 程序目录 → 工作目录 → 二者向上最多 8 级 → `~/.config/QwenZImage/config.json`。`QZI_*` 环境变量（`QZI_QWEN21_DIR`、`QZI_ZIMAGE_DIR`、`QZI_QWEN21_LORA_DIR`、`QZI_ZIMAGE_NUNCHAKU_DIR`、`QZI_ZIMAGE_CONTROL_DIR`、`QZI_MODEL_CACHE`、`QZI_DEVICE_ID`、`QZI_MEMORY_PROFILE`）优先于文件，代码里显式传入的 `QziClientOptions` 优先于环境变量。每个 engine 在创建时快照自己的配置，多实例互不串扰。
 
 ## 模型权重
 

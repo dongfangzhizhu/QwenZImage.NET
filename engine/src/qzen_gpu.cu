@@ -462,7 +462,19 @@ qzen_gpu *qzen_gpu_create(const char *shader_source_path, char *error,
         cudaMemPool_t pool = NULL;
         if (cudaDeviceGetDefaultMemPool(&pool, gpu->device) == cudaSuccess &&
             pool) {
+            /* Default 24 GiB keeps freed blocks pooled for the loader's repeated
+             * shapes. A low-VRAM profile publishes QZEN_GPU_POOL_RELEASE_MIB
+             * (in MiB) so blocks are returned to the driver instead of being
+             * hoarded, which is what lets a small card survive a tier or VAE
+             * switch. Invalid / 0 values fall back to the historical default. */
             uint64_t threshold = (uint64_t)24 << 30;
+            const char *release = getenv("QZEN_GPU_POOL_RELEASE_MIB");
+            if (release && *release) {
+                char *end = NULL;
+                unsigned long long mib = strtoull(release, &end, 10);
+                if (end && *end == '\0' && mib > 0 && mib <= 1024ULL * 1024ULL)
+                    threshold = (uint64_t)mib << 20;
+            }
             cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
                                     &threshold);
             gpu->pool_alloc = 1;
@@ -12853,6 +12865,76 @@ int qzen_gpu_prefix_causal_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
         prefix_rows, heads, head_dim, scale);
     gpu->stats.direct_dispatches++;
     return qzen_cuda_check(gpu, cudaGetLastError(), "qzen_prefix_causal_bf16");
+}
+
+/* Online-softmax attention for prefix rows with a per-row key limit.
+ * No score scratch: each thread keeps the running max / sum / accumulator in
+ * registers, so arbitrarily long reference prefixes are supported. */
+__global__ static void qzen_prefix_limited_bf16_kernel(
+    const uint16_t *query, const uint16_t *key, const uint16_t *value,
+    const uint32_t *limits, uint16_t *output, uint32_t sequence,
+    uint32_t limit_rows, uint32_t heads, uint32_t head_dim, float scale) {
+    uint32_t row = (uint32_t)blockIdx.x;
+    uint32_t head = (uint32_t)blockIdx.y;
+    if (row >= limit_rows || head >= heads) return;
+    uint32_t keys = limits[row];
+    if (keys > sequence) keys = sequence;
+    if (!keys) return;
+    size_t qbase = ((size_t)row * heads + head) * head_dim;
+    float q[128];
+    for (uint32_t d = 0; d < head_dim; d++)
+        q[d] = qzen_bf16_bits_to_f32(query[qbase + d]) * scale;
+    float maximum = -INFINITY;
+    float total = 0.0f;
+    float accumulator[128];
+    for (uint32_t d = 0; d < head_dim; d++) accumulator[d] = 0.0f;
+    for (uint32_t j = 0; j < keys; j++) {
+        size_t kbase = ((size_t)j * heads + head) * head_dim;
+        float score = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++)
+            score += q[d] * qzen_bf16_bits_to_f32(key[kbase + d]);
+        float factor;
+        if (score > maximum) {
+            factor = __expf(maximum - score);
+            maximum = score;
+            total *= factor;
+            for (uint32_t d = 0; d < head_dim; d++) accumulator[d] *= factor;
+        } else {
+            factor = __expf(score - maximum);
+        }
+        total += factor;
+        for (uint32_t d = 0; d < head_dim; d++)
+            accumulator[d] += factor * qzen_bf16_bits_to_f32(value[kbase + d]);
+    }
+    float inverse = 1.0f / total;
+    for (uint32_t d = 0; d < head_dim; d++)
+        output[qbase + d] = qzen_f32_to_bf16_bits(accumulator[d] * inverse);
+}
+
+int qzen_gpu_prefix_limited_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
+                                const qzen_gpu_tensor *query,
+                                const qzen_gpu_tensor *key,
+                                const qzen_gpu_tensor *value,
+                                const qzen_gpu_tensor *row_limits,
+                                uint32_t sequence, uint32_t limit_rows,
+                                uint32_t heads, uint32_t head_dim, float scale) {
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!gpu || !output || !query || !key || !value || !row_limits ||
+        output->dtype != QZEN_GPU_BF16 || query->dtype != QZEN_GPU_BF16 ||
+        key->dtype != QZEN_GPU_BF16 || value->dtype != QZEN_GPU_BF16 ||
+        row_limits->dtype != QZEN_GPU_U32 ||
+        output->elements < count || query->elements < count ||
+        key->elements < count || value->elements < count ||
+        row_limits->elements < sequence || !sequence || !limit_rows ||
+        limit_rows > sequence || !heads || !head_dim || head_dim > 128)
+        return qzen_gpu_fail(gpu, "invalid prefix-limited attention request");
+    dim3 blocks(limit_rows, heads, 1);
+    qzen_prefix_limited_bf16_kernel<<<blocks, 1, 0, gpu->stream>>>(
+        (const uint16_t *)query->device, (const uint16_t *)key->device,
+        (const uint16_t *)value->device, (const uint32_t *)row_limits->device,
+        (uint16_t *)output->device, sequence, limit_rows, heads, head_dim, scale);
+    gpu->stats.direct_dispatches++;
+    return qzen_cuda_check(gpu, cudaGetLastError(), "qzen_gpu_prefix_limited_bf16");
 }
 
 } /* extern "C" */

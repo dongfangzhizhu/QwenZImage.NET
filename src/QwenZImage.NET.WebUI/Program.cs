@@ -95,6 +95,12 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
     bool inpaint = false;
     try { inpaint = rt.Engine?.SupportsInpaint == true; }
     catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe inpaint capability"); }
+    bool identityReference = false;
+    try { identityReference = rt.Engine?.SupportsIdentityReference == true; }
+    catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe identity-reference capability"); }
+    bool lowVram = false;
+    try { lowVram = rt.Engine?.SupportsLowVram == true; }
+    catch (Exception ex) { app.Logger.LogDebug(ex, "Could not probe low-VRAM capability"); }
 
     if (ok)
     {
@@ -113,7 +119,10 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
                 served = h.Served,
                 rejected = h.Rejected,
                 uptime_s = h.UptimeSeconds,
-                reference_backend = h.IsReferenceBackend
+                reference_backend = h.IsReferenceBackend,
+                memory_profile = h.MemoryProfile,
+                pool_release_mib = h.PoolReleaseMib,
+                reference_encode_cap = h.ReferenceEncodeCap
             };
         }
         catch (Exception ex)
@@ -138,6 +147,8 @@ app.MapGet("/api/health", (WebUiRuntime rt) =>
         supports_controlnet = controlnet,
         supports_advanced_editing = advancedEditing,
         supports_inpaint = inpaint,
+        supports_identity_reference = identityReference,
+        supports_low_vram = lowVram,
         preprocessing = rt.Preprocessor.Describe(),
         uptime_s = (DateTimeOffset.UtcNow - rt.StartedAt).TotalSeconds,
         engine
@@ -390,7 +401,8 @@ app.MapPost("/api/jobs", async (HttpContext context, WebUiRuntime rt) =>
             rt.Engine?.SupportsImageEditing == true,
             rt.Engine?.SupportsControlNet == true,
             rt.Engine?.SupportsAdvancedEditing == true,
-            rt.Engine?.SupportsInpaint == true);
+            rt.Engine?.SupportsInpaint == true,
+            rt.Engine?.SupportsIdentityReference == true);
         if (capabilityError is not null) return BadRequest(capabilityError);
         job = rt.Queue.Submit(options);
     }
@@ -467,6 +479,50 @@ IResult UnloadEngine(WebUiRuntime rt)
 
 app.MapGet("/api/unload", (WebUiRuntime rt) => UnloadEngine(rt));
 app.MapPost("/api/unload", (WebUiRuntime rt) => UnloadEngine(rt));
+
+// Low-VRAM / memory profile control plane. Cheap and synchronous: no model
+// load, no job, no served counter. The selector is only offered when the loaded
+// native library advertises QZI_FEATURE_LOW_VRAM.
+app.MapPost("/api/memory-profile", async (HttpContext context, WebUiRuntime rt) =>
+{
+    if (rt.Engine is null) return Unavailable(rt);
+    if (!rt.Engine.SupportsLowVram)
+        return Json(new ErrorResponse("low-VRAM profiles are not supported by this native library"),
+                    StatusCodes.Status400BadRequest);
+    MemoryProfileRequest? body;
+    try
+    {
+        body = await context.Request.ReadFromJsonAsync<MemoryProfileRequest>(
+            WebUiJson.Options, context.RequestAborted);
+    }
+    catch (JsonException ex)
+    {
+        return Json(new ErrorResponse("invalid JSON", ex.Message),
+                    StatusCodes.Status400BadRequest);
+    }
+    if (body is null || !Enum.TryParse<QziMemoryProfile>(body.Profile, true, out QziMemoryProfile profile) ||
+        !Enum.IsDefined(profile))
+        return Json(new ErrorResponse("profile must be auto, high, balanced, low or lowest"),
+                    StatusCodes.Status400BadRequest);
+    try
+    {
+        rt.Engine.SetMemoryProfile(profile);
+        QziMemoryPlan plan = rt.Engine.GetMemoryPlan();
+        return Json(new
+        {
+            profile = plan.Profile.ToString().ToLowerInvariant(),
+            total_vram_mib = plan.TotalVramMib,
+            free_vram_mib = plan.FreeVramMib,
+            pool_release_mib = plan.PoolReleaseMib,
+            reference_encode_cap = plan.ReferenceEncodeCap
+        });
+    }
+    catch (Exception ex)
+    {
+        return Json(new ErrorResponse("memory profile change failed", ex.Message),
+                    StatusCodes.Status400BadRequest);
+    }
+});
 
 // ----------------------------------------------------------------- outputs
 

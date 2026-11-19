@@ -34,6 +34,15 @@ public static class RequestMapper
         if (editAlias) model = "qwen21";
         bool wantsEdit = editAlias || !string.IsNullOrWhiteSpace(request.ReferenceImage);
 
+        // The fifth additive ABI v1 increment: identity references are
+        // CONDITIONS, not an img2img start point. An explicit model alias or a
+        // non-empty identity_refs array selects the dedicated entry point.
+        bool identityAlias = model is "qwen21-identity" or "qwen21-identity-ref" or
+            "qwen21-identity-refs" or "identity-ref" or "qwen-image-identity";
+        if (identityAlias) model = "qwen21";
+        bool hasIdentityRefs = request.IdentityRefs is { Count: > 0 };
+        bool wantsIdentity = identityAlias || hasIdentityRefs;
+
         // Z-Image Turbo Fun ControlNet Union is the Z-Image counterpart of the
         // edit mode: an explicit "zimage-control" model, or a plain zimage
         // request that simply carries a control_image. Z-Image Union 2.x inpaint
@@ -55,6 +64,26 @@ public static class RequestMapper
         if (wantsEdit && (wantsControl || wantsInpaint))
             throw new ArgumentException(
                 "Image editing and Z-Image ControlNet are mutually exclusive features.");
+        if (wantsIdentity && wantsEdit)
+            throw new ArgumentException(
+                "identity_refs and reference_image are mutually exclusive: identity_refs " +
+                "injects identity conditions from noise, while reference_image is an " +
+                "img2img starting point. Use one mode, not both.");
+        if (wantsIdentity && (wantsControl || wantsInpaint))
+            throw new ArgumentException(
+                "Identity references and Z-Image ControlNet / inpaint are mutually " +
+                "exclusive features.");
+        if (wantsIdentity && model is not ("qwen21" or "qwen" or "qwen-image"))
+            throw new ArgumentException(
+                "Identity references are a Qwen-Image 2.1 feature; use model " +
+                "'qwen21-identity'.");
+        if (identityAlias && !hasIdentityRefs)
+            throw new ArgumentException(
+                "identity_refs (1..10 PNG images) is required for model 'qwen21-identity'.");
+        if (!wantsIdentity && (request.IdentityRefWeight is not null ||
+                               request.ReferenceEncodeMaxSide is not null))
+            throw new ArgumentException(
+                "identity_ref_weight / reference_encode_max_side require identity_refs.");
         if (wantsEdit && model is not ("qwen21" or "qwen" or "qwen-image"))
             throw new ArgumentException(
                 "Image editing is a Qwen-Image 2.1 feature; use model 'qwen21-edit'.");
@@ -72,7 +101,8 @@ public static class RequestMapper
         GenerationOptions options = model switch
         {
             "qwen21" or "qwen" or "qwen-image" =>
-                wantsEdit ? MapQwen21Edit(request) : MapQwen21(request),
+                wantsIdentity ? MapQwen21IdentityRef(request)
+                : wantsEdit ? MapQwen21Edit(request) : MapQwen21(request),
             "zimage" or "z-image" or "z_image" =>
                 wantsInpaint ? MapZImageInpaint(request)
                 : wantsControl ? MapZImageControl(request)
@@ -109,6 +139,64 @@ public static class RequestMapper
             Lora = NullIfBlank(request.Lora),
             LoraScale = request.LoraScale
         };
+    }
+
+    /// <summary>
+    /// Decodes identity_refs into planar RGB rasters. Each entry may be a PNG
+    /// data URL, plain base64, or a local PNG path (Wan2GP-style absolute
+    /// paths); the local-path form keeps scripted callers from having to
+    /// base64-encode every reference by hand.
+    /// </summary>
+    private static Qwen21IdentityRefOptions MapQwen21IdentityRef(GenerateRequest request)
+    {
+        List<string> sources = request.IdentityRefs!;
+        if (sources.Count is < 1 or > Qwen21IdentityRef.MaxReferences)
+            throw new ArgumentException(
+                $"identity_refs must contain 1..{Qwen21IdentityRef.MaxReferences} images; " +
+                $"got {sources.Count}.");
+
+        List<QziRasterImage> references = new(sources.Count);
+        foreach (string source in sources)
+        {
+            if (string.IsNullOrWhiteSpace(source))
+                throw new ArgumentException("identity_refs contains an empty entry.");
+            references.Add(DecodeReference(source.Trim()));
+        }
+
+        QwenImageOptions common = MapQwen21(request);
+        return new Qwen21IdentityRefOptions
+        {
+            Prompt = common.Prompt,
+            Width = common.Width,
+            Height = common.Height,
+            Seed = common.Seed,
+            Tier = common.Tier,
+            Steps = common.Steps,
+            Guidance = common.Guidance,
+            NegativePrompt = common.NegativePrompt,
+            Lora = common.Lora,
+            LoraScale = common.LoraScale,
+            References = references,
+            IdentityRefWeight = request.IdentityRefWeight,
+            ReferenceEncodeMaxSide = request.ReferenceEncodeMaxSide,
+            Flags = 0
+        };
+    }
+
+    private static QziRasterImage DecodeReference(string source)
+    {
+        // Data URLs and standard PNG base64 both start with the same PNG
+        // signature bytes ("iVBORw0KGgo"); everything else is treated as a
+        // filesystem path so a missing file produces a clear FileNotFound.
+        if (source.StartsWith("data:", StringComparison.OrdinalIgnoreCase) ||
+            source.StartsWith("iVBORw0KGgo", StringComparison.Ordinal))
+            return QziRasterImage.FromPngBase64(source);
+        if (File.Exists(source) || Path.IsPathRooted(source) ||
+            source.Contains(Path.DirectorySeparatorChar) ||
+            source.Contains(Path.AltDirectorySeparatorChar) ||
+            source.Contains('\\'))
+            return QziRasterImage.FromPngFile(source);
+        return QziRasterImage.FromPngBase64(source);
     }
 
     /// <summary>

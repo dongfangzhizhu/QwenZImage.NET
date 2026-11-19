@@ -1,0 +1,28 @@
+[
+  {
+    "id": "qwen21-identity-512",
+    "model": "qwen21-identity",
+    "prompt": "the same person, wearing a modern short jacket and round sunglasses, street fashion, full body, front view, cinematic light, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "tier": "turbo",
+    "identity_refs": [
+      "identity_ref.png"
+    ],
+    "identity_ref_weight": 70
+  },
+  {
+    "id": "qwen21-identity-wardrobe-512",
+    "model": "qwen21-identity",
+    "prompt": "the same person, wearing a bright red leather biker jacket over a white t-shirt, modern streetwear, three-quarter side view, looking slightly to the left, outdoor city street, sharp detail",
+    "width": 512,
+    "height": 512,
+    "seed": 42,
+    "tier": "turbo",
+    "identity_refs": [
+      "identity_ref.png"
+    ],
+    "identity_ref_weight": 50
+  }
+]

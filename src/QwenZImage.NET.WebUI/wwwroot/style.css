@@ -162,6 +162,14 @@ input[type="file"] { width: 100%; font-size: 12px; color: var(--muted); }
 .pill-bad { color: var(--danger); background: var(--danger-soft); border-color: transparent; }
 .pill-wait { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
 
+/* Low-VRAM memory-profile selector in the header. */
+.mem-profile {
+  padding: 4px 8px; border-radius: 8px; font-size: 11.5px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--panel-soft); color: var(--text);
+  cursor: pointer;
+}
+.mem-profile[hidden] { display: none; }
+
 .table-wrap { overflow-x: auto; }
 .job-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .job-table th {
@@ -306,6 +314,19 @@ input[type="file"] { width: 100%; font-size: 12px; color: var(--muted); }
   padding: 12px; font-size: 11px; line-height: 1.5; margin: 8px 0 0;
 }
 .model-command { max-height: 110px; margin: 4px 0 6px; padding: 8px 10px; font-size: 10.5px; }
+
+.identity-thumbs {
+  display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px;
+}
+.identity-thumb { position: relative; width: 88px; height: 88px; }
+.identity-thumb img {
+  width: 100%; height: 100%; object-fit: cover;
+  border: 1px solid var(--border); border-radius: 7px;
+}
+.identity-thumb button {
+  position: absolute; top: -6px; right: -6px; padding: 0 6px;
+  line-height: 18px; border-radius: 50%;
+}
 
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; padding: 14px; }

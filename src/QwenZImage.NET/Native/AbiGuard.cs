@@ -18,6 +18,10 @@ internal static unsafe class AbiGuard
     private static int _advState;
     // 0 = not probed, 1 = no Z-Image inpainting, 2 = inpainting verified.
     private static int _inpaintState;
+    // 0 = not probed, 1 = no identity reference, 2 = identity reference verified.
+    private static int _identityRefState;
+    // 0 = not probed, 1 = no low-VRAM profile, 2 = low-VRAM profile verified.
+    private static int _lowVramState;
 
     internal static void Verify()
     {
@@ -205,6 +209,81 @@ internal static unsafe class AbiGuard
 
         nuint nativeSize = ((delegate* unmanaged<nuint>)layout)();
         Check("qzi_zimage_inpaint_request", nativeSize, sizeof(QziZImageInpaintRequest));
+        return true;
+    }
+
+    /// <summary>
+    /// True when the loaded library implements the fifth additive ABI v1
+    /// increment: Qwen-Image 2.1 identity reference (WanGP image_refs / "I").
+    /// The request embeds only the ordinary qwen21 request, so unlike advanced
+    /// editing / inpainting it has NO prerequisite on another optional feature.
+    /// Export discovery plus a sizeof check is the only safe probe.
+    /// </summary>
+    internal static bool Qwen21IdentityRefSupported
+    {
+        get
+        {
+            int state = Volatile.Read(ref _identityRefState);
+            if (state != 0) return state == 2;
+            Verify();
+            bool supported = ProbeIdentityRefFeatures();
+            Volatile.Write(ref _identityRefState, supported ? 2 : 1);
+            return supported;
+        }
+    }
+
+    private static bool ProbeIdentityRefFeatures()
+    {
+        IntPtr handle = NativeLibraryLoader.Handle;
+        if (handle == IntPtr.Zero) return false;
+        if (!NativeLibrary.TryGetExport(handle, "qzi_abi_features", out IntPtr features) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_qwen21_identity_ref_layout", out IntPtr layout) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_generate_qwen21_identity_ref", out _))
+            return false;
+
+        uint bits = ((delegate* unmanaged<uint>)features)();
+        if ((bits & NativeMethods.FeatureQwen21IdentityRef) == 0) return false;
+
+        nuint nativeSize = ((delegate* unmanaged<nuint>)layout)();
+        Check("qzi_qwen21_identity_ref_request", nativeSize,
+              sizeof(QziQwen21IdentityRefRequest));
+        return true;
+    }
+
+    /// <summary>
+    /// True when the loaded library implements the sixth additive ABI v1
+    /// increment: low-VRAM / memory profile. Export discovery of all three
+    /// symbols (feature query, layout, setter) plus a sizeof check is the only
+    /// safe probe; a v1 library predating it has none of them.
+    /// </summary>
+    internal static bool LowVramSupported
+    {
+        get
+        {
+            int state = Volatile.Read(ref _lowVramState);
+            if (state != 0) return state == 2;
+            Verify();
+            bool supported = ProbeLowVramFeatures();
+            Volatile.Write(ref _lowVramState, supported ? 2 : 1);
+            return supported;
+        }
+    }
+
+    private static bool ProbeLowVramFeatures()
+    {
+        IntPtr handle = NativeLibraryLoader.Handle;
+        if (handle == IntPtr.Zero) return false;
+        if (!NativeLibrary.TryGetExport(handle, "qzi_abi_features", out IntPtr features) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_memory_plan_layout", out IntPtr layout) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_engine_set_memory_profile", out _) ||
+            !NativeLibrary.TryGetExport(handle, "qzi_engine_memory_plan", out _))
+            return false;
+
+        uint bits = ((delegate* unmanaged<uint>)features)();
+        if ((bits & NativeMethods.FeatureLowVram) == 0) return false;
+
+        nuint nativeSize = ((delegate* unmanaged<nuint>)layout)();
+        Check("qzi_memory_plan", nativeSize, sizeof(QziMemoryPlan));
         return true;
     }
 

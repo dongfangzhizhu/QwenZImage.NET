@@ -200,6 +200,75 @@ public sealed record Qwen21EditExOptions : Qwen21EditOptions
     public uint EffectiveModelMode => (uint)ModelMode;
 }
 
+/// <summary>Maximum number of ordered identity references WanGP accepts.</summary>
+/// <remarks>Declared here (not only in the validator) so callers can size a UI
+/// uploader without duplicating the magic number.</remarks>
+public static class Qwen21IdentityRef
+{
+    /// <summary>WanGP image_refs / identity reference count limit (10).</summary>
+    public const int MaxReferences = 10;
+
+    /// <summary>Default identity reference weight (WanGP image_refs_relative_size).</summary>
+    public const float DefaultWeight = 70.0f;
+
+    /// <summary>Default cap on a reference's longest side before VAE encoding.</summary>
+    public const uint DefaultEncodeMaxSide = 768u;
+}
+
+/// <summary>
+/// Qwen-Image 2.1 IDENTITY REFERENCE generation (WanGP
+/// <c>video_prompt_type="I"</c> / <c>image_refs</c>). Unlike
+/// <see cref="Qwen21EditOptions"/>, the reference images are NOT a denoising
+/// origin: each is VAE-encoded and injected as an identity CONDITION, and the
+/// output is a fresh generation that starts from pure noise. That is what lets
+/// the face stay locked while the outfit / pose / angle change freely -- the
+/// exact capability gap this increment closes.
+/// </summary>
+/// <remarks>
+/// Uses the SAME 7B weights as text-to-image. The engine's condition-prefix DiT
+/// injection is the next engine milestone; the full ABI / managed / WebUI data
+/// path and the deterministic reference backend are already available, and the
+/// CUDA build reports an explicit "unsupported" until the engine lands.
+/// <para>
+/// Derived from <see cref="QwenImageOptions"/> (not the edit options): the
+/// embedded native request is the ordinary t2i request, so the tier / steps /
+/// guidance / LoRA rules are identical to text-to-image.
+/// </para>
+/// </remarks>
+public sealed record Qwen21IdentityRefOptions : QwenImageOptions
+{
+    /// <summary>
+    /// 1..<see cref="Qwen21IdentityRef.MaxReferences"/> ordered planar RGB8
+    /// reference images. The first is the primary identity anchor, as in WanGP.
+    /// </summary>
+    public required IReadOnlyList<QziRasterImage> References { get; init; }
+
+    /// <summary>
+    /// WanGP <c>image_refs_relative_size</c> (slider 20..100).
+    /// <c>null</c> uses the engine default <see cref="Qwen21IdentityRef.DefaultWeight"/>.
+    /// </summary>
+    public float? IdentityRefWeight { get; init; }
+
+    /// <summary>
+    /// Cap on each reference's longest side (multiple of 16) before VAE
+    /// encoding, decoupled from the output canvas so a 1024x1024 reference no
+    /// longer OOMs. <c>null</c> uses
+    /// <see cref="Qwen21IdentityRef.DefaultEncodeMaxSide"/>.
+    /// </summary>
+    public uint? ReferenceEncodeMaxSide { get; init; }
+
+    /// <summary>Reserved for the C ABI; must be 0.</summary>
+    public uint Flags { get; init; }
+
+    /// <summary>The weight actually sent to the engine (never the 0 sentinel).</summary>
+    public float EffectiveIdentityRefWeight =>
+        IdentityRefWeight ?? Qwen21IdentityRef.DefaultWeight;
+
+    /// <summary>The encode cap actually sent to the engine (never the 0 sentinel).</summary>
+    public uint EffectiveReferenceEncodeMaxSide =>
+        ReferenceEncodeMaxSide ?? Qwen21IdentityRef.DefaultEncodeMaxSide;
+}
+
 /// <summary>
 /// Z-Image (Turbo / Nunchaku) request. Turbo runs a fixed 8-step schedule with
 /// no CFG branch, so there are no steps, guidance or negative-prompt fields.

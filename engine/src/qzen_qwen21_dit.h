@@ -24,6 +24,15 @@ typedef struct qzen_qwen21_request {
     int width;
     const float *sigmas; /* [sigma_count] in 0..1 (scheduler sigma) */
     int sigma_count;
+    /* Optional Wan2GP-style condition prefix. Each entry is a channel-major
+     * [64][h][w] latent produced by the VAE with the same mean/std normalisation
+     * as the target. The DiT sees [text ; ref_0 ... ref_n ; target] and returns
+     * velocity for the target tail only. NULL / ref_count == 0 keeps the exact
+     * legacy two-segment behaviour. */
+    const float *const *image_refs;
+    const int *ref_heights;
+    const int *ref_widths;
+    int ref_count;
 } qzen_qwen21_request;
 
 /* Open a single-file checkpoint and read the resident (non-block) weights.

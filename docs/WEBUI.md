@@ -230,7 +230,8 @@ Go WebUI wire format. Errors use `{"error": "...", "detail": "..."}`.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet`, `supports_advanced_editing`, `supports_inpaint` and the `preprocessing` capability block |
+| `GET` | `/api/health` | WebUI + native engine status, `transport`, `config_path`, output/model dirs, uptime, `supports_image_editing`, `supports_controlnet`, `supports_advanced_editing`, `supports_inpaint`, `supports_identity_reference`, `supports_low_vram`, `engine.memory_profile` / `pool_release_mib` / `reference_encode_cap` / `free_vram_mib` / `total_vram_mib` and the `preprocessing` capability block |
+| `POST` | `/api/memory-profile` | `{"profile":"auto|high|balanced|low|lowest"}` — switch the low-VRAM budget at runtime; returns the resolved plan. `400` on an unsupported library, invalid profile or busy engine |
 | `GET` | `/api/preprocess` | `{"available":true,"modes":[...],"learned":{...}}` — available guide operators and discovered WanGP ONNX assets |
 | `POST` | `/api/preprocess` | Turn an uploaded photo into a ControlNet guide PNG (see [Guide preprocessing](#guide-preprocessing-getpost-apipreprocess)) |
 | `GET` | `/api/presets` | `{"presets":[...]}` — all `QziPresets` with a `model` discriminator |
@@ -458,7 +459,9 @@ environment variable that would override the new file values) and
 ```
 
 `model` accepts `qwen21` (aliases `qwen`, `qwen-image`), `qwen21-edit`
-(aliases `qwen21_edit`, `qwen-image-edit`), `zimage`
+(aliases `qwen21_edit`, `qwen-image-edit`), `qwen21-identity` (aliases
+`qwen21-identity-ref`, `qwen21-identity-refs`, `identity-ref`,
+`qwen-image-identity`), `zimage`
 (aliases `z-image`, `z_image`) or `zimage-control`
 (aliases `zimage_control`, `z-image-control`). Qwen21 adds `tier` (`turbo`/`base`);
 `lora` and `lora_scale` are valid on **both** tiers, while `steps`,
@@ -643,6 +646,63 @@ requires 33-channel Union v2 / v2.1 weights in `zimage_control_dir`; a 16-channe
 v1 pack is rejected by the engine. With the reference backend the request still
 succeeds but only produces the deterministic byte-comparison image.
 
+### Identity-reference envelope (`POST /api/jobs`)
+
+A fifth additive mode: `model: "qwen21-identity"`, **or** a plain `qwen21`
+request that carries `identity_refs`. It selects the identity-condition entry
+point (`GenerateQwen21IdentityRef`), which starts from pure noise and uses the
+reference photos as identity conditions — unlike `reference_image`, which is an
+img2img starting point. The two are strictly mutually exclusive (as are
+identity refs and ControlNet / inpaint).
+
+```json
+{
+  "model": "qwen21-identity",
+  "prompt": "the same person wearing a red winter coat, full body",
+  "width": 1024,
+  "height": 1024,
+  "seed": 42,
+  "client": "manual-test",
+  "identity_refs": [
+    "data:image/png;base64,iVBORw0KGgo...",
+    "D:/refs/person_front.png",
+    "D:/refs/person_side.png"
+  ],
+  "identity_ref_weight": 70,
+  "reference_encode_max_side": 768
+}
+```
+
+| Field | Rule |
+| --- | --- |
+| `identity_refs` | **Required.** Array of 1–10 PNG images. Each element may be a base64 data URL, plain base64, or a **local PNG file path** — this is the Wan2GP `image_refs` calling style without manual base64 encoding. Each raster: 3 channels, side `1..4096`, total pixels `≤ 2048×2048` |
+| `identity_ref_weight` | Optional, default `70`. Finite `20..100` (or `0` for the ABI default). Mirrors WanGP `image_refs_relative_size` |
+| `reference_encode_max_side` | Optional, default `768`. Multiple of 16 in `16..2048` (or `0` for default). Bounds the VAE encode memory for large references |
+
+Only PNG bytes are decoded. Convert JPEG / WebP files to PNG before passing a
+local path; the browser UI does that automatically through a canvas.
+Submitted jobs appear with `"identity_ref": true` and `"identity_ref_count": N`.
+`/api/health` exposes `supports_identity_reference`; when `false` the UI
+disables the mode, and the server rejects such jobs with `400` before queueing.
+**Real CUDA backend note**: the CUDA backend implements this mode with a
+condition-prefix DiT: references are VAE-encoded at a weight-controlled
+resolution, prepended to the noisy target, and the sampler still starts from
+pure noise. The text tower is text-only (no Qwen3-VL `visual.*` port), so visual
+semantics come from the VAE condition tokens rather than `<|image_pad|>`
+embeddings. See [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md).
+
+### 低显存 / 内存 profile（第六增量）
+
+WanGP 靠 mmgp profile 在低显存卡上跑同一份 7B 模型；QZI 用引擎级 profile 达到同类效果。它对所有生成模式生效，不是请求字段，也不产生作业 / 不占 `served` 计数。
+
+- `QwenZImage.config.json` 的 `memory_profile`（或环境变量 `QZI_MEMORY_PROFILE`）：`auto`（默认）/ `high` / `balanced` / `low` / `lowest`，创建引擎时生效。小显存卡建议 `low` 或 `lowest`。
+- 顶栏的 `VRAM: ...` 下拉仅在 `/api/health` 返回 `supports_low_vram: true` 时出现；切换即 `POST /api/memory-profile`，返回已解析预算（profile / 设备 VRAM / 分配器释放阈值 / 参考图编码上限），前端随即刷新 health pill。
+- `/api/health` 的 `engine` 对象新增 `memory_profile`、`pool_release_mib`、`reference_encode_cap`，以及真实设备显存 `free_vram_mib` / `total_vram_mib`（旧版原生库为 `-1`）；pill 文本与 tooltip 会显示 VRAM 与当前 profile。
+- `auto` 按设备总显存解析：≥20 GiB→high，≥12 GiB→balanced，≥8 GiB→low，否则 lowest。预算：high=24 GiB 池 / 768 px、balanced=4 GiB / 768、low=1 GiB / 512、lowest=256 MiB / 384。参考图编码上限只作用于请求未显式给 `reference_encode_max_side` 的情况。
+- 运行时切换对**后续新建**的显存上下文生效（首次生成前设置最稳妥，config/env 即如此）；已在显存中的 DiT 不会因切换而重载。非法 profile 返回 `400`，busy 时拒绝。
+
+实现细节与 C ABI 见 [NATIVE_ABI.md](NATIVE_ABI.md)「低显存 / 内存 profile」节，参数规则见 [PARAMETERS.md](PARAMETERS.md)。
+
 ### SSE (`/api/events`)
 
 ```
@@ -684,6 +744,14 @@ do not close idle connections. `EventSource` reconnects automatically.
   pixels are regenerated from the prompt, black ones keep the reference. The
   option is disabled when `/api/health` reports
   `supports_image_editing: false`.
+- **Identity-reference mode** (`qwen21-identity`): upload **1–10** photos of the
+  same person (PNG / JPEG / WebP, each re-encoded by the canvas as 8-bit PNG),
+  remove individual thumbnails, and tune `Identity weight` (20–100, default
+  70) plus `Reference encode cap` (128–1024 px, default 768) with live sliders.
+  Denoising starts from noise, so clothing / pose can change while the face is
+  held as an identity condition. The option is disabled when `/api/health`
+  reports `supports_identity_reference: false`; job rows show an
+  `identity · N` badge.
 - **Advanced edit panel** (inside `qwen21-edit`): top / bottom / left / right
   outpainting margins (step 32, they **enlarge** the output canvas), a
   `Model mode` selector (masked denoising or LanPaint with 2/5/10/15 inner

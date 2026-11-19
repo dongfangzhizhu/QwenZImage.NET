@@ -17,6 +17,16 @@
   </div>
   <div class="topbar-actions">
     <span id="health-pill" class="pill pill-wait">checking…</span>
+    <!-- Sixth additive ABI v1 increment: low-VRAM memory profile. Hidden until
+         /api/health reports supports_low_vram; changing it is a cheap control-
+         plane call, no job / model reload. -->
+    <select id="memory-profile" class="mem-profile" hidden title="Low-VRAM memory profile (WanGP mmgp-style budget)">
+      <option value="auto">VRAM: auto</option>
+      <option value="high">VRAM: high</option>
+      <option value="balanced">VRAM: balanced</option>
+      <option value="low">VRAM: low</option>
+      <option value="lowest">VRAM: lowest</option>
+    </select>
     <a class="btn btn-ghost btn-sm" href="#models-panel">Model weights ↓</a>
     <button id="unload-btn" class="btn btn-ghost" type="button">Unload model</button>
   </div>
@@ -50,6 +60,7 @@
       <select id="model">
         <option value="qwen21">Qwen-Image 2.1</option>
         <option value="qwen21-edit">Qwen-Image 2.1 · image edit</option>
+        <option value="qwen21-identity">Qwen-Image 2.1 · identity refs</option>
         <option value="zimage">Z-Image</option>
         <option value="zimage-control">Z-Image · ControlNet Union</option>
         <option value="zimage-inpaint">Z-Image · Inpaint (Union 2.x)</option>
@@ -223,6 +234,33 @@
           </div>
         </div>
       </div>
+    </div>
+
+    <!-- Fifth additive ABI v1 increment: identity references (Wan2GP
+         image_refs). These are conditions injected from pure noise, NOT an
+         img2img starting point, so clothing / pose can change while the face
+         stays the same. Mutually exclusive with the edit / control modes. -->
+    <div class="edit-block" data-only="qwen21-identity">
+      <h3 class="section-title">Identity references <span class="hint">Wan2GP image_refs</span></h3>
+      <p class="note edit-note">Upload 1–10 photos of the same person. The engine starts from noise and uses these as identity conditions, so wardrobe / pose / viewpoint can change freely. For scripted callers the API also accepts local PNG paths in <code>identity_refs</code>.</p>
+      <div class="field">
+        <label for="identity-file">Reference images <span class="hint">PNG / JPEG / WebP · max 10</span></label>
+        <input id="identity-file" type="file" accept="image/*" multiple>
+      </div>
+      <p id="identity-empty" class="note edit-empty">No identity references yet. Upload at least one photo.</p>
+      <div id="identity-thumbs" class="identity-thumbs"></div>
+      <p class="hint">Loaded: <span id="identity-count">0/10</span></p>
+      <div class="grid-2">
+        <div class="field">
+          <label for="identity-weight">Identity weight <span class="hint" id="identity-weight-hint">70</span></label>
+          <input id="identity-weight" type="range" min="20" max="100" step="1" value="70">
+        </div>
+        <div class="field">
+          <label for="identity-encode-side">Reference encode cap <span class="hint" id="identity-encode-hint">768 px</span></label>
+          <input id="identity-encode-side" type="range" min="128" max="1024" step="16" value="768">
+        </div>
+      </div>
+      <p class="hint">Lower encode cap reduces VAE memory for large reference photos; the visible output resolution is unchanged.</p>
     </div>
 
     <div class="field" data-only="zimage">

@@ -67,6 +67,21 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     public bool SupportsInpaint => AbiGuard.ZImageInpaintSupported;
 
     /// <summary>
+    /// Whether the loaded native library implements the fifth additive ABI v1
+    /// increment: Qwen-Image 2.1 identity reference (WanGP image_refs / "I" mode).
+    /// The request embeds only the ordinary qwen21 request, so this feature is
+    /// independent of editing, ControlNet and inpainting.
+    /// </summary>
+    public bool SupportsIdentityReference => AbiGuard.Qwen21IdentityRefSupported;
+
+    /// <summary>
+    /// Whether the loaded native library implements the sixth additive ABI v1
+    /// increment: low-VRAM / memory profile. An older v1 library keeps serving
+    /// every generation mode but does not export the profile control surface.
+    /// </summary>
+    public bool SupportsLowVram => AbiGuard.LowVramSupported;
+
+    /// <summary>
     /// Creates a native engine instance. With no options,
     /// <c>QwenZImage.config.json</c> is loaded automatically and its model
     /// directories are passed straight into the native backend; an explicit
@@ -151,6 +166,51 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     }
 
     /// <summary>
+    /// Sets the low-VRAM memory profile for subsequent generations. A control-
+    /// plane call; it loads no weights and consumes no generation slot. Pass
+    /// <see cref="QziMemoryProfile.Auto"/> to re-resolve from live device VRAM.
+    /// Refused while a generation owns the device.
+    /// </summary>
+    /// <exception cref="QziException">The loaded library has no low-VRAM support,
+    /// the profile is invalid, or a generation is in flight.</exception>
+    public void SetMemoryProfile(QziMemoryProfile profile)
+    {
+        ThrowIfDisposed();
+        if (!SupportsLowVram)
+            throw new QziException(QziStatus.Unsupported,
+                "The loaded native library does not support memory profiles.");
+        byte* error = stackalloc byte[NativeMethods.ErrorCapacity];
+        new Span<byte>(error, NativeMethods.ErrorCapacity).Clear();
+        int status = NativeMethods.EngineSetMemoryProfile(
+            _handle.DangerousGetHandle(), (int)profile, error,
+            NativeMethods.ErrorCapacity);
+        if (status != 0) throw NativeError.ToException(status, error);
+    }
+
+    /// <summary>Reads the resolved low-VRAM budget and live device VRAM.</summary>
+    /// <exception cref="QziException">The loaded library has no low-VRAM support.</exception>
+    public QziMemoryPlan GetMemoryPlan()
+    {
+        ThrowIfDisposed();
+        if (!SupportsLowVram)
+            throw new QziException(QziStatus.Unsupported,
+                "The loaded native library does not support memory profiles.");
+        Native.QziMemoryPlan native = default;
+        byte* error = stackalloc byte[NativeMethods.ErrorCapacity];
+        new Span<byte>(error, NativeMethods.ErrorCapacity).Clear();
+        int status = NativeMethods.EngineMemoryPlan(_handle.DangerousGetHandle(),
+                                                    &native, error,
+                                                    NativeMethods.ErrorCapacity);
+        if (status != 0) throw NativeError.ToException(status, error);
+        return new QziMemoryPlan(
+            (QziMemoryProfile)native.Profile,
+            native.TotalVramMib,
+            native.FreeVramMib,
+            native.PoolReleaseMib,
+            native.ReferenceEncodeCap);
+    }
+
+    /// <summary>
     /// Releases re-creatable resident state (text tower / caches). The DiT stays
     /// resident because reloading it costs minutes. Refused while busy.
     /// </summary>
@@ -226,6 +286,38 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     {
         QziImage image = CallQwen21EditEx(options, progress, cancellationToken,
                                           out TimeSpan elapsed);
+        try
+        {
+            int length = checked((int)image.Size);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            new ReadOnlySpan<byte>(image.Data, length).CopyTo(buffer);
+            return new GenerationResult(buffer, length, (int)image.Width,
+                                        (int)image.Height, options.Seed,
+                                        GenerationModel.Qwen21, elapsed);
+        }
+        finally
+        {
+            ReleaseImage(ref image);
+        }
+    }
+
+    /// <summary>
+    /// Generates a fresh image conditioned on one or more identity references
+    /// (WanGP image_refs / <c>video_prompt_type="I"</c>; synchronous, may take
+    /// minutes). The references are identity conditions, NOT an img2img origin,
+    /// so the face stays locked while clothing / pose / angle change freely.
+    /// Requires a native library implementing the fifth additive ABI v1
+    /// increment; see <see cref="SupportsIdentityReference"/>. Note the bundled
+    /// CUDA engine currently reports UNSUPPORTED here (condition-prefix DiT
+    /// injection is the next engine milestone) while the deterministic
+    /// reference backend exercises the complete data path.
+    /// </summary>
+    public GenerationResult GenerateQwen21IdentityRef(Qwen21IdentityRefOptions options,
+                                           IProgress<GenerationProgress>? progress = null,
+                                           CancellationToken cancellationToken = default)
+    {
+        QziImage image = CallQwen21IdentityRef(options, progress, cancellationToken,
+                                               out TimeSpan elapsed);
         try
         {
             int length = checked((int)image.Size);
@@ -326,6 +418,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             // Derived options must be matched before their base record.
             Qwen21EditExOptions advanced => GenerateQwen21EditEx(advanced, progress, cancellationToken),
             Qwen21EditOptions edit => GenerateQwen21Edit(edit, progress, cancellationToken),
+            Qwen21IdentityRefOptions identity => GenerateQwen21IdentityRef(identity, progress, cancellationToken),
             QwenImageOptions qwen => GenerateQwen21(qwen, progress, cancellationToken),
             // Inpaint derives from the ControlNet options, so it must come first.
             ZImageInpaintOptions inpaint => GenerateZImageInpaint(inpaint, progress, cancellationToken),
@@ -353,6 +446,9 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
                 break;
             case Qwen21EditOptions edit:
                 image = CallQwen21Edit(edit, progress, cancellationToken, out _);
+                break;
+            case Qwen21IdentityRefOptions identity:
+                image = CallQwen21IdentityRef(identity, progress, cancellationToken, out _);
                 break;
             case QwenImageOptions qwen:
                 image = CallQwen21(qwen, progress, cancellationToken, out _);
@@ -411,6 +507,14 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         IProgress<GenerationProgress>? progress = null,
         CancellationToken cancellationToken = default)
         => Task.Run(() => GenerateQwen21EditEx(options, progress, cancellationToken),
+                    cancellationToken);
+
+    /// <summary>Async wrapper over the synchronous identity-reference call.</summary>
+    public Task<GenerationResult> GenerateQwen21IdentityRefAsync(
+        Qwen21IdentityRefOptions options,
+        IProgress<GenerationProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+        => Task.Run(() => GenerateQwen21IdentityRef(options, progress, cancellationToken),
                     cancellationToken);
 
     /// <summary>Async wrapper over the synchronous native call.</summary>
@@ -473,7 +577,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
         QziQwen21Request request = BuildQwen21Request(options, prompt, negative,
                                                        tier, lora);
 
-        return Invoke(&request, null, null, null, null, null, callbacks,
+        return Invoke(&request, null, null, null, null, null, null, callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -522,7 +626,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so both pins stay alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, &request, null, null, null, callbacks,
+            return Invoke(null, null, &request, null, null, null, null, callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -588,8 +692,81 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so both pins stay alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, null, null, &request, null, callbacks,
+            return Invoke(null, null, null, null, &request, null, null, callbacks,
                           cancellationToken, out elapsed);
+        }
+    }
+
+    private QziImage CallQwen21IdentityRef(Qwen21IdentityRefOptions options,
+                                    IProgress<GenerationProgress>? progress,
+                                    CancellationToken cancellationToken,
+                                    out TimeSpan elapsed)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        RequestValidator.Validate(options);
+        ThrowIfDisposed();
+        if (!AbiGuard.Qwen21IdentityRefSupported)
+            throw new QziException(QziStatus.Unsupported,
+                "The loaded native library does not implement Qwen-Image 2.1 identity " +
+                "reference (qzi_generate_qwen21_identity_ref is not exported). Rebuild " +
+                "QwenZImageNative from the matching source tree; text-to-image " +
+                "generation is unaffected.");
+        cancellationToken.ThrowIfCancellationRequested();
+
+        using var prompt = new Utf8PinnedString(options.Prompt);
+        using var negative = new Utf8PinnedString(options.NegativePrompt);
+        using var tier = new Utf8PinnedString(options.TierName);
+        using var lora = new Utf8PinnedString(options.Lora);
+        using var callbacks = new CallbackScope(progress, cancellationToken);
+
+        QziQwen21Request baseRequest = BuildQwen21Request(options, prompt, negative,
+                                                           tier, lora);
+        IReadOnlyList<QziRasterImage> references = options.References;
+        int count = references.Count;
+
+        // A dynamic number of separate raster arrays cannot be held by nested
+        // `fixed` statements, so pin each buffer with a GCHandle for the whole
+        // synchronous call. The pointer / width / height tables are themselves
+        // managed arrays, fixed below; the native request only borrows them.
+        GCHandle[] pins = new GCHandle[count];
+        byte*[] pointers = new byte*[count];
+        uint[] widths = new uint[count];
+        uint[] heights = new uint[count];
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                QziRasterImage reference = references[i];
+                pins[i] = GCHandle.Alloc(reference.Bytes, GCHandleType.Pinned);
+                pointers[i] = (byte*)pins[i].AddrOfPinnedObject();
+                widths[i] = (uint)reference.Width;
+                heights[i] = (uint)reference.Height;
+            }
+            fixed (byte** refsPtr = pointers)
+            fixed (uint* widthsPtr = widths)
+            fixed (uint* heightsPtr = heights)
+            {
+                QziQwen21IdentityRefRequest request = new()
+                {
+                    Base = baseRequest,
+                    ReferenceRgb = refsPtr,
+                    ReferenceWidths = widthsPtr,
+                    ReferenceHeights = heightsPtr,
+                    ReferenceCount = (uint)count,
+                    IdentityRefWeight = options.EffectiveIdentityRefWeight,
+                    ReferenceEncodeMaxSide = options.EffectiveReferenceEncodeMaxSide,
+                    Flags = options.Flags
+                };
+                // The native call is synchronous, so every GCHandle and all
+                // three fixed pins stay alive until Invoke returns.
+                return Invoke(null, null, null, null, null, null, &request, callbacks,
+                          cancellationToken, out elapsed);
+            }
+        }
+        finally
+        {
+            foreach (GCHandle pin in pins)
+                if (pin.IsAllocated) pin.Free();
         }
     }
 
@@ -639,7 +816,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             Flags = 0
         };
 
-        return Invoke(null, &request, null, null, null, null, callbacks,
+        return Invoke(null, &request, null, null, null, null, null, callbacks,
                       cancellationToken, out elapsed);
     }
 
@@ -690,7 +867,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             };
             // The native call is synchronous, so the pin stays alive until
             // Invoke returns and the caller owns the resulting PNG buffer.
-            return Invoke(null, null, null, &request, null, null, callbacks,
+            return Invoke(null, null, null, &request, null, null, null, callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -756,7 +933,7 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
                 // carry options.Flags and the validator keeps both at zero.
                 Flags = 0
             };
-            return Invoke(null, null, null, null, null, &request, callbacks,
+            return Invoke(null, null, null, null, null, &request, null, callbacks,
                           cancellationToken, out elapsed);
         }
     }
@@ -764,10 +941,11 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
     private QziImage Invoke(QziQwen21Request* qwen, QziZImageRequest* zimage,
                             QziQwen21EditRequest* edit, QziZImageControlRequest* control,
                             QziQwen21EditExRequest* editEx, QziZImageInpaintRequest* inpaint,
+                            QziQwen21IdentityRefRequest* identityRef,
                             CallbackScope scope,
                             CancellationToken cancellationToken, out TimeSpan elapsed)
     {
-        // Exactly one of the six request pointers is non-null. The callbacks
+        // Exactly one of the seven request pointers is non-null. The callbacks
         // struct is a local copy whose address stays valid for the whole
         // synchronous call; the owning scope keeps the live-token entry alive.
         QziCallbacks callbacks = scope.Callbacks;
@@ -788,6 +966,10 @@ public sealed unsafe class QziClient : IDisposable, IQziExecutor
             else if (edit is not null)
                 status = NativeMethods.GenerateQwen21Edit(engine, edit, &callbacks, &image,
                                                           error, NativeMethods.ErrorCapacity);
+            else if (identityRef is not null)
+                status = NativeMethods.GenerateQwen21IdentityRef(engine, identityRef, &callbacks,
+                                                                 &image, error,
+                                                                 NativeMethods.ErrorCapacity);
             else if (inpaint is not null)
                 status = NativeMethods.GenerateZImageInpaint(engine, inpaint, &callbacks, &image,
                                                              error, NativeMethods.ErrorCapacity);

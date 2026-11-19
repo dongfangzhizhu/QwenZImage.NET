@@ -129,6 +129,27 @@ internal unsafe struct QziZImageInpaintRequest
     public uint Flags;
 }
 
+/// <summary>
+/// Fifth additive ABI v1 request: the ordinary qwen21 request followed by N
+/// planar RGB8 reference buffers (as an array of pointers), their width/height
+/// arrays, the relative-size weight and the VAE encode cap. Field order and
+/// packing must match <c>qzi_qwen21_identity_ref_request</c> in
+/// native/include/qzi.h; <see cref="AbiGuard"/> verifies sizeof() against
+/// qzi_qwen21_identity_ref_layout().
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct QziQwen21IdentityRefRequest
+{
+    public QziQwen21Request Base;
+    public byte** ReferenceRgb;
+    public uint* ReferenceWidths;
+    public uint* ReferenceHeights;
+    public uint ReferenceCount;
+    public float IdentityRefWeight;
+    public uint ReferenceEncodeMaxSide;
+    public uint Flags;
+}
+
 /// <summary>Function pointers are passed as IntPtr so the source-generated
 /// marshaller treats the whole struct as blittable (no marshalling stubs).</summary>
 [StructLayout(LayoutKind.Sequential)]
@@ -162,4 +183,15 @@ internal struct QziHealth
     public ulong Rejected;
     public double UptimeSeconds;
     public int ReferenceBackend;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct QziMemoryPlan
+{
+    public int Profile;
+    public long TotalVramMib;
+    public long FreeVramMib;
+    public int PoolReleaseMib;
+    public int ReferenceEncodeCap;
+    public uint Flags;
 }

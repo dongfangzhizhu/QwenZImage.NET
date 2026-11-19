@@ -15,6 +15,7 @@
 #include "qzi.h"
 #include "qzi_backend.h"
 #include "qzi_internal.h"
+#include "qzi_env.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -48,6 +49,9 @@ struct qzi_engine {
     uint64_t        rejected;
     int             busy;
     qzi_model_kind  resident;
+    /* AUTO until a caller sets a concrete profile; resolved lazily from live
+     * VRAM in qzi_engine_memory_plan() / at the first set call. */
+    qzi_memory_profile memory_profile;
 };
 
 static qzi_backend g_backend;
@@ -136,6 +140,60 @@ uint64_t qzi_fnv1a(const char *text)
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+qzi_memory_profile qzi_resolve_memory_profile(qzi_memory_profile requested,
+                                              int64_t total_vram_mib)
+{
+    /* AUTO: pick a budget from the device's total VRAM. The cut points match
+     * the documented contract in qzi.h. Unknown VRAM is deliberately treated
+     * as a mid-range card so a machine that cannot answer still gets a safe,
+     * deterministic middle ground. */
+    if (requested == QZI_MEMORY_AUTO) {
+        if (total_vram_mib < 0) return QZI_MEMORY_BALANCED;
+        if (total_vram_mib >= 20480) return QZI_MEMORY_HIGH;
+        if (total_vram_mib >= 12288) return QZI_MEMORY_BALANCED;
+        if (total_vram_mib >= 8192) return QZI_MEMORY_LOW;
+        return QZI_MEMORY_LOWEST;
+    }
+    if (requested >= QZI_MEMORY_HIGH && requested <= QZI_MEMORY_LOWEST)
+        return requested;
+    /* Out-of-range concrete values are a defensive no-op -> balanced. */
+    return QZI_MEMORY_BALANCED;
+}
+
+void qzi_fill_memory_plan(qzi_memory_profile concrete,
+                          int64_t total_vram_mib, int64_t free_vram_mib,
+                          qzi_memory_plan *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->profile = (int32_t)concrete;
+    out->total_vram_mib = total_vram_mib;
+    out->free_vram_mib = free_vram_mib;
+    /* The two budgets that actually change engine behaviour. HIGH preserves
+     * the historical 24 GiB threshold and 768 encode cap byte-for-byte; each
+     * lower profile tightens both so a small card can release blocks and avoid
+     * a full-canvas reference VAE encode. */
+    switch (concrete) {
+    case QZI_MEMORY_HIGH:
+        out->pool_release_mib = 24576;
+        out->reference_encode_cap = 768;
+        break;
+    case QZI_MEMORY_LOW:
+        out->pool_release_mib = 1024;
+        out->reference_encode_cap = 512;
+        break;
+    case QZI_MEMORY_LOWEST:
+        out->pool_release_mib = 256;
+        out->reference_encode_cap = 384;
+        break;
+    case QZI_MEMORY_BALANCED:
+    default:
+        out->pool_release_mib = 4096;
+        out->reference_encode_cap = 768;
+        break;
+    }
 }
 
 int qzi_cancelled(const qzi_callbacks *callbacks)
@@ -474,6 +532,102 @@ static void qzi_normalize_qwen21_edit_ex(const qzi_qwen21_edit_ex_request *reque
     }
 }
 
+/* ---- Qwen-Image 2.1 identity reference (fifth additive ABI v1 increment) --
+ *
+ * Identity references are a DIFFERENT semantic from the img2img edit path:
+ * they are injected as an identity condition and denoising starts from pure
+ * noise. Because the request embeds an ordinary qwen21 request (not an edit),
+ * the tier / steps / guidance / LoRA rules are exactly the t2i ones. The extra
+ * checks below only cover the reference array, the relative-size weight and
+ * the encode-resolution cap. */
+qzi_status qzi_validate_qwen21_identity_ref(
+                                    const qzi_qwen21_identity_ref_request *request,
+                                    char *error, size_t error_cap)
+{
+    qzi_status s;
+    uint32_t i;
+    if (!request) {
+        qzi_set_error(error, error_cap, "qwen21 identity-ref request is NULL");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->flags != 0) {
+        qzi_set_error(error, error_cap,
+                      "qwen21 identity-ref request flags must be 0");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    s = qzi_validate_qwen21(&request->base, error, error_cap);
+    if (s != QZI_OK) return s;
+    if (request->reference_count == 0 ||
+        request->reference_count > QZI_MAX_IDENTITY_REFS) {
+        qzi_set_error_fmt(error, error_cap,
+            "reference_count must be 1..%u", (unsigned)QZI_MAX_IDENTITY_REFS);
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (!request->reference_rgb || !request->reference_widths ||
+        !request->reference_heights) {
+        qzi_set_error(error, error_cap,
+            "reference_rgb, reference_widths and reference_heights are required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    for (i = 0; i < request->reference_count; i++) {
+        uint32_t rw = request->reference_widths[i];
+        uint32_t rh = request->reference_heights[i];
+        if (!request->reference_rgb[i]) {
+            qzi_set_error_fmt(error, error_cap,
+                "reference_rgb[%u] is NULL", (unsigned)i);
+            return QZI_ERR_INVALID_ARGUMENT;
+        }
+        if (rw == 0 || rh == 0 || rw > QZI_MAX_REFERENCE_SIDE ||
+            rh > QZI_MAX_REFERENCE_SIDE ||
+            (int64_t)rw * (int64_t)rh > QZI_MAX_PIXELS) {
+            qzi_set_error_fmt(error, error_cap,
+                "reference %u must be 1..%u pixels per side and at most "
+                "2048*2048 total pixels", (unsigned)i,
+                (unsigned)QZI_MAX_REFERENCE_SIDE);
+            return QZI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    /* NaN/Inf fail both comparisons and are rejected, not coerced. */
+    if (request->identity_ref_weight != 0.0f &&
+        !(request->identity_ref_weight >= 20.0f &&
+          request->identity_ref_weight <= 100.0f)) {
+        qzi_set_error(error, error_cap,
+            "identity_ref_weight must be finite and in 20..100 (or 0 for the "
+            "engine default 70)");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (request->reference_encode_max_side != 0u) {
+        uint32_t cap = request->reference_encode_max_side;
+        if (cap % 16u != 0u || cap < 16u || cap > 2048u) {
+            qzi_set_error(error, error_cap,
+                "reference_encode_max_side must be a multiple of 16 in 16..2048 "
+                "(or 0 for the engine default 768)");
+            return QZI_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return QZI_OK;
+}
+
+/* Resolve the two sentinels once, before any backend sees the request, so C
+ * and .NET callers agree on the effective weight / encode cap. The pixel
+ * buffers and the width / height arrays are copied by POINTER only -- the
+ * caller owns their memory for the whole synchronous call. */
+static void qzi_normalize_qwen21_identity_ref(
+                        const qzi_qwen21_identity_ref_request *request,
+                        qzi_qwen21_identity_ref_request *out)
+{
+    qzi_normalize_qwen21(&request->base, &out->base);
+    out->reference_rgb = request->reference_rgb;
+    out->reference_widths = request->reference_widths;
+    out->reference_heights = request->reference_heights;
+    out->reference_count = request->reference_count;
+    out->identity_ref_weight = request->identity_ref_weight == 0.0f
+        ? QZI_IDENTITY_REF_DEFAULT_WEIGHT : request->identity_ref_weight;
+    out->reference_encode_max_side = request->reference_encode_max_side == 0u
+        ? QZI_REFERENCE_ENCODE_DEFAULT_MAX_SIDE : request->reference_encode_max_side;
+    out->flags = 0;
+}
+
 qzi_status qzi_validate_zimage(const qzi_zimage_request *request,
                                char *error, size_t error_cap)
 {
@@ -673,7 +827,8 @@ QZI_API uint32_t qzi_abi_version(void)
 QZI_API uint32_t qzi_abi_features(void)
 {
     return QZI_FEATURE_QWEN21_EDIT | QZI_FEATURE_ZIMAGE_CONTROL |
-           QZI_FEATURE_QWEN21_EDIT_ADV | QZI_FEATURE_ZIMAGE_INPAINT;
+           QZI_FEATURE_QWEN21_EDIT_ADV | QZI_FEATURE_ZIMAGE_INPAINT |
+           QZI_FEATURE_QWEN21_IDENTITY_REF | QZI_FEATURE_LOW_VRAM;
 }
 
 QZI_API size_t qzi_qwen21_edit_layout(void)
@@ -694,6 +849,16 @@ QZI_API size_t qzi_qwen21_edit_ex_layout(void)
 QZI_API size_t qzi_zimage_inpaint_layout(void)
 {
     return sizeof(qzi_zimage_inpaint_request);
+}
+
+QZI_API size_t qzi_qwen21_identity_ref_layout(void)
+{
+    return sizeof(qzi_qwen21_identity_ref_request);
+}
+
+QZI_API size_t qzi_memory_plan_layout(void)
+{
+    return sizeof(qzi_memory_plan);
 }
 
 QZI_API const char *qzi_status_text(qzi_status status)
@@ -776,6 +941,7 @@ QZI_API qzi_status qzi_engine_create(const qzi_engine_config *config,
     }
     engine->backend = g_backend;
     engine->started = qzi_now_seconds();
+    engine->memory_profile = QZI_MEMORY_AUTO;
     mutex_init(&engine->mutex);
 
     status = engine->backend.init(&engine->context, config, error, error_cap);
@@ -785,6 +951,40 @@ QZI_API qzi_status qzi_engine_create(const qzi_engine_config *config,
         if (error[0] == '\0')
             qzi_set_error(error, error_cap, qzi_status_text(status));
         return status;
+    }
+
+    /* QZI_MEMORY_PROFILE (published by the managed config layer) is the only
+     * input at create time. Resolve AUTO from live VRAM and push the concrete
+     * profile into the backend so the allocator levers take effect before the
+     * first generation. A malformed value is ignored rather than failing the
+     * whole engine: low-VRAM tuning is an optimisation, not a correctness gate. */
+    {
+        char value[32];
+        if (qzi_getenv("QZI_MEMORY_PROFILE", value, sizeof(value)) == 1) {
+            qzi_memory_profile requested = QZI_MEMORY_AUTO;
+            if (!strcmp(value, "high")) requested = QZI_MEMORY_HIGH;
+            else if (!strcmp(value, "balanced")) requested = QZI_MEMORY_BALANCED;
+            else if (!strcmp(value, "low")) requested = QZI_MEMORY_LOW;
+            else if (!strcmp(value, "lowest")) requested = QZI_MEMORY_LOWEST;
+            else if (!strcmp(value, "auto")) requested = QZI_MEMORY_AUTO;
+            else if (*value >= '0' && *value <= '4' && value[1] == '\0')
+                requested = (qzi_memory_profile)(*value - '0');
+            if (engine->backend.set_memory_profile) {
+                qzi_health h;
+                int64_t total = -1;
+                memset(&h, 0, sizeof(h));
+                if (engine->backend.health &&
+                    engine->backend.health(engine->context, &h, error, error_cap) == QZI_OK)
+                    total = h.total_vram_mib;
+                qzi_memory_profile concrete =
+                    qzi_resolve_memory_profile(requested, total);
+                engine->backend.set_memory_profile(engine->context, concrete,
+                                                   error, error_cap);
+                engine->memory_profile = concrete;
+            } else {
+                engine->memory_profile = requested;
+            }
+        }
     }
     *out_engine = engine;
     return QZI_OK;
@@ -823,6 +1023,69 @@ QZI_API qzi_status qzi_engine_health(qzi_engine *engine, qzi_health *out,
         status = engine->backend.health(engine->context, out, error, error_cap);
         if (status != QZI_OK) return status;
     }
+    return QZI_OK;
+}
+
+QZI_API qzi_status qzi_engine_set_memory_profile(qzi_engine *engine,
+                                                  qzi_memory_profile profile,
+                                                  char *error, size_t error_cap)
+{
+    if (!engine) {
+        qzi_set_error(error, error_cap, "engine is required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (profile < QZI_MEMORY_AUTO || profile > QZI_MEMORY_LOWEST) {
+        qzi_set_error(error, error_cap,
+                      "memory profile must be 0 (auto) .. 4 (lowest)");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (!engine->backend.set_memory_profile)
+        return QZI_ERR_UNSUPPORTED;
+    if (!mutex_try_lock(&engine->mutex)) {
+        qzi_set_error(error, error_cap,
+                      "a generation owns the device; profile change refused while busy");
+        return QZI_ERR_BUSY;
+    }
+    /* Resolve AUTO against live device VRAM before the backend sees it: every
+     * backend slot receives a concrete profile. */
+    int64_t total = -1;
+    if (engine->backend.health) {
+        qzi_health h;
+        memset(&h, 0, sizeof(h));
+        if (engine->backend.health(engine->context, &h, error, error_cap) == QZI_OK)
+            total = h.total_vram_mib;
+    }
+    qzi_memory_profile concrete = qzi_resolve_memory_profile(profile, total);
+    qzi_status status = engine->backend.set_memory_profile(engine->context,
+                                                           concrete, error, error_cap);
+    if (status == QZI_OK) engine->memory_profile = concrete;
+    mutex_unlock(&engine->mutex);
+    return status;
+}
+
+QZI_API qzi_status qzi_engine_memory_plan(qzi_engine *engine,
+                                           qzi_memory_plan *out,
+                                           char *error, size_t error_cap)
+{
+    if (!engine || !out) {
+        qzi_set_error(error, error_cap, "engine and out are required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    if (!engine->backend.set_memory_profile)
+        return QZI_ERR_UNSUPPORTED;
+    memset(out, 0, sizeof(*out));
+    int64_t total = -1, free = -1;
+    if (engine->backend.health) {
+        qzi_health h;
+        memset(&h, 0, sizeof(h));
+        if (engine->backend.health(engine->context, &h, error, error_cap) == QZI_OK) {
+            total = h.total_vram_mib;
+            free = h.free_vram_mib;
+        }
+    }
+    qzi_memory_profile concrete =
+        qzi_resolve_memory_profile(engine->memory_profile, total);
+    qzi_fill_memory_plan(concrete, total, free, out);
     return QZI_OK;
 }
 
@@ -1059,6 +1322,39 @@ QZI_API qzi_status qzi_generate_qwen21_edit_ex(qzi_engine *engine,
     status = engine->backend.generate_qwen21_edit_ex(engine->context, &normalized,
                                                      callbacks, out_image, error,
                                                      error_cap);
+    return generation_leave(engine, status, out_image, QZI_MODEL_QWEN21,
+                            error, error_cap);
+}
+
+QZI_API qzi_status qzi_generate_qwen21_identity_ref(
+                                    qzi_engine *engine,
+                                    const qzi_qwen21_identity_ref_request *request,
+                                    const qzi_callbacks *callbacks,
+                                    qzi_image *out_image,
+                                    char *error, size_t error_cap)
+{
+    qzi_status status;
+    qzi_qwen21_identity_ref_request normalized;
+    if (!engine || !out_image || !error || error_cap == 0) {
+        qzi_set_error(error, error_cap,
+                      "engine, out_image and error buffer are required");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    memset(out_image, 0, sizeof(*out_image));
+    error[0] = '\0';
+    status = qzi_validate_qwen21_identity_ref(request, error, error_cap);
+    if (status != QZI_OK) { engine->rejected++; return status; }
+    if (!engine->backend.generate_qwen21_identity_ref) {
+        engine->rejected++;
+        qzi_set_error(error, error_cap,
+            "the registered native backend does not implement Qwen-Image 2.1 "
+            "identity reference");
+        return QZI_ERR_UNSUPPORTED;
+    }
+    qzi_normalize_qwen21_identity_ref(request, &normalized);
+    if (!generation_enter(engine, error, error_cap)) return QZI_ERR_BUSY;
+    status = engine->backend.generate_qwen21_identity_ref(
+        engine->context, &normalized, callbacks, out_image, error, error_cap);
     return generation_leave(engine, status, out_image, QZI_MODEL_QWEN21,
                             error, error_cap);
 }

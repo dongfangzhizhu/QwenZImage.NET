@@ -41,7 +41,17 @@ typedef struct stub_state {
      * reference engine behaves like the real one: changing the environment
      * afterwards must not change this engine's output. */
     uint64_t config_tag;
+    /* Low-VRAM profile is tracked for observability. The reference backend has
+     * no device, so it reports a fixed synthetic VRAM total that resolves AUTO
+     * to "balanced" and exercises the same plan/validation path as the real
+     * backend. Generation bytes are unaffected (this is a control-plane knob). */
+    qzi_memory_profile memory_profile;
 } stub_state;
+
+/* Synthetic device reported by the reference backend. 16 GiB total resolves
+ * AUTO -> balanced (>= 12288), so health and plan are deterministic. */
+#define QZI_STUB_TOTAL_VRAM_MIB 16384
+#define QZI_STUB_FREE_VRAM_MIB  12288
 
 static char *dup_or_null(const char *s)
 {
@@ -227,6 +237,7 @@ static qzi_status stub_init(void **out_context,
     s->device_id = config->device_id;
     s->resident = QZI_MODEL_NONE;
     s->config_tag = config_fingerprint(config);
+    s->memory_profile = QZI_MEMORY_AUTO;
     if ((config->qwen21_dir && !s->qwen21_dir) ||
         (config->zimage_dir && !s->zimage_dir) ||
         (config->cache_dir && !s->cache_dir)) {
@@ -254,10 +265,23 @@ static qzi_status stub_health(void *context, qzi_health *out,
 {
     stub_state *s = (stub_state *)context;
     out->device_id = s->device_id < 0 ? 0 : s->device_id;
-    out->free_vram_mib = -1;
-    out->total_vram_mib = -1;
+    out->free_vram_mib = QZI_STUB_FREE_VRAM_MIB;
+    out->total_vram_mib = QZI_STUB_TOTAL_VRAM_MIB;
     out->reference_backend = 1;
     (void)error; (void)error_cap;
+    return QZI_OK;
+}
+
+static qzi_status stub_set_memory_profile(void *context,
+                                          qzi_memory_profile profile,
+                                          char *error, size_t error_cap)
+{
+    stub_state *s = (stub_state *)context;
+    if (!s || profile < QZI_MEMORY_HIGH || profile > QZI_MEMORY_LOWEST) {
+        qzi_set_error(error, error_cap, "stub: invalid concrete memory profile");
+        return QZI_ERR_INVALID_ARGUMENT;
+    }
+    s->memory_profile = profile;
     return QZI_OK;
 }
 
@@ -441,6 +465,94 @@ static qzi_status stub_generate_qwen21_edit_ex(void *context,
                                      out_image, error, error_cap);
 }
 
+/* Identity-reference generation (WanGP image_refs / "I" mode). Unlike the
+ * img2img edit path, denoising starts from PURE NOISE: the reference is an
+ * identity condition, not an init_latent. The deterministic tag therefore
+ * mixes in every reference buffer, its geometry, the relative-size weight and
+ * the encode cap so each knob is observable without a GPU. The phase trace
+ * reports one "image encode" stage per reference (the real backend VAE-encodes
+ * each condition image) and the full step count. */
+static qzi_status stub_generate_qwen21_identity_ref(
+                        void *context,
+                        const qzi_qwen21_identity_ref_request *request,
+                        const qzi_callbacks *callbacks,
+                        qzi_image *out_image,
+                        char *error, size_t error_cap)
+{
+    stub_state *s = (stub_state *)context;
+    qzi_status status;
+    uint8_t *rgb, *png;
+    size_t png_size = 0;
+    const qzi_qwen21_request *base = &request->base;
+    const char *tier = base->tier && *base->tier ? base->tier : "turbo";
+    const char *lora = base->lora ? base->lora : "";
+    double start = qzi_now_seconds();
+    uint64_t tag = 0x494452454631ULL; /* "IDREF1" */
+    uint32_t i;
+
+    /* Validate BEFORE touching any caller-owned buffer: an integrator may call
+     * the backend directly with a bogus count / geometry / NULL pointer. */
+    status = qzi_validate_qwen21_identity_ref(request, error, error_cap);
+    if (status != QZI_OK) return status;
+
+    tag ^= qzi_fnv1a(tier) ^ qzi_fnv1a(lora) ^
+           qzi_fnv1a(base->negative_prompt ? base->negative_prompt : "");
+    tag ^= (uint64_t)(uint32_t)base->steps * 0x9E3779B97F4A7C15ULL;
+    tag ^= float_bits(base->guidance) * 0xBF58476D1CE4E5B9ULL;
+    tag ^= float_bits(base->lora_scale) * 0x94D049BB133111EBULL;
+    tag ^= s->config_tag;
+    tag ^= (uint64_t)request->reference_count * 0xD6E8FEB86659FD93ULL;
+    tag ^= float_bits(request->identity_ref_weight) * 0x9E3779B97F4A7C15ULL;
+    tag ^= (uint64_t)request->reference_encode_max_side * 0xBF58476D1CE4E5B9ULL;
+    for (i = 0; i < request->reference_count; i++) {
+        size_t pixels = (size_t)request->reference_widths[i] *
+                        (size_t)request->reference_heights[i];
+        tag ^= hash_bytes(request->reference_rgb[i], 3u * pixels) *
+               (i % 2 ? 0x9E3779B97F4A7C15ULL : 0xBF58476D1CE4E5B9ULL);
+        tag ^= ((uint64_t)request->reference_widths[i] << 32) ^
+               (uint64_t)request->reference_heights[i];
+    }
+
+    if (!s->qwen21_dir) {
+        qzi_set_error(error, error_cap,
+                      "qwen21 model pack is not configured (qwen21_dir)");
+        return QZI_ERR_NOT_CONFIGURED;
+    }
+    /* The real backend re-encodes every reference, so the phase count tracks
+     * reference_count; a switched tier / adapter still emits "model load". */
+    {
+        int switched = (s->resident != QZI_MODEL_QWEN21) ||
+                       strcmp(s->tier, tier) != 0 ||
+                       strcmp(s->lora, lora) != 0 ||
+                       s->lora_scale != base->lora_scale;
+        int32_t steps = base->steps > 0 ? base->steps : 8;
+        status = run_phases(callbacks, start, QZI_MODEL_QWEN21, switched, steps,
+                            (int)request->reference_count, s, error, error_cap);
+    }
+    if (status != QZI_OK) return status;
+
+    snprintf(s->tier, sizeof(s->tier), "%s", tier);
+    snprintf(s->lora, sizeof(s->lora), "%s", lora);
+    s->lora_scale = base->lora_scale;
+
+    rgb = make_pixels(base->prompt, (uint32_t)base->width,
+                      (uint32_t)base->height, 3u, base->seed, tag,
+                      error, error_cap);
+    if (!rgb) return QZI_ERR_OUT_OF_MEMORY;
+    png = qzi_png_encode_rgb8(rgb, (uint32_t)base->width,
+                              (uint32_t)base->height, &png_size,
+                              error, error_cap);
+    free(rgb);
+    if (!png) return QZI_ERR_ENGINE;
+
+    memset(out_image, 0, sizeof(*out_image));
+    out_image->data = png;
+    out_image->size = png_size;
+    out_image->width = (uint32_t)base->width;
+    out_image->height = (uint32_t)base->height;
+    return QZI_OK;
+}
+
 /* Shared Z-Image implementation. `control` is NULL for plain text-to-image;
  * when present, the deterministic tag mixes in the control image pixels, the
  * canonical control type and the context scale, and the phase trace gains the
@@ -574,7 +686,9 @@ const qzi_backend qzi_reference_vtable = {
     stub_generate_qwen21_edit,
     stub_generate_zimage_control,
     stub_generate_qwen21_edit_ex,
-    stub_generate_zimage_inpaint
+    stub_generate_zimage_inpaint,
+    stub_generate_qwen21_identity_ref,
+    stub_set_memory_profile
 };
 
 /* The vtable's context pointer must be per-engine, not a global: qzi.c copies

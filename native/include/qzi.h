@@ -63,6 +63,28 @@ extern "C" {
  * 33-channel context as [control_latent | keep_mask | inpaint_latent]; this
  * bit means the last 17 planes can actually be populated from a mask. */
 #define QZI_FEATURE_ZIMAGE_INPAINT  0x8u
+/* Qwen-Image 2.1 identity reference: one or more reference images are supplied
+ * as IDENTITY CONDITION (WanGP video_prompt_type="I" / image_refs), not as an
+ * img2img denoising origin. Output is a fresh generation that keeps the face.
+ * The data path, validation and deterministic backend are complete; the CUDA
+ * condition-prefix DiT injection is the next engine milestone. */
+#define QZI_FEATURE_QWEN21_IDENTITY_REF 0x10u
+/* Low-VRAM / memory profile. The engine can observe device VRAM and select a
+ * budget preset that keeps the 7B DiT, VAEs and text tower runnable on small
+ * cards (WanGP's mmgp profileHigh/profileLow behaviour). Additive like every
+ * other bit: QZI_ABI_VERSION stays 1 and no existing struct or export moves. */
+#define QZI_FEATURE_LOW_VRAM 0x20u
+
+/* WanGP accepts at most 10 ordered reference images. */
+#define QZI_MAX_IDENTITY_REFS 10u
+/* Default WanGP image_refs_relative_size used by this project's casting recipe
+ * (tools/wgp_qwen_characters.py); the slider range is 20..100. */
+#define QZI_IDENTITY_REF_DEFAULT_WEIGHT 70.0f
+/* Default cap on the LONGEST side used for VAE-encoding a reference image.
+ * A 1024x1024 reference otherwise allocates ~13 GiB in qzen_qwen21_vae_encode
+ * and OOMs; references are downscaled to this grid before encoding and the
+ * latent is upsampled back to the output grid. Must be a multiple of 16. */
+#define QZI_REFERENCE_ENCODE_DEFAULT_MAX_SIDE 768u
 
 /* Outpainting margins and source offsets are aligned to 32 pixels, matching
  * models/qwen21/pipeline.py OUTPAINTING_ALIGNMENT. */
@@ -301,6 +323,94 @@ typedef struct qzi_zimage_inpaint_request {
     uint32_t           flags;             /* reserved, must be 0 */
 } qzi_zimage_inpaint_request;
 
+/* Qwen-Image 2.1 IDENTITY REFERENCE, additive in ABI v1 exactly like the four
+ * increments above: qzi_qwen21_request and every existing export keep their
+ * layout, and the new request embeds the ordinary t2i request as its first
+ * member. Probe QZI_FEATURE_QWEN21_IDENTITY_REF and
+ * qzi_qwen21_identity_ref_layout() before calling
+ * qzi_generate_qwen21_identity_ref().
+ *
+ * This is the WanGP "video_prompt_type='I'" (Reference Images Are People or
+ * Objects) semantic, NOT image editing: every reference image is VAE-encoded
+ * and injected as an identity CONDITION, and denoising starts from PURE NOISE.
+ * The output is a brand-new image of the same person in a different outfit /
+ * pose / angle, so identity locking and large wardrobe changes do not fight
+ * each other the way they do in the img2img edit path.
+ *
+ * `reference_rgb` is an ARRAY of `reference_count` planar RGB8 buffers. Buffer
+ * i holds 3 * reference_width[i] * reference_height[i] bytes (R plane, then G,
+ * then B). All buffers, the width/height arrays, and the pixel data are owned
+ * by the caller and only read during the synchronous call.
+ *
+ * `identity_ref_weight` mirrors WanGP's image_refs_relative_size (slider 20..100).
+ * 0.0f is the "use the engine default" sentinel (70). Finite values must lie in
+ * 20..100. Invalid values are rejected, never silently coerced.
+ *
+ * `reference_encode_max_side` decouples the reference VAE-encode resolution
+ * from the OUTPUT canvas: each reference is cover-fitted and downscaled so its
+ * longest side is at most this value before encoding (a 1024x1024 reference
+ * otherwise allocates ~13 GiB and OOMs). It must be a multiple of 16; 0 means
+ * "use the engine default" (768). The result latent is upsampled back to the
+ * output grid. This knob does not change the output canvas dimensions. */
+typedef struct qzi_qwen21_identity_ref_request {
+    qzi_qwen21_request   base;                   /* the ordinary t2i request */
+    const uint8_t *const *reference_rgb;          /* [count] planar RGB8 buffers */
+    const uint32_t       *reference_widths;       /* [count] widths (1..4096) */
+    const uint32_t       *reference_heights;      /* [count] heights (1..4096) */
+    uint32_t              reference_count;        /* 1..QZI_MAX_IDENTITY_REFS */
+    float                 identity_ref_weight;    /* 0 sentinel, else 20..100 */
+    uint32_t              reference_encode_max_side; /* 0 sentinel, else multiple of 16 */
+    uint32_t              flags;                  /* reserved, must be 0 */
+} qzi_qwen21_identity_ref_request;
+
+/* LOW-VRAM / MEMORY PROFILE, the SIXTH additive ABI v1 increment. Just like the
+ * five before it, this is probed through qzi_abi_features() + export discovery;
+ * no pre-existing struct, export or vtable slot changes size or position.
+ *
+ * WanGP runs the same 7B model on 8 GiB cards by keeping weights in RAM and
+ * streaming blocks to the GPU (mmgp profileHigh/profileLow). This engine keeps
+ * the INT8 DiT resident, so its equivalent levers are: how much VRAM the async
+ * allocator is allowed to hold before returning blocks to the driver, the
+ * longest side used to VAE-encode a reference, and whether the denoiser stays
+ * mapped between requests. A profile is a named bundle of those levers so an
+ * application does not have to know the individual knobs.
+ *
+ * AUTO (0) resolves once at engine create from the device's total VRAM:
+ *   >= 20 GiB  -> high      (fastest; pool keeps blocks resident)
+ *   >= 12 GiB  -> balanced
+ *   >=  8 GiB  -> low       (smaller encode cap, tighter pool)
+ *    <  8 GiB  -> lowest    (smallest encode cap, tightest pool)
+ * An unknown VRAM total (reference backend) resolves to "balanced". */
+typedef enum qzi_memory_profile {
+    QZI_MEMORY_AUTO     = 0,
+    QZI_MEMORY_HIGH     = 1,
+    QZI_MEMORY_BALANCED = 2,
+    QZI_MEMORY_LOW      = 3,
+    QZI_MEMORY_LOWEST   = 4
+} qzi_memory_profile;
+
+/* Resolved, read-only description of a profile. `qzi_engine_memory_plan()`
+ * fills it from the engine's active profile and the live device VRAM; nothing
+ * in it is writable. All sizes are in MiB unless noted.
+ *   pool_release_mib     - async allocator release threshold (blocks above it
+ *                          go back to the driver instead of staying pooled).
+ *                          The current engine default is 24576 (24 GiB), which
+ *                          never releases on a small card; LOW / LOWEST lower
+ *                          it so freed blocks return to the driver.
+ *   reference_encode_cap - longest side for VAE-encoding a reference image;
+ *                          this is the DEFAULT applied when a request passes 0
+ *                          for reference_encode_max_side. An explicit request
+ *                          value still wins.
+ *   total_vram_mib / free_vram_mib - -1 when the device cannot be queried. */
+typedef struct qzi_memory_plan {
+    int32_t  profile;               /* one of qzi_memory_profile, never AUTO */
+    int64_t  total_vram_mib;
+    int64_t  free_vram_mib;
+    int32_t  pool_release_mib;
+    int32_t  reference_encode_cap;  /* longest side, px */
+    uint32_t flags;                 /* reserved, 0 */
+} qzi_memory_plan;
+
 /* Progress callback. `phase` is a static literal: "model load", "text",
  * "image encode" (image edits / ControlNet: VAE-encoding the reference or
  * control image), "dit"
@@ -369,6 +479,11 @@ QZI_API size_t      qzi_qwen21_edit_ex_layout(void);
 /* sizeof(qzi_zimage_inpaint_request); additive in v1, old libraries do not
  * export it at all. */
 QZI_API size_t      qzi_zimage_inpaint_layout(void);
+/* sizeof(qzi_qwen21_identity_ref_request); fifth additive increment, old
+ * libraries do not export it at all. */
+QZI_API size_t      qzi_qwen21_identity_ref_layout(void);
+/* sizeof(qzi_memory_plan); sixth additive increment (low-VRAM). */
+QZI_API size_t      qzi_memory_plan_layout(void);
 
 /* Reports sizeof() for the six POD structs above. Used by the managed wrapper
  * to fail fast on a struct-packing mismatch instead of corrupting memory. */
@@ -448,6 +563,32 @@ QZI_API qzi_status  qzi_generate_zimage_inpaint(qzi_engine *engine,
                                                 const qzi_callbacks *callbacks,
                                                 qzi_image *out_image,
                                                 char *error, size_t error_cap);
+
+/* Qwen-Image 2.1 identity-reference generation (WanGP image_refs / "I" mode).
+ * Same single-flight, progress, cancellation and buffer-ownership rules as
+ * qzi_generate_qwen21(). Returns QZI_ERR_UNSUPPORTED when the registered
+ * backend has no identity-ref slot. All reference buffers, width/height arrays
+ * and their pixels are only read during the call and remain owned by the
+ * caller. Requires the fifth additive capability bit and layout export. */
+QZI_API qzi_status  qzi_generate_qwen21_identity_ref(
+                                    qzi_engine *engine,
+                                    const qzi_qwen21_identity_ref_request *request,
+                                    const qzi_callbacks *callbacks,
+                                    qzi_image *out_image,
+                                    char *error, size_t error_cap);
+
+/* LOW-VRAM / MEMORY PROFILE (sixth additive increment). Probe
+ * QZI_FEATURE_LOW_VRAM and qzi_memory_plan_layout() first. Setting a profile
+ * is a cheap, synchronous control-plane call (no model load); it changes how
+ * subsequent generations budget VRAM. AUTO resolves from the live device VRAM
+ * at engine create. Both calls return QZI_ERR_UNSUPPORTED when the loaded
+ * library predates this increment. */
+QZI_API qzi_status  qzi_engine_set_memory_profile(qzi_engine *engine,
+                                                  qzi_memory_profile profile,
+                                                  char *error, size_t error_cap);
+QZI_API qzi_status  qzi_engine_memory_plan(qzi_engine *engine,
+                                           qzi_memory_plan *out,
+                                           char *error, size_t error_cap);
 
 /* Releases the buffer behind out_image and zeroes the struct. Idempotent for
  * a zeroed image; calling twice with the same token is undefined. */

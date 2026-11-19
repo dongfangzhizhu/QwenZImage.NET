@@ -107,9 +107,51 @@ native 侧 `qzi_validate_qwen21_edit_ex()` 先复用 `qzi_validate_qwen21_edit()
 
 能力探测比普通编辑多一层依赖：`Qwen21EditExOptions` 内嵌了普通编辑请求，因此 `AbiGuard` 要求 `SupportsImageEditing` **与** `qzi_abi_features() & 0x4`、`qzi_qwen21_edit_ex_layout()` 尺寸比对、`qzi_generate_qwen21_edit_ex` 导出四者全部通过才报告支持。WebUI 里只要出现任一高级字段（`margin_*` / `model_mode` / `rgba`），`RequestMapper` 就把普通编辑作业升级成 `Qwen21EditExOptions`；全部字段都省略时仍走第二个增量扩展，旧库照样可用。
 
-**保真度边界**：WanGP 的 Qwen-Image 编辑是 condition-prefix 模型（参考 latent 拼在带噪目标前面，DiT 通过注意力读取它），本引擎是 img2img sampler（参考图就是起点 latent）。因此 Red Canvas 外扩通过「边距 + 绘制区从全噪声起步、保留区 pin 到已知轨迹」来近似，**不是逐像素复刻 WanGP 的外扩效果**；详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。多参考图、20B edit / edit_plus / layered、Viggle / Pruna、prompt enhancer `EDITING` 仍不在本库范围内。
+**保真度边界**：WanGP 的 Qwen-Image 编辑是 condition-prefix 模型（参考 latent 拼在带噪目标前面，DiT 通过注意力读取它），本引擎是 img2img sampler（参考图就是起点 latent）。因此 Red Canvas 外扩通过「边距 + 绘制区从全噪声起步、保留区 pin 到已知轨迹」来近似，**不是逐像素复刻 WanGP 的外扩效果**；详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。20B edit / edit_plus / layered、Viggle / Pruna、prompt enhancer `EDITING` 仍不在本库范围内。多参考图身份条件已通过第五增量交付完整数据管线与真实 CUDA condition-prefix 实现，见下节。
 
 WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`margin_*` / `model_mode` / `rgba`），C 契约见 [NATIVE_ABI.md](NATIVE_ABI.md)。
+
+## Qwen-Image 2.1 身份参考（`Qwen21IdentityRefOptions`）
+
+第五个 ABI v1 增量，对应 Wan2GP `image_refs` + `video_prompt_type="I"`。它继承和复用 `QwenImageOptions` 的全部 t2i 字段（尺寸/tier/steps/guidance/LoRA/prompt），但**不走 img2img**：参考图是身份条件，去噪从纯噪声开始，因此可以同时锁住人物身份并大幅改服装 / 姿势 / 视角。对应 native 结构体 `qzi_qwen21_identity_ref_request`，入口 `qzi_generate_qwen21_identity_ref()`，`.NET` 侧 `GenerateQwen21IdentityRef(Async)`。
+
+| 字段 | 默认值 | 规则 |
+| --- | --- | --- |
+| `References` | 必填 | 1..`Qwen21IdentityRef.MaxReferences`（10）张 3 通道平面 RGB `QziRasterImage`；每边 1..4096、总像素 ≤ 2048² |
+| `IdentityRefWeight` | `null` → `70` | 20..100，`0` 也接受（C ABI sentinel，等同默认 70）。对齐 WanGP `image_refs_relative_size` |
+| `ReferenceEncodeMaxSide` | `null` → `768` | 16 的倍数、16..2048，`0` 也接受（等同默认 768）。控制每张参考图 VAE 编码前的最长边，降低大图显存占用 |
+| `Flags` | `0` | 保留字段，必须为 `0` |
+
+`EffectiveIdentityRefWeight` / `EffectiveReferenceEncodeMaxSide` 是实际发给 native 的有效值（null 已解析为默认值；显式 0 留给 native 归一化）。托管 `RequestValidator.Validate(Qwen21IdentityRefOptions)` 与 native `qzi_validate_qwen21_identity_ref()` 规则一致；NaN / Inf 一律拒绝。老 native 库缺该能力时 `SupportsIdentityReference == false`，调用抛 `QziException(QziStatus.Unsupported)`。能力探测检查 `qzi_abi_features() & 0x10`、`qzi_qwen21_identity_ref_layout()` 尺寸和 `qzi_generate_qwen21_identity_ref()` 导出三项。
+
+**真实后端行为**：CUDA backend 已把权重解释为参考图相对分辨率（`weight/100 ×` 目标 latent 网格），每张参考图 cover-fit 到该尺寸后 VAE 编码，作为 condition prefix 拼在噪声目标前面；`img_in` 共享，prefix 用 t=0 modulation、target 用实际 sigma、attention 按 text / 每个 reference block / target 分段限制可见 key，RoPE 逐块递增 frame，最终只输出 target tail。去噪起点是纯噪声，不经过 img2img。文本塔暂未移植 Qwen3-VL `visual.*`，因此视觉语义完全由 VAE latent 前缀承载；这和 WanGP 的 `<|image_pad|>` 视觉 embedding 不是逐像素等价，但已能在真图回归中同时锁脸与大幅换装。参考后端仍把每张图的像素、尺寸、数量、权重和编码上限混入确定性输出，并按参考图数量上报 `"image encode"` 阶段，供无 GPU 测试验证参数贯通。
+
+WebUI 等价字段见 [WEBUI.md](WEBUI.md)（`identity_refs` / `identity_ref_weight` / `reference_encode_max_side`，`model = "qwen21-identity"`）；数组元素可以是 base64 PNG 数据 URL，也可以是本地 PNG 文件路径。
+
+## 低显存 / 内存 profile（`QziMemoryProfile`）
+
+第六个 ABI v1 增量，对应 WanGP 的 mmgp 低显存 profile。它不是请求字段，而是**引擎级控制面设置**，对所有模型（t2i / 编辑 / ControlNet / inpaint / 身份参考）一视同仁；因此不影响任何 `GenerationOptions` 的字节语义，也不占 `served` 计数。
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `QziClientOptions.MemoryProfile` / config `memory_profile` | `auto`（默认）/ `high` / `balanced` / `low` / `lowest`（或 0..4） | 创建引擎时通过 `QZI_MEMORY_PROFILE` 传给 native；`auto` 按设备总显存解析 |
+| `QziClient.SetMemoryProfile(profile)` | 同上 | 运行时切换（busy 时抛 `QziException(QziStatus.Busy)`）；`auto` 重新按实时 VRAM 解析 |
+| `QziClient.GetMemoryPlan()` | → `QziMemoryPlan` | 读已解析预算与设备级 free/total VRAM（查询失败为 -1） |
+| `QziClient.GetHealth().FreeVramMib / TotalVramMib` | MiB | 设备级显存（nvidia-smi 口径），本增量起真实后端不再固定为 -1 |
+
+解析规则与预算（`AUTO`：≥20 GiB→high，≥12 GiB→balanced，≥8 GiB→low，<8 GiB→lowest；显存未知→balanced）：
+
+| profile | 分配器释放阈值 | 参考图编码上限（0 哨兵时） |
+|---|---|---|
+| high | 24 GiB（历史默认） | 768 px |
+| balanced | 4 GiB | 768 px |
+| low | 1 GiB | 512 px |
+| lowest | 256 MiB | 384 px |
+
+- 参考图编码上限只作用于请求的 `reference_encode_max_side == 0`（默认）；显式值始终优先。编辑、身份参考两条路径都遵守该默认值。
+- 真实后端把释放阈值写成 `QZEN_GPU_POOL_RELEASE_MIB`，在后续新建显存上下文时生效（低显存卡切换模型 / VAE 阶段时能真正把块还给驱动）；手工设置该环境变量优先于 profile。
+- 老 native 库缺该能力时 `SupportsLowVram == false`，调用 `SetMemoryProfile` / `GetMemoryPlan` 抛 `QziException(QziStatus.Unsupported)`；能力探测检查 `qzi_abi_features() & 0x20`、`qzi_memory_plan_layout()` 尺寸与两个导出。
+- WebUI 等价字段见 [WEBUI.md](WEBUI.md)（`supports_low_vram`、`memory_profile`、`pool_release_mib`、`reference_encode_cap`、`POST /api/memory-profile`）。
 
 ## Z-Image（`ZImageOptions`）
 
@@ -213,7 +255,7 @@ native 侧通过 `qzi_progress_fn` 上报的 `phase` 是**静态字面量**，�
 | --- | --- | --- |
 | `"model load"` | `ModelLoad` | 权重加载阶段 |
 | `"text"` | `Text` | 文本编码 |
-| `"image encode"` | `ImageEncode` | **图像编辑 / Z-Image ControlNet / inpaint**：把参考图、控制图（inpaint 时还有遮罩后的源图）VAE 编码成 latents。真实后端一律按**单个**阶段上报（`0/1 → 1/1`），inpaint 的第二次编码折算在里面；只有 GPU-free 参考后端把 inpaint 拆成**两个**独立阶段（`0/2 → 1/2 → 2/2`）供无 GPU 测试断言 |
+| `"image encode"` | `ImageEncode` | **图像编辑 / Z-Image ControlNet / inpaint / 身份参考**：把参考图、控制图（inpaint 时还有遮罩后的源图）VAE 编码成 latents。真实后端一律按**单个**阶段上报（`0/1 → 1/1`），inpaint 的第二次编码折算在里面；参考后端把 inpaint 拆成**两个**独立阶段（`0/2 → 1/2 → 2/2`），身份参考则按参考图数量上报（每张 `0/n → 1/n`），供无 GPU 测试断言 |
 | `"dit"` | `Dit` | 去噪步数（Turbo 为 8 步；编辑时只跑 `steps - first_step` 步） |
 | `"vae"` | `Vae` | VAE 解码 |
 | `"encode"` | `Encode` | PNG 编码 |

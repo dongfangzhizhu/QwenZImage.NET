@@ -56,6 +56,7 @@ internal sealed class NativeConfigScope : IDisposable
         (QziConfig.NunchakuDirectoryVariable, o => o.ZImageNunchakuDirectory),
         (QziConfig.ZImageControlDirectoryVariable, o => o.ZImageControlDirectory),
         (QziConfig.ModelCacheVariable, o => o.CacheDirectory),
+        (QziConfig.MemoryProfileVariable, o => o.MemoryProfile),
     ];
 
     /// <summary>Names covered by the scope (also used by the config tests).</summary>

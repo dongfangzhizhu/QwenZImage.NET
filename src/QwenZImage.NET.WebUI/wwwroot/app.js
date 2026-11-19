@@ -17,6 +17,10 @@ const state = {
   referencePng: null,
   maskDirty: false,
   editingAvailable: true,
+  // Fifth additive ABI v1 increment: identity references (Wan2GP image_refs).
+  // PNG data URLs produced by canvas, so the server decoder stays unchanged.
+  identityRefs: [],
+  identityAvailable: true,
   // Third additive ABI v1 increment: outpainting / LanPaint / RGBA.
   advancedEditingAvailable: true,
   // Z-Image Turbo Fun ControlNet Union state. `controlSourcePng` is the raw
@@ -56,6 +60,7 @@ const state = {
 // checkpoint / 16-px steps still apply and qwen21-only fields stay hidden.
 const modelFamily = () => ($("model").value.startsWith("qwen21") ? "qwen21" : "zimage");
 const isEditMode = () => $("model").value === "qwen21-edit";
+const isIdentityMode = () => $("model").value === "qwen21-identity";
 const isControlMode = () => $("model").value === "zimage-control";
 const isInpaintMode = () => $("model").value === "zimage-inpaint";
 // Inpaint is a strict superset of ControlNet: it always carries a control
@@ -96,6 +101,11 @@ async function refreshHealth() {
       const backend = reference ? "reference backend (noise)" : (h.engine?.backend || "engine backend");
       pill.className = reference ? "pill pill-wait" : "pill pill-ok";
       pill.textContent = `● ${backend} · ${h.engine?.resident_model || "no model"}`;
+      const mem = h.engine?.memory_profile;
+      const vram = (h.engine?.free_vram_mib >= 0 && h.engine?.total_vram_mib > 0)
+        ? ` · ${Math.round(h.engine.free_vram_mib / 1024)}/${Math.round(h.engine.total_vram_mib / 1024)} GB VRAM`
+        : "";
+      pill.textContent = `● ${backend} · ${h.engine?.resident_model || "no model"}${mem ? ` · ${mem}` : ""}${vram}`;
       pill.title = [
         `transport: ${h.transport}`,
         `config: ${h.config_path || "(defaults)"}`,
@@ -104,7 +114,15 @@ async function refreshHealth() {
         `native: ${h.native_library || "(runtime default probe)"}`,
         `native_source: ${h.native_library_source || "unknown"}`,
         `served: ${h.engine?.served ?? 0}`,
-      ].join("\n");
+        mem ? `memory profile: ${mem} (pool release ${h.engine.pool_release_mib} MiB, encode cap ${h.engine.reference_encode_cap} px)` : "",
+      ].filter(Boolean).join("\n");
+      // Low-VRAM profile selector (sixth additive increment).
+      const memSelect = $("memory-profile");
+      const lowVram = h.supports_low_vram === true;
+      if (memSelect) {
+        memSelect.hidden = !lowVram;
+        if (lowVram && mem && memSelect.value !== mem) memSelect.value = mem;
+      }
       $("backend-banner").hidden = !reference;
       // /api/preprocess advertises its operators and which WanGP ONNX
       // estimators are actually installed. It works without a native engine.
@@ -116,6 +134,21 @@ async function refreshHealth() {
       const editOption = document.querySelector('#model option[value="qwen21-edit"]');
       if (editOption) editOption.disabled = !state.editingAvailable;
       if (!state.editingAvailable && isEditMode()) {
+        $("model").value = "qwen21";
+        switchModel();
+      }
+      // Identity references are the fifth optional increment. Without the
+      // qzi_generate_qwen21_identity_ref export the mode is hidden, so a job
+      // never fails after being queued.
+      state.identityAvailable = h.supports_identity_reference === true;
+      const identityOption = document.querySelector('#model option[value="qwen21-identity"]');
+      if (identityOption) {
+        identityOption.disabled = !state.identityAvailable;
+        identityOption.title = state.identityAvailable
+          ? "Identity conditions from 1-10 reference images (Wan2GP image_refs)"
+          : "Unavailable: the loaded native library has no identity-reference export";
+      }
+      if (!state.identityAvailable && isIdentityMode()) {
         $("model").value = "qwen21";
         switchModel();
       }
@@ -211,6 +244,7 @@ function markCustom() { $("preset").value = ""; }
 function syncModelUI() {
   const family = modelFamily();
   const edit = isEditMode();
+  const identity = isIdentityMode();
   const inpaint = isInpaintMode();
   const step = family === "qwen21" ? 32 : 16;
   $("width").step = String(step);
@@ -230,6 +264,7 @@ function syncModelUI() {
     const only = el.getAttribute("data-only");
     el.hidden = only === "qwen21" ? family !== "qwen21"
       : only === "qwen21-edit" ? !edit
+      : only === "qwen21-identity" ? !identity
       : only === "zimage" ? family !== "zimage"
       : only === "zimage-control" ? !isControlLike()
       : only === "edit-or-inpaint" ? !(edit || inpaint)
@@ -341,6 +376,69 @@ async function loadReference(file) {
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+// ------------------------------------------------------- identity references
+
+/* Wan2GP-style identity_refs: up to 10 PNG data URLs. Re-encoding through a
+ * canvas keeps browser JPEG / WebP uploads compatible with the server's
+ * PNG-only decoder and applies the same raster limits as loadReference(). */
+async function loadIdentityRefs(files) {
+  const incoming = Array.from(files || []);
+  if (!incoming.length) return;
+  const room = 10 - state.identityRefs.length;
+  if (room <= 0) {
+    showToast("At most 10 identity references are allowed. Remove one first.");
+    return;
+  }
+  const selected = incoming.slice(0, room);
+  if (incoming.length > room) {
+    showToast(`Only ${room} more reference(s) fit; the rest were ignored.`);
+  }
+  const added = [];
+  try {
+    for (const file of selected) {
+      const url = URL.createObjectURL(file);
+      try {
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        const maxSide = 4096, maxPixels = 2048 * 2048;
+        const scale = Math.min(1, maxSide / image.naturalWidth,
+          maxSide / image.naturalHeight,
+          Math.sqrt(maxPixels / (image.naturalWidth * image.naturalHeight)));
+        const width = Math.max(1, Math.round(image.naturalWidth * scale));
+        const height = Math.max(1, Math.round(image.naturalHeight * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        canvas.getContext("2d").drawImage(image, 0, 0, width, height);
+        added.push(canvas.toDataURL("image/png"));
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+  } catch (error) {
+    showToast(`Could not read an identity reference: ${error.message || error}`);
+    return;
+  }
+  state.identityRefs.push(...added);
+  $("identity-file").value = "";
+  renderIdentityRefs();
+  showToast(`${added.length} identity reference(s) loaded · ${state.identityRefs.length}/10.`);
+}
+
+function renderIdentityRefs() {
+  const gallery = $("identity-thumbs");
+  if (!gallery) return;
+  gallery.innerHTML = state.identityRefs.map((png, i) =>
+    `<div class="identity-thumb"><img src="${png}" alt="Identity reference ${i + 1}">` +
+    `<button class="btn btn-ghost btn-sm" type="button" data-identity-remove="${i}">×</button></div>`
+  ).join("");
+  $("identity-empty").hidden = state.identityRefs.length > 0;
+  $("identity-count").textContent = `${state.identityRefs.length}/10`;
+  $("identity-weight-hint").textContent = Number($("identity-weight").value).toFixed(0);
+  $("identity-encode-hint").textContent = `${$("identity-encode-side").value} px`;
 }
 
 function strokeGeometry(event) {
@@ -647,6 +745,11 @@ function buildRequestBody() {
   } else {
     body.checkpoint = $("checkpoint").value;
   }
+  if (isIdentityMode()) {
+    body.identity_refs = state.identityRefs.slice();
+    body.identity_ref_weight = Number($("identity-weight").value);
+    body.reference_encode_max_side = Number($("identity-encode-side").value);
+  }
   if (isEditMode()) {
     body.reference_image = state.referencePng;
     body.strength = Number($("strength").value);
@@ -678,6 +781,11 @@ async function submit() {
   if (!$("prompt").value.trim()) {
     showToast("Please enter a prompt.");
     $("prompt").focus();
+    return;
+  }
+  if (isIdentityMode() && state.identityRefs.length === 0) {
+    showToast("Upload at least one identity reference before queueing the job.");
+    $("identity-file").focus();
     return;
   }
   if (isEditMode() && !state.referencePng) {
@@ -748,6 +856,9 @@ function renderJobs() {
     const editBadge = job.edit
       ? `<span class="job-edit-badge">edit${job.has_mask ? " · mask" : ""}</span>`
       : "";
+    const identityBadge = job.identity_ref
+      ? `<span class="job-edit-badge">identity · ${job.identity_ref_count}</span>`
+      : "";
     const advancedBadge = job.advanced_edit
       ? `<span class="job-edit-badge">adv${job.outpaint ? " · outpaint" : ""}${job.rgba ? " · rgba" : ""}</span>`
       : "";
@@ -764,7 +875,7 @@ function renderJobs() {
     else actions.push(`<button class="btn btn-ghost btn-sm" data-action="retry" data-id="${job.id}">Retry</button>`);
     return `<tr>
       <td>#${job.id}${job.retry_of ? `<div class="hint">↻ #${job.retry_of}</div>` : ""}</td>
-      <td>${escapeHtml(job.model)}${editBadge}${advancedBadge}${controlBadge}${inpaintBadge}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
+      <td>${escapeHtml(job.model)}${editBadge}${identityBadge}${advancedBadge}${controlBadge}${inpaintBadge}<div class="job-prompt" title="${escapeHtml(job.prompt)}">${escapeHtml(job.prompt)}</div></td>
       <td><span class="state state-${escapeHtml(job.state)}">${escapeHtml(job.state)}</span></td>
       <td class="progress-cell">
         <div class="progress-track"><div class="progress-fill" style="width:${job.state === "done" ? 100 : fraction}%"></div></div>
@@ -916,6 +1027,25 @@ async function unloadEngine() {
     await api("/api/unload", { method: "POST" });
     await refreshHealth();
   } catch (error) { showToast(String(error.message || error)); }
+}
+
+// Low-VRAM / memory profile (sixth additive increment). A control-plane POST;
+// the server returns the resolved plan, which refreshHealth then reflects in
+// the pill. On failure we restore the selector from health rather than leaving
+// a value the engine never accepted.
+async function changeMemoryProfile(event) {
+  const profile = event.target.value;
+  try {
+    await api("/api/memory-profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ profile }),
+    });
+    await refreshHealth();
+  } catch (error) {
+    showToast(String(error.message || error));
+    await refreshHealth();
+  }
 }
 
 // ------------------------------------------------------- model downloads
@@ -1230,6 +1360,18 @@ function wire() {
   $("mask-clear").addEventListener("click", clearMask);
   $("mask-fill").addEventListener("click", fillMask);
   $("reference-remove").addEventListener("click", removeReference);
+
+  // Identity references: 1..10 PNG data URLs, weight and encode resolution.
+  $("identity-file").addEventListener("change", (event) => loadIdentityRefs(event.target.files));
+  $("identity-thumbs").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-identity-remove]");
+    if (!button) return;
+    state.identityRefs.splice(Number(button.dataset.identityRemove), 1);
+    renderIdentityRefs();
+  });
+  ["identity-weight", "identity-encode-side"].forEach((id) => {
+    $(id).addEventListener("input", renderIdentityRefs);
+  });
   const maskCanvas = $("mask-canvas");
   maskCanvas.addEventListener("pointerdown", beginStroke);
   maskCanvas.addEventListener("pointermove", moveStroke);
@@ -1275,6 +1417,7 @@ function wire() {
   $("delete-selected").addEventListener("click", deleteOutputs);
   $("restore-selected").addEventListener("click", restoreOutputs);
   $("unload-btn").addEventListener("click", unloadEngine);
+  $("memory-profile").addEventListener("change", changeMemoryProfile);
   $("lightbox-close").addEventListener("click", closeLightbox);
   $("lightbox-download").addEventListener("click", () => {
     if (state.lightboxUrl) window.open(state.lightboxUrl, "_blank", "noopener");
@@ -1332,6 +1475,7 @@ function wire() {
 async function boot() {
   wire();
   syncModelUI();
+  renderIdentityRefs();
   await Promise.all([refreshHealth(), refreshPresets(), refreshJobs(),
                      refreshOutputs(), refreshModels(false)]);
   connectEvents();

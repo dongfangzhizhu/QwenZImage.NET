@@ -253,10 +253,17 @@ static const qzi_backend custom_backend_vtable = {
     NULL,
     /* Optional, additive in ABI v1: Z-Image Turbo Fun ControlNet Union 2.x
      * mask inpainting. NULL makes qzi_generate_zimage_inpaint() answer
-     * QZI_ERR_UNSUPPORTED while every older generate path keeps working.
-     * All four optional slots stay at the END of the vtable, in this order,
-     * so an integrator that recompiles against qzi_backend.h keeps every
-     * existing slot at the same offset. */
+     * QZI_ERR_UNSUPPORTED while every older generate path keeps working. */
+    NULL,
+    /* Optional, additive in ABI v1: Qwen-Image 2.1 identity reference (WanGP
+     * image_refs / "I" mode). NULL makes qzi_generate_qwen21_identity_ref()
+     * answer QZI_ERR_UNSUPPORTED. */
+    NULL,
+    /* Optional, additive in ABI v1: low-VRAM / memory profile. NULL makes
+     * qzi_engine_set_memory_profile() answer QZI_ERR_UNSUPPORTED. All six
+     * optional slots stay at the END of the vtable, in this order, so an
+     * integrator that recompiles against qzi_backend.h keeps every existing
+     * slot at the same offset. */
     NULL
 };
 

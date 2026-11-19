@@ -72,11 +72,35 @@ int qzen_qwen21_sigmas_base(int steps, int image_tokens, float *sigmas) {
 }
 
 /* One DiT evaluation for one prompt, returning velocity [tokens][64]. */
+static int q21_velocity_refs(qzen_qwen21_model *dit, const float *text,
+                             int text_tokens, const float *latent_grid,
+                             int height, int width, float sigma,
+                             const float *const *image_refs,
+                             const int *ref_heights, const int *ref_widths,
+                             int ref_count, float *velocity, char *error,
+                             size_t error_size) {
+    qzen_qwen21_request request;
+    memset(&request, 0, sizeof(request));
+    request.text = text;
+    request.text_tokens = text_tokens;
+    request.latent = latent_grid;
+    request.height = height;
+    request.width = width;
+    request.sigmas = &sigma;
+    request.sigma_count = 1;
+    request.image_refs = image_refs;
+    request.ref_heights = ref_heights;
+    request.ref_widths = ref_widths;
+    request.ref_count = ref_count;
+    return qzen_qwen21_forward(dit, &request, velocity, NULL, error, error_size);
+}
+
 static int q21_velocity(qzen_qwen21_model *dit, const float *text, int text_tokens,
                         const float *latent_grid, int height, int width, float sigma,
                         float *velocity, char *error, size_t error_size) {
-    const qzen_qwen21_request request = {text, text_tokens, latent_grid, height, width, &sigma, 1};
-    return qzen_qwen21_forward(dit, &request, velocity, NULL, error, error_size);
+    return q21_velocity_refs(dit, text, text_tokens, latent_grid, height, width,
+                             sigma, NULL, NULL, NULL, 0, velocity, error,
+                             error_size);
 }
 
 /* ---------------------------------------------------------------- LanPaint */
@@ -320,6 +344,19 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
         snprintf(error, error_size, "invalid Qwen-Image 2.1 sampling request");
         return 0;
     }
+    if (sample->ref_count < 0 || sample->ref_count > 10 ||
+        (sample->ref_count &&
+         (!sample->image_refs || !sample->ref_heights || !sample->ref_widths))) {
+        snprintf(error, error_size, "invalid identity reference set");
+        return 0;
+    }
+    for (int index = 0; index < sample->ref_count; index++) {
+        if (!sample->image_refs[index] || sample->ref_heights[index] <= 0 ||
+            sample->ref_widths[index] <= 0) {
+            snprintf(error, error_size, "invalid identity reference %d", index);
+            return 0;
+        }
+    }
     if (sample->latent_mask && !sample->init_latent) {
         snprintf(error, error_size,
                  "a latent mask requires an encoded reference image");
@@ -435,13 +472,20 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
                     grid[(size_t)channel * tokens + token];
             }
         }
-        if (!q21_velocity(dit, sample->text, sample->text_tokens, grid, sample->height,
-                          sample->width, sigma, positive, error, error_size)) {
+        if (!q21_velocity_refs(dit, sample->text, sample->text_tokens, grid,
+                               sample->height, sample->width, sigma,
+                               sample->image_refs, sample->ref_heights,
+                               sample->ref_widths, sample->ref_count,
+                               positive, error, error_size)) {
             goto done;
         }
         if (negative) {
-            if (!q21_velocity(dit, sample->negative, sample->negative_tokens, grid, sample->height,
-                              sample->width, sigma, negative, error, error_size)) {
+            if (!q21_velocity_refs(dit, sample->negative,
+                                   sample->negative_tokens, grid,
+                                   sample->height, sample->width, sigma,
+                                   sample->image_refs, sample->ref_heights,
+                                   sample->ref_widths, sample->ref_count,
+                                   negative, error, error_size)) {
                 goto done;
             }
             for (size_t index = 0; index < (size_t)tokens * Q21_LATENT_CHANNELS; index++) {

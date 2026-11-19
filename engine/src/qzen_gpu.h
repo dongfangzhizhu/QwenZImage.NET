@@ -130,12 +130,12 @@ int qzen_gpu_get_stats(const qzen_gpu *gpu, qzen_gpu_stats *stats);
 int qzen_gpu_device_memory(uint64_t *free_bytes, uint64_t *total_bytes);
 /* Bytes held by live allocations, from the stream-ordered pool's own counter.
  *
- * The difference matters after a tier switch: this engine sets the pool's
- * release threshold to 24 GiB, so freed blocks are kept for the next loader and
- * never go back to the driver.  total-free therefore reports the process
- * high-water forever -- load the 13 GiB bf16 pack, switch to the 3.5 GiB packed
- * one, and it still says 13 GiB.  Returns 0 when the pool is not in use (then
- * total-free is the live number). */
+ * The difference matters after a tier switch: by default this engine sets the
+ * pool's release threshold to 24 GiB, so freed blocks are kept for the next
+ * loader and never go back to the driver.  A low-VRAM profile lowers it via
+ * QZEN_GPU_POOL_RELEASE_MIB (MiB), in which case freed blocks ARE returned and
+ * total-free tracks live usage again.  Returns 0 when the pool is not in use
+ * (then total-free is the live number). */
 int qzen_gpu_device_memory_live(uint64_t *used_bytes);
 /* Stream-ordered pool bookkeeping, for diagnosing allocator behaviour under a
  * near-full card: used/reserved are the pool's own view, high-water marks are
@@ -1060,4 +1060,16 @@ int qzen_gpu_prefix_causal_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
                               const qzen_gpu_tensor *value,
                               uint32_t prefix_rows, uint32_t sequence,
                               uint32_t heads, uint32_t head_dim, float scale);
+/* Recompute selected attention rows with a PER-ROW key limit. row_limits is a
+ * U32 [sequence] device tensor: row r attends to keys [0, row_limits[r]).
+ * Rows whose limit equals `sequence` are left untouched (the flash pass already
+ * computed them). Used by the Qwen-Image 2.1 condition-prefix path where text
+ * and each reference-image block have a different visibility boundary. */
+int qzen_gpu_prefix_limited_bf16(qzen_gpu *gpu, qzen_gpu_tensor *output,
+                                const qzen_gpu_tensor *query,
+                                const qzen_gpu_tensor *key,
+                                const qzen_gpu_tensor *value,
+                                const qzen_gpu_tensor *row_limits,
+                                uint32_t sequence, uint32_t limit_rows,
+                                uint32_t heads, uint32_t head_dim, float scale);
 #endif

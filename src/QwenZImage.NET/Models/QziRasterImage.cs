@@ -118,6 +118,31 @@ public sealed class QziRasterImage
     public static QziRasterImage FromPngBase64(string base64, bool mask = false)
         => DecodePng(DecodeBase64(base64), mask);
 
+    /// <summary>
+    /// Decodes a PNG from a local file. Added for the identity-reference
+    /// pipeline so callers can pass the same absolute path arrays Wan2GP uses
+    /// for <c>image_refs</c> instead of base64-encoding every image by hand.
+    /// Only PNG payloads are decoded (the same 8-bit non-interlaced subset as
+    /// <see cref="FromPngBase64"/>); convert JPEG / WebP inputs first.
+    /// </summary>
+    public static QziRasterImage FromPngFile(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        string full = Path.GetFullPath(path);
+        if (!File.Exists(full))
+            throw new FileNotFoundException("Reference image file not found.", full);
+        try
+        {
+            return DecodePng(File.ReadAllBytes(full), mask: false);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidDataException)
+        {
+            throw new ArgumentException(
+                $"Could not decode reference image '{full}': {ex.Message}",
+                nameof(path), ex);
+        }
+    }
+
     private static byte[] DecodeBase64(string base64)
     {
         ArgumentNullException.ThrowIfNull(base64);

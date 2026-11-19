@@ -106,10 +106,9 @@ struct q21_gpu_ctx;
 static struct q21_gpu_ctx *q21_gpu_open(qzen_qwen21_model *model, char *error,
                                         size_t error_size);
 static void q21_gpu_free(struct q21_gpu_ctx *ctx);
-static int q21_forward_device(qzen_qwen21_model *model, const float *text,
-                              int text_tokens,
-                              const qzen_gpu_tensor *latent_device, int height,
-                              int width, float sigma,
+static int q21_forward_device(qzen_qwen21_model *model,
+                              const qzen_qwen21_request *request,
+                              const qzen_gpu_tensor *latent_device, float sigma,
                               qzen_gpu_tensor *velocity_out, float *block0_out,
                               char *error, size_t error_size);
 qzen_gpu_tensor *qzen_qwen21_device_velocity(qzen_qwen21_model *model, int slot,
@@ -166,14 +165,70 @@ static void q21_gated_residual(float *restrict x, const float *restrict y, int t
     }
 }
 
+/* ------------------------------------------------------------------ layout */
+
+#define Q21_MAX_REFS 10
+
+typedef struct {
+    int text_tokens;
+    int ref_count;
+    int ref_tokens[Q21_MAX_REFS]; /* cumulative END offset of each ref block */
+    int prefix_rows;              /* text + all reference tokens */
+    int target_tokens;
+    int tokens;
+} q21_layout;
+
+static int q21_layout_from_request(const qzen_qwen21_request *request, q21_layout *layout,
+                                   char *error, size_t error_size) {
+    memset(layout, 0, sizeof(*layout));
+    layout->text_tokens = request->text_tokens;
+    layout->target_tokens = request->height * request->width;
+    layout->ref_count = request->ref_count;
+    if (request->ref_count < 0 || request->ref_count > Q21_MAX_REFS) {
+        snprintf(error, error_size, "DiT supports at most %d reference latents", Q21_MAX_REFS);
+        return 0;
+    }
+    int cursor = layout->text_tokens;
+    for (int index = 0; index < layout->ref_count; index++) {
+        if (!request->image_refs || !request->image_refs[index] ||
+            !request->ref_heights || !request->ref_widths) {
+            snprintf(error, error_size, "reference latent %d is missing", index);
+            return 0;
+        }
+        int h = request->ref_heights[index], w = request->ref_widths[index];
+        if (h <= 0 || w <= 0) {
+            snprintf(error, error_size, "reference latent %d has invalid dimensions", index);
+            return 0;
+        }
+        cursor += h * w;
+        layout->ref_tokens[index] = cursor;
+    }
+    layout->prefix_rows = cursor;
+    layout->tokens = cursor + layout->target_tokens;
+    return 1;
+}
+
+/* Visible-key count for a query row. Text is causal; each reference block sees
+ * itself and earlier prefixes but not later references or the target; target
+ * rows see the whole joint sequence. */
+static int q21_key_limit(const q21_layout *layout, int row) {
+    if (row < layout->text_tokens) return row + 1;
+    if (row < layout->prefix_rows) {
+        for (int index = 0; index < layout->ref_count; index++)
+            if (row < layout->ref_tokens[index]) return layout->ref_tokens[index];
+    }
+    return layout->tokens;
+}
+
 /* -------------------------------------------------------------------- rope */
 
 /* Axes [16, 56, 56] -> 8 + 28 + 28 complex pairs. A text token t sits at
- * (frame, height, width) = (t, t, t); every image token sits at frame = the text
- * length with centred height/width indices in raster order (QwenImage21Rope). */
-static void q21_rope_tables(int text_tokens, int height, int width, float *cos_tab,
-                            float *sin_tab) {
-    int tokens = text_tokens + height * width;
+ * (frame, height, width) = (t, t, t). Each image block shares one frame
+ * position (advanced by max(h,w) between blocks) and centred height/width
+ * indices in raster order (QwenImage21Rope). */
+static void q21_rope_tables(const qzen_qwen21_request *request, const q21_layout *layout,
+                            float *cos_tab, float *sin_tab) {
+    int tokens = layout->tokens;
     double inverse[Q21_GROUPS];
     int axes[3] = {Q21_ROPE_FRAME, Q21_ROPE_HEIGHT, Q21_ROPE_WIDTH};
     int cursor = 0;
@@ -185,15 +240,34 @@ static void q21_rope_tables(int text_tokens, int height, int width, float *cos_t
     }
     const int frame_pairs = Q21_ROPE_FRAME / 2;
     const int height_pairs = Q21_ROPE_HEIGHT / 2;
+    /* One block = all refs in order, then the target. */
+    int block_count = layout->ref_count + 1;
+    int block_heights[Q21_MAX_REFS + 1], block_widths[Q21_MAX_REFS + 1];
+    int block_ends[Q21_MAX_REFS + 1];
+    for (int index = 0; index < layout->ref_count; index++) {
+        block_heights[index] = request->ref_heights[index];
+        block_widths[index] = request->ref_widths[index];
+        block_ends[index] = layout->ref_tokens[index];
+    }
+    block_heights[layout->ref_count] = request->height;
+    block_widths[layout->ref_count] = request->width;
+    block_ends[layout->ref_count] = layout->tokens;
     for (int t = 0; t < tokens; t++) {
         int frame = 0, high = 0, wide = 0;
-        if (t < text_tokens) {
+        if (t < layout->text_tokens) {
             frame = t;
             high = t;
             wide = t;
         } else {
-            int index = t - text_tokens;
-            frame = text_tokens;
+            int block = 0;
+            while (block < block_count && t >= block_ends[block]) block++;
+            int start = block ? block_ends[block - 1] : layout->text_tokens;
+            int index = t - start;
+            int height = block_heights[block], width = block_widths[block];
+            frame = layout->text_tokens;
+            for (int previous = 0; previous < block; previous++)
+                frame += block_heights[previous] > block_widths[previous]
+                       ? block_heights[previous] : block_widths[previous];
             high = index / width - (height - height / 2);
             wide = index % width - (width - width / 2);
         }
@@ -237,6 +311,7 @@ typedef struct {
     float *scores; /* [threads][HEADS][tokens] */
     int tokens;
     int text_tokens;
+    const int *key_limits; /* [tokens]; NULL means legacy text-causal/full-image */
     float scale;
 } q21_attention_job;
 
@@ -244,7 +319,8 @@ static void q21_attention_queries(void *context, int slot, int start, int end) {
     q21_attention_job *job = context;
     float *scratch = job->scores + (size_t)slot * Q21_HEADS * (size_t)job->tokens;
     for (int q = start; q < end; q++) {
-        int keys = q < job->text_tokens ? q + 1 : job->tokens;
+        int keys = job->key_limits ? job->key_limits[q]
+                                   : (q < job->text_tokens ? q + 1 : job->tokens);
         for (int h = 0; h < Q21_HEADS; h++) {
             const float *query = job->q + (size_t)q * Q21_HIDDEN + (size_t)h * Q21_HEAD_DIM;
             float *scores = scratch + (size_t)h * (size_t)job->tokens;
@@ -405,8 +481,9 @@ static int q21_scratch_init(q21_scratch *scratch, int tokens, int threads, char 
 /* One QwenImage21TransformerBlock. module row 0 is the sigma row (target
  * tokens), row 1 the t = 0 row (text prefix); each row reads
  * [scale1 | gate1 | scale2 | gate2]. */
-static void q21_block_run(const q21_block *block, float *hidden, int tokens, int text_tokens,
-                          const float *module, q21_scratch *scratch, int threads) {
+static void q21_block_run(const q21_block *block, float *hidden, int tokens, int prefix_rows,
+                          const int *key_limits, const float *module,
+                          q21_scratch *scratch, int threads) {
     const float *scale1_target = module;
     const float *gate1_target = module + Q21_HIDDEN;
     const float *scale2_target = module + 2 * Q21_HIDDEN;
@@ -417,7 +494,7 @@ static void q21_block_run(const q21_block *block, float *hidden, int tokens, int
     const float *gate2_text = module + 7 * Q21_HIDDEN;
 
     q21_layer_norm(hidden, tokens, Q21_HIDDEN, scratch->norm);
-    q21_modulate(scratch->norm, tokens, text_tokens, Q21_HIDDEN, scale1_text, scale1_target);
+    q21_modulate(scratch->norm, tokens, prefix_rows, Q21_HIDDEN, scale1_text, scale1_target);
     q21_dump_f32("ln1", scratch->norm, (size_t)tokens * Q21_HIDDEN);
     q21_linear(scratch->norm, tokens, block->attn_q, Q21_HIDDEN, Q21_HIDDEN, scratch->q, threads);
     q21_linear(scratch->norm, tokens, block->attn_k, Q21_HIDDEN, Q21_HIDDEN, scratch->k, threads);
@@ -433,19 +510,19 @@ static void q21_block_run(const q21_block *block, float *hidden, int tokens, int
                                    scratch->attention,
                                    scratch->scores,
                                    tokens,
-                                   text_tokens,
+                                   prefix_rows, key_limits,
                                    1.0f / sqrtf((float)Q21_HEAD_DIM)};
     q21_parallel(tokens, threads, q21_attention_queries, &attention);
     q21_dump_f32("attn", scratch->attention, (size_t)tokens * Q21_HIDDEN);
     q21_linear(scratch->attention, tokens, block->attn_out, Q21_HIDDEN, Q21_HIDDEN,
                scratch->projected, threads);
     q21_dump_f32("projected", scratch->projected, (size_t)tokens * Q21_HIDDEN);
-    q21_gated_residual(hidden, scratch->projected, tokens, text_tokens, Q21_HIDDEN, gate1_text,
+    q21_gated_residual(hidden, scratch->projected, tokens, prefix_rows, Q21_HIDDEN, gate1_text,
                        gate1_target);
     q21_dump_f32("hidden1", hidden, (size_t)tokens * Q21_HIDDEN);
 
     q21_layer_norm(hidden, tokens, Q21_HIDDEN, scratch->norm);
-    q21_modulate(scratch->norm, tokens, text_tokens, Q21_HIDDEN, scale2_text, scale2_target);
+    q21_modulate(scratch->norm, tokens, prefix_rows, Q21_HIDDEN, scale2_text, scale2_target);
     q21_dump_f32("ln2", scratch->norm, (size_t)tokens * Q21_HIDDEN);
     q21_linear(scratch->norm, tokens, block->mlp_gate, Q21_FFN, Q21_HIDDEN, scratch->gate, threads);
     q21_linear(scratch->norm, tokens, block->mlp_proj, Q21_FFN, Q21_HIDDEN, scratch->up, threads);
@@ -453,7 +530,7 @@ static void q21_block_run(const q21_block *block, float *hidden, int tokens, int
     q21_dump_f32("mlp_act", scratch->gate, (size_t)tokens * Q21_FFN);
     q21_linear(scratch->gate, tokens, block->mlp_out, Q21_HIDDEN, Q21_FFN, scratch->mlp, threads);
     q21_dump_f32("mlp", scratch->mlp, (size_t)tokens * Q21_HIDDEN);
-    q21_gated_residual(hidden, scratch->mlp, tokens, text_tokens, Q21_HIDDEN, gate2_text,
+    q21_gated_residual(hidden, scratch->mlp, tokens, prefix_rows, Q21_HIDDEN, gate2_text,
                        gate2_target);
     q21_dump_f32("hidden2", hidden, (size_t)tokens * Q21_HIDDEN);
 }
@@ -619,9 +696,11 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
         snprintf(error, error_size, "invalid Qwen-Image 2.1 forward request");
         return 0;
     }
+    q21_layout layout;
+    if (!q21_layout_from_request(request, &layout, error, error_size)) return 0;
     const int text_tokens = request->text_tokens;
     const int image_tokens = request->height * request->width;
-    const int tokens = text_tokens + image_tokens;
+    const int tokens = layout.tokens;
     const int sigma_count = request->sigma_count;
     if (!request->text || !request->latent || !request->sigmas || text_tokens <= 0 ||
         request->height <= 0 || request->width <= 0 || sigma_count <= 0) {
@@ -650,9 +729,7 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
             }
             float *block0_rows =
                 block0_out ? block0_out + (size_t)s * tokens * Q21_HIDDEN : NULL;
-            if (!q21_forward_device(model, request->text, text_tokens,
-                                    latent_device, request->height,
-                                    request->width,
+            if (!q21_forward_device(model, request, latent_device,
                                     request->sigmas[s], velocity_device,
                                     block0_rows, error, error_size)) {
                 ok = 0;
@@ -681,42 +758,65 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
     q21_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
     float *prefix = NULL, *latent = NULL, *image = NULL, *hidden = NULL;
+    int *key_limits = NULL;
     q21_conditioning *conditions = NULL;
     int ok = 0;
 
     prefix = q21_text_prefix(model, request->text, text_tokens, error, error_size);
     if (!prefix) goto done;
-    latent = malloc((size_t)image_tokens * Q21_IN_CHANNELS * sizeof(float));
-    image = malloc((size_t)image_tokens * Q21_HIDDEN * sizeof(float));
+    latent = malloc((size_t)layout.tokens * Q21_IN_CHANNELS * sizeof(float));
+    image = malloc((size_t)layout.tokens * Q21_HIDDEN * sizeof(float));
     hidden = malloc((size_t)sigma_count * dim * sizeof(float));
     conditions = malloc((size_t)sigma_count * sizeof(*conditions));
     if (!latent || !image || !hidden || !conditions) {
         snprintf(error, error_size, "out of memory for %d image tokens", image_tokens);
         goto done;
     }
-    for (int t = 0; t < image_tokens; t++) {
-        for (int c = 0; c < Q21_IN_CHANNELS; c++) {
-            latent[(size_t)t * Q21_IN_CHANNELS + c] = request->latent[(size_t)c * image_tokens + t];
+    /* Reference blocks precede the target in token order. Each block uses the
+     * same img_in projection as the noisy target, exactly like Wan2GP's
+     * transformer._prepare (one shared img_in for condition + target). */
+    {
+        int cursor = 0;
+        for (int block = 0; block <= layout.ref_count; block++) {
+            const float *source = request->latent;
+            int height = request->height, width = request->width;
+            if (block < layout.ref_count) {
+                source = request->image_refs[block];
+                height = request->ref_heights[block];
+                width = request->ref_widths[block];
+            }
+            int count = height * width;
+            for (int t = 0; t < count; t++) {
+                for (int c = 0; c < Q21_IN_CHANNELS; c++) {
+                    latent[(size_t)(cursor + t) * Q21_IN_CHANNELS + c] =
+                        source[(size_t)c * count + t];
+                }
+            }
+            q21_linear(latent + (size_t)cursor * Q21_IN_CHANNELS, count,
+                       model->img_in, Q21_HIDDEN, Q21_IN_CHANNELS,
+                       image + (size_t)cursor * Q21_HIDDEN, threads);
+            cursor += count;
         }
     }
-    q21_linear(latent, image_tokens, model->img_in, Q21_HIDDEN, Q21_IN_CHANNELS, image, threads);
     for (int s = 0; s < sigma_count; s++) {
         float *rows = hidden + (size_t)s * dim;
         memcpy(rows, prefix, (size_t)text_tokens * Q21_HIDDEN * sizeof(float));
         memcpy(rows + (size_t)text_tokens * Q21_HIDDEN, image,
-               (size_t)image_tokens * Q21_HIDDEN * sizeof(float));
+               (size_t)(layout.tokens - text_tokens) * Q21_HIDDEN * sizeof(float));
         q21_condition(model, request->sigmas[s], &conditions[s], threads);
     }
     if (!q21_scratch_init(&scratch, tokens, threads, error, error_size)) goto done;
-    q21_rope_tables(text_tokens, request->height, request->width, scratch.cos_tab,
-                    scratch.sin_tab);
+    q21_rope_tables(request, &layout, scratch.cos_tab, scratch.sin_tab);
+    key_limits = malloc((size_t)tokens * sizeof(int));
+    if (!key_limits) goto done;
+    for (int row = 0; row < tokens; row++) key_limits[row] = q21_key_limit(&layout, row);
     for (int layer = 0; layer < Q21_LAYERS; layer++) {
         q21_block block;
-        if (!q21_block_load(model, layer, &block, error, error_size)) goto done;
+        if (!q21_block_load(model, layer, &block, error, error_size)) { free(key_limits); goto done; }
         for (int s = 0; s < sigma_count; s++) {
             float *rows = hidden + (size_t)s * dim;
-            q21_block_run(&block, rows, tokens, text_tokens, conditions[s].module, &scratch,
-                          threads);
+            q21_block_run(&block, rows, tokens, layout.prefix_rows, key_limits,
+                          conditions[s].module, &scratch, threads);
             if (s == 0 && getenv("Q21_DUMP_DIR")) {
                 char stage[32];
                 snprintf(stage, sizeof(stage), "block%02d", layer);
@@ -729,8 +829,8 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
         q21_block_free(&block);
     }
     for (int s = 0; s < sigma_count; s++) {
-        const float *rows = hidden + (size_t)s * dim + (size_t)text_tokens * Q21_HIDDEN;
-        float *normed = scratch.norm + (size_t)text_tokens * Q21_HIDDEN;
+        const float *rows = hidden + (size_t)s * dim + (size_t)layout.prefix_rows * Q21_HIDDEN;
+        float *normed = scratch.norm + (size_t)layout.prefix_rows * Q21_HIDDEN;
         q21_layer_norm(rows, image_tokens, Q21_HIDDEN, normed);
         q21_modulate(normed, image_tokens, 0, Q21_HIDDEN, NULL, conditions[s].out_scale);
         q21_linear(normed, image_tokens, model->proj_out, Q21_OUT_CHANNELS, Q21_HIDDEN,
@@ -738,6 +838,7 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
     }
     ok = 1;
 done:
+    free(key_limits);
     free(prefix);
     free(latent);
     free(image);
@@ -763,6 +864,13 @@ int qzen_qwen21_block_forward(qzen_qwen21_model *model, int layer, const float *
     }
     const int tokens = text_tokens + height * width;
     const size_t dim = (size_t)tokens * Q21_HIDDEN;
+    qzen_qwen21_request rope_request;
+    q21_layout rope_layout;
+    memset(&rope_request, 0, sizeof(rope_request));
+    rope_request.text_tokens = text_tokens;
+    rope_request.height = height;
+    rope_request.width = width;
+    if (!q21_layout_from_request(&rope_request, &rope_layout, error, error_size)) return 0;
     q21_scratch scratch;
     memset(&scratch, 0, sizeof(scratch));
     q21_conditioning conditions;
@@ -776,12 +884,12 @@ int qzen_qwen21_block_forward(qzen_qwen21_model *model, int layer, const float *
         free(rows);
         return 0;
     }
-    q21_rope_tables(text_tokens, height, width, scratch.cos_tab, scratch.sin_tab);
+    q21_rope_tables(&rope_request, &rope_layout, scratch.cos_tab, scratch.sin_tab);
     memcpy(rows, hidden, dim * sizeof(float));
     q21_condition(model, sigma, &conditions, model->threads);
     q21_block block;
     if (q21_block_load(model, layer, &block, error, error_size)) {
-        q21_block_run(&block, rows, tokens, text_tokens, conditions.module, &scratch,
+        q21_block_run(&block, rows, tokens, text_tokens, NULL, conditions.module, &scratch,
                       model->threads);
         q21_block_free(&block);
         memcpy(out, rows, dim * sizeof(float));
@@ -848,8 +956,9 @@ typedef struct q21_gpu_ctx {
     qzen_gpu_tensor *img_in;   /* BF16 [4096][64] */
     qzen_gpu_tensor *proj_out; /* BF16 [64][4096] */
     qzen_gpu_tensor *ones;     /* BF16 [4096]: affine-free LayerNorm weight */
-    qzen_gpu_tensor *row_map;  /* U32 [tokens]: 0 target, 1 text */
+    qzen_gpu_tensor *row_map;  /* U32 [tokens]: 0 target, 1 prefix */
     qzen_gpu_tensor *zero_map; /* U32 [tokens]: all zero (final norm) */
+    qzen_gpu_tensor *key_limits; /* U32 [tokens]: visible key count per row */
     qzen_gpu_tensor *rope_cos, *rope_sin; /* BF16 [tokens][64] */
     qzen_gpu_tensor *mod_table;   /* BF16 [2][5][4096] */
     qzen_gpu_tensor *final_table; /* BF16 [2][4096] */
@@ -865,6 +974,8 @@ typedef struct q21_gpu_ctx {
      * depend on it, so a call with the same token count but a different
      * prefix length or canvas has to rebuild them. */
     int tokens, text_tokens, height, width, velocity_slot;
+    int prefix_rows, ref_count;
+    int ref_heights[Q21_MAX_REFS], ref_widths[Q21_MAX_REFS];
 } q21_gpu;
 
 static void q21_gpu_tensor_free(qzen_gpu_tensor **tensor) {
@@ -893,6 +1004,7 @@ static void q21_gpu_scratch_release(q21_gpu *ctx) {
     q21_gpu_tensor_free(&ctx->image_f32);
     q21_gpu_tensor_free(&ctx->row_map);
     q21_gpu_tensor_free(&ctx->zero_map);
+    q21_gpu_tensor_free(&ctx->key_limits);
     q21_gpu_tensor_free(&ctx->rope_cos);
     q21_gpu_tensor_free(&ctx->rope_sin);
     q21_gpu_tensor_free(&ctx->mod_table);
@@ -1048,13 +1160,24 @@ static int q21_gpu_load_block(q21_gpu *ctx, qzen_st_header *header, int layer,
     return block->norm_q && block->norm_k;
 }
 
-static int q21_gpu_scratch_prepare(q21_gpu *ctx, int tokens, int text_tokens,
-                                   int height, int width, char *error,
+/* Cache the device scratch by full attention geometry, not just by token
+ * count: [text ; refs ; target] can have the same length with a completely
+ * different row map, key-visibility boundary and RoPE grid. */
+static int q21_gpu_scratch_prepare(q21_gpu *ctx,
+                                   const qzen_qwen21_request *request,
+                                   const q21_layout *layout, char *error,
                                    size_t error_size) {
-    if (ctx->tokens >= tokens && ctx->text_tokens == text_tokens &&
-        ctx->height == height && ctx->width == width) {
-        return 1;
+    const int tokens = layout->tokens;
+    const int text_tokens = layout->text_tokens;
+    int same = ctx->tokens >= tokens && ctx->text_tokens == text_tokens &&
+               ctx->height == request->height && ctx->width == request->width &&
+               ctx->ref_count == layout->ref_count &&
+               ctx->prefix_rows == layout->prefix_rows;
+    for (int index = 0; same && index < layout->ref_count; index++) {
+        same = ctx->ref_heights[index] == request->ref_heights[index] &&
+               ctx->ref_widths[index] == request->ref_widths[index];
     }
+    if (same) return 1;
     q21_gpu_scratch_release(ctx);
     const size_t dim = (size_t)tokens * Q21_HIDDEN;
     const size_t wide = (size_t)tokens * Q21_FFN;
@@ -1096,14 +1219,18 @@ static int q21_gpu_scratch_prepare(q21_gpu *ctx, int tokens, int text_tokens,
                  tokens);
         return 0;
     }
-    /* row_map: text tokens read the t = 0 table row, image tokens the sigma
-     * row; the final norm sees only image rows and always row 0. */
-    uint32_t *map = malloc((size_t)tokens * sizeof(uint32_t));
+    /* row_map: the whole prefix (text + condition-image blocks) reads the
+     * t = 0 table row, the noisy target the sigma row; the final norm sees
+     * only target rows and always row 0. */
+    uint32_t *map = malloc((size_t)tokens * sizeof(uint32_t) * 2u);
     if (!map) {
-        snprintf(error, error_size, "out of memory for the row map");
+        snprintf(error, error_size, "out of memory for the attention maps");
         return 0;
     }
-    for (int t = 0; t < tokens; t++) map[t] = t < text_tokens ? 1u : 0u;
+    for (int t = 0; t < tokens; t++) {
+        map[t] = t < layout->prefix_rows ? 1u : 0u;
+        map[tokens + t] = (uint32_t)q21_key_limit(layout, t);
+    }
     qzen_gpu_tensor *uploaded = qzen_gpu_tensor_from_u32(ctx->gpu, map, tokens);
     if (!uploaded) {
         free(map);
@@ -1112,6 +1239,14 @@ static int q21_gpu_scratch_prepare(q21_gpu *ctx, int tokens, int text_tokens,
     }
     q21_gpu_tensor_free(&ctx->row_map);
     ctx->row_map = uploaded;
+    uploaded = qzen_gpu_tensor_from_u32(ctx->gpu, map + tokens, tokens);
+    if (!uploaded) {
+        free(map);
+        snprintf(error, error_size, "key limit upload failed");
+        return 0;
+    }
+    q21_gpu_tensor_free(&ctx->key_limits);
+    ctx->key_limits = uploaded;
     for (int t = 0; t < tokens; t++) map[t] = 0u;
     uploaded = qzen_gpu_tensor_from_u32(ctx->gpu, map, tokens);
     free(map);
@@ -1133,7 +1268,7 @@ static int q21_gpu_scratch_prepare(q21_gpu *ctx, int tokens, int text_tokens,
         snprintf(error, error_size, "out of memory for the RoPE tables");
         return 0;
     }
-    q21_rope_tables(text_tokens, height, width, cosine, sine);
+    q21_rope_tables(request, layout, cosine, sine);
     for (size_t i = 0; i < (size_t)tokens * Q21_GROUPS; i++) {
         staged[i] = q21_f32_to_bf16(cosine[i]);
     }
@@ -1154,8 +1289,14 @@ static int q21_gpu_scratch_prepare(q21_gpu *ctx, int tokens, int text_tokens,
     free(staged);
     ctx->tokens = tokens;
     ctx->text_tokens = text_tokens;
-    ctx->height = height;
-    ctx->width = width;
+    ctx->height = request->height;
+    ctx->width = request->width;
+    ctx->prefix_rows = layout->prefix_rows;
+    ctx->ref_count = layout->ref_count;
+    for (int index = 0; index < layout->ref_count; index++) {
+        ctx->ref_heights[index] = request->ref_heights[index];
+        ctx->ref_widths[index] = request->ref_widths[index];
+    }
     return 1;
 rope_fail:
     free(cosine);
@@ -1167,8 +1308,9 @@ rope_fail:
 
 /* One transformer block on the device. carrier is the F32 residual. */
 static int q21_gpu_block_run(q21_gpu *ctx, const q21_gpu_block *block,
-                             qzen_gpu_tensor *carrier, int tokens, int text_tokens,
-                             char *error, size_t error_size) {
+                             qzen_gpu_tensor *carrier, int tokens,
+                             int prefix_rows, int ref_count, char *error,
+                             size_t error_size) {
     const int dim = Q21_HIDDEN;
     const float eps = Q21_EPS;
 #define Q21_OP(call, label)                                                    \
@@ -1215,12 +1357,24 @@ static int q21_gpu_block_run(q21_gpu *ctx, const q21_gpu_block *block,
                                   tokens, tokens, Q21_HEADS, Q21_HEAD_DIM,
                                   1.0f / sqrtf((float)Q21_HEAD_DIM)),
            "qwen joint attention");
-    if (text_tokens > 0) {
-        Q21_OP(qzen_gpu_prefix_causal_bf16(ctx->gpu, ctx->attn, ctx->q, ctx->k,
-                                         ctx->v, text_tokens, tokens, Q21_HEADS,
-                                         Q21_HEAD_DIM,
-                                         1.0f / sqrtf((float)Q21_HEAD_DIM)),
-               "qwen causal prefix fixup");
+    if (prefix_rows > 0) {
+        if (!ref_count) {
+            /* Legacy two-segment path: keep the original kernel byte for byte. */
+            Q21_OP(qzen_gpu_prefix_causal_bf16(ctx->gpu, ctx->attn, ctx->q, ctx->k,
+                                             ctx->v, prefix_rows, tokens, Q21_HEADS,
+                                             Q21_HEAD_DIM,
+                                             1.0f / sqrtf((float)Q21_HEAD_DIM)),
+                   "qwen causal prefix fixup");
+        } else {
+            /* Text stays causal, each condition block sees only itself and
+             * earlier prefixes; the flash pass already computed the target. */
+            Q21_OP(qzen_gpu_prefix_limited_bf16(
+                       ctx->gpu, ctx->attn, ctx->q, ctx->k, ctx->v,
+                       ctx->key_limits, (uint32_t)tokens, (uint32_t)prefix_rows,
+                       Q21_HEADS, Q21_HEAD_DIM,
+                       1.0f / sqrtf((float)Q21_HEAD_DIM)),
+                   "qwen condition-prefix attention fixup");
+        }
     }
     q21_dump_bf16("attn", ctx->attn, (size_t)tokens * dim);
     /* to_out.0 is int8 ConvRot like every other block linear: its stored rows
@@ -1664,69 +1818,97 @@ qzen_gpu_tensor *qzen_qwen21_device_velocity(qzen_qwen21_model *model, int slot,
     return ctx->velocity[slot];
 }
 
-/* Full device forward, one sigma. latent_device is [64][height][width] F32
- * channel major on the model's GPU and stays owned by the caller (the host
- * entry point uploads it once and loops sigmas over it); velocity_out
- * receives [image_tokens][64] BF16 (caller-owned, at least that many
- * elements). block0_out, when non-NULL, receives the joint hidden states
- * after block 0 (F32, host). */
-static int q21_forward_device(qzen_qwen21_model *model, const float *text,
-                              int text_tokens,
-                              const qzen_gpu_tensor *latent_device, int height,
-                              int width, float sigma,
+/* Full device forward, one sigma. The request's target latent stays on the
+ * model's GPU (the host entry point uploads it once and loops sigmas over it);
+ * optional condition latents arrive as host F32 [64][h][w] and are uploaded
+ * and projected with the same img_in before the joint sequence is assembled.
+ * velocity_out receives [target_tokens][64] BF16 (caller-owned). */
+static int q21_forward_device(qzen_qwen21_model *model,
+                              const qzen_qwen21_request *request,
+                              const qzen_gpu_tensor *latent_device, float sigma,
                               qzen_gpu_tensor *velocity_out, float *block0_out,
                               char *error, size_t error_size) {
     q21_gpu *ctx = model->gpu_ctx;
-    const int image_tokens = height * width;
-    const int tokens = text_tokens + image_tokens;
-    if (!q21_gpu_scratch_prepare(ctx, tokens, text_tokens, height, width, error,
-                                 error_size)) {
-        return 0;
-    }
-    if (!q21_gpu_stage_conditioning(ctx, model, sigma, error, error_size)) {
-        return 0;
-    }
+    q21_layout layout;
+    if (!q21_layout_from_request(request, &layout, error, error_size)) return 0;
+    const int text_tokens = layout.text_tokens;
+    const int image_tokens = layout.target_tokens;
+    const int tokens = layout.tokens;
+    const int prefix_rows = layout.prefix_rows;
+    if (!q21_gpu_scratch_prepare(ctx, request, &layout, error, error_size)) return 0;
+    if (!q21_gpu_stage_conditioning(ctx, model, sigma, error, error_size)) return 0;
     /* Text prefix: exact host path, uploaded into the carrier. */
-    float *prefix = q21_text_prefix(model, text, text_tokens, error, error_size);
+    float *prefix = q21_text_prefix(model, request->text, text_tokens, error,
+                                    error_size);
     if (!prefix) return 0;
-    /* The latent arrives as channel-major F32 [64][height][width]; transpose
-     * it into token-major rows, project with img_in, widen to F32 into the
-     * carrier tail. */
-    qzen_gpu_tensor *latent_tokens = qzen_gpu_tensor_new_f32(
-        ctx->gpu, (size_t)image_tokens * Q21_IN_CHANNELS);
-    if (!latent_tokens) {
+    int max_latent = image_tokens;
+    for (int block = 0; block < layout.ref_count; block++) {
+        int count = request->ref_heights[block] * request->ref_widths[block];
+        if (count > max_latent) max_latent = count;
+    }
+    qzen_gpu_tensor *latent_tokens =
+        qzen_gpu_tensor_new_f32(ctx->gpu, (size_t)max_latent * Q21_IN_CHANNELS);
+    qzen_gpu_tensor *projected_f32 =
+        qzen_gpu_tensor_new_f32(ctx->gpu, (size_t)max_latent * Q21_HIDDEN);
+    if (!latent_tokens || !projected_f32) {
+        qzen_gpu_tensor_free(latent_tokens);
+        qzen_gpu_tensor_free(projected_f32);
         free(prefix);
         snprintf(error, error_size, "out of GPU memory for the latent staging");
         return 0;
     }
     int ok = 0;
     do {
-        if (!qzen_gpu_transpose_f32(ctx->gpu, latent_tokens, latent_device,
-                                  Q21_IN_CHANNELS, image_tokens)) {
-            snprintf(error, error_size, "latent transpose failed: %s",
-                     qzen_gpu_error(ctx->gpu));
-            break;
+        int cursor = 0;
+        for (int block = 0; block <= layout.ref_count; block++) {
+            qzen_gpu_tensor *source_device = (qzen_gpu_tensor *)latent_device;
+            int height = request->height, width = request->width;
+            int owned = 0;
+            if (block < layout.ref_count) {
+                source_device = qzen_gpu_tensor_from_f32(
+                    ctx->gpu, request->image_refs[block],
+                    (size_t)request->ref_heights[block] *
+                        (size_t)request->ref_widths[block] * Q21_IN_CHANNELS);
+                owned = 1;
+                height = request->ref_heights[block];
+                width = request->ref_widths[block];
+                if (!source_device) {
+                    snprintf(error, error_size,
+                             "reference %d upload failed", block);
+                    break;
+                }
+            }
+            const int count = height * width;
+            int block_ok = qzen_gpu_transpose_f32(
+                               ctx->gpu, latent_tokens, source_device,
+                               Q21_IN_CHANNELS, count) &&
+                           qzen_gpu_cast_f32_to_bf16(
+                               ctx->gpu, ctx->image_bf16, latent_tokens,
+                               (size_t)count * Q21_IN_CHANNELS) &&
+                           qzen_gpu_linear_bf16(
+                               ctx->gpu, ctx->normed, ctx->image_bf16,
+                               ctx->img_in, NULL, count, Q21_IN_CHANNELS,
+                               Q21_HIDDEN) &&
+                           qzen_gpu_cast_bf16_to_f32(
+                               ctx->gpu, projected_f32, ctx->normed,
+                               (uint32_t)count * Q21_HIDDEN) &&
+                           qzen_gpu_copy_d2d_f32(
+                               ctx->gpu, ctx->image_f32,
+                               (size_t)cursor * Q21_HIDDEN, projected_f32, 0,
+                               (size_t)count * Q21_HIDDEN);
+            if (owned) qzen_gpu_tensor_free(source_device);
+            if (!block_ok) {
+                snprintf(error, error_size,
+                         "%s latent projection failed: %s",
+                         block < layout.ref_count ? "reference" : "target",
+                         qzen_gpu_error(ctx->gpu));
+                break;
+            }
+            cursor += count;
         }
-        if (!qzen_gpu_cast_f32_to_bf16(ctx->gpu, ctx->image_bf16, latent_tokens,
-                                     (size_t)image_tokens * Q21_IN_CHANNELS)) {
-            snprintf(error, error_size, "latent cast failed: %s",
-                     qzen_gpu_error(ctx->gpu));
-            break;
-        }
-        /* img_in widens 64 -> 4096 channels, so the output cannot alias the
-         * input: row r writes past the input rows the GEMM has not read yet.
-         * Stage the projection in normed (scratch, rewritten by block 0). */
-        if (!qzen_gpu_linear_bf16(ctx->gpu, ctx->normed, ctx->image_bf16,
-                                ctx->img_in, NULL, image_tokens, Q21_IN_CHANNELS,
-                                Q21_HIDDEN)) {
-            snprintf(error, error_size, "img_in projection failed: %s",
-                     qzen_gpu_error(ctx->gpu));
-            break;
-        }
-        if (!qzen_gpu_cast_bf16_to_f32(ctx->gpu, ctx->image_f32, ctx->normed,
-                                      (uint32_t)image_tokens * Q21_HIDDEN)) {
-            snprintf(error, error_size, "img_in widen failed: %s",
-                     qzen_gpu_error(ctx->gpu));
+        if (cursor != tokens - text_tokens) {
+            if (!error[0])
+                snprintf(error, error_size, "incomplete latent projection");
             break;
         }
         if (!qzen_gpu_tensor_write_f32_range(ctx->carrier, 0, prefix,
@@ -1736,7 +1918,8 @@ static int q21_forward_device(qzen_qwen21_model *model, const float *text,
         }
         if (!qzen_gpu_copy_d2d_f32(ctx->gpu, ctx->carrier,
                                  (size_t)text_tokens * Q21_HIDDEN, ctx->image_f32,
-                                 0, (size_t)image_tokens * Q21_HIDDEN)) {
+                                 0,
+                                 (size_t)(tokens - text_tokens) * Q21_HIDDEN)) {
             snprintf(error, error_size, "carrier tail copy failed: %s",
                      qzen_gpu_error(ctx->gpu));
             break;
@@ -1744,7 +1927,8 @@ static int q21_forward_device(qzen_qwen21_model *model, const float *text,
         int layer_failed = 0;
         for (int layer = 0; layer < Q21_LAYERS; layer++) {
             if (!q21_gpu_block_run(ctx, &ctx->blocks[layer], ctx->carrier, tokens,
-                                   text_tokens, error, error_size)) {
+                                   prefix_rows, layout.ref_count, error,
+                                   error_size)) {
                 layer_failed = 1;
                 break;
             }
@@ -1762,9 +1946,9 @@ static int q21_forward_device(qzen_qwen21_model *model, const float *text,
             }
         }
         if (layer_failed) break;
-        /* final norm over the image rows, then proj_out */
+        /* final norm over the target rows only, then proj_out */
         if (!qzen_gpu_copy_d2d_f32(ctx->gpu, ctx->image_f32, 0, ctx->carrier,
-                                 (size_t)text_tokens * Q21_HIDDEN,
+                                 (size_t)prefix_rows * Q21_HIDDEN,
                                  (size_t)image_tokens * Q21_HIDDEN)) {
             snprintf(error, error_size, "final tail copy failed: %s",
                      qzen_gpu_error(ctx->gpu));
@@ -1787,6 +1971,7 @@ static int q21_forward_device(qzen_qwen21_model *model, const float *text,
         }
         ok = 1;
     } while (0);
+    qzen_gpu_tensor_free(projected_f32);
     qzen_gpu_tensor_free(latent_tokens);
     free(prefix);
     return ok;
@@ -1803,9 +1988,20 @@ int qzen_qwen21_forward_device(qzen_qwen21_model *model, const float *text,
         snprintf(error, error_size, "invalid qwen device forward request");
         return 0;
     }
-    return q21_forward_device(model, text, text_tokens, latent_device, height,
-                              width, sigma, velocity_out, block0_out, error,
-                              error_size);
+    /* Public compatibility entry: a two-segment forward built from the
+     * legacy separate arguments. New callers should use qzen_qwen21_forward
+     * with a request so condition references can travel with it. */
+    qzen_qwen21_request request;
+    memset(&request, 0, sizeof(request));
+    request.text = text;
+    request.text_tokens = text_tokens;
+    request.latent = NULL; /* the caller already uploaded latent_device */
+    request.height = height;
+    request.width = width;
+    request.sigmas = &sigma;
+    request.sigma_count = 1;
+    return q21_forward_device(model, &request, latent_device, sigma,
+                              velocity_out, block0_out, error, error_size);
 }
 
 /* Single block on the device with host F32 in/out (gate localisation). */
@@ -1820,12 +2016,18 @@ int qzen_qwen21_block_forward_device(qzen_qwen21_model *model, int layer,
         snprintf(error, error_size, "invalid qwen device block request");
         return 0;
     }
-    const int tokens = text_tokens + height * width;
-    const size_t dim = (size_t)tokens * Q21_HIDDEN;
-    if (!q21_gpu_scratch_prepare(ctx, tokens, text_tokens, height, width, error,
-                                 error_size)) {
+    qzen_qwen21_request request;
+    memset(&request, 0, sizeof(request));
+    request.text_tokens = text_tokens;
+    request.height = height;
+    request.width = width;
+    q21_layout layout;
+    if (!q21_layout_from_request(&request, &layout, error, error_size) ||
+        !q21_gpu_scratch_prepare(ctx, &request, &layout, error, error_size)) {
         return 0;
     }
+    const int tokens = layout.tokens;
+    const size_t dim = (size_t)tokens * Q21_HIDDEN;
     if (!q21_gpu_stage_conditioning(ctx, model, sigma, error, error_size)) {
         return 0;
     }
@@ -1834,7 +2036,7 @@ int qzen_qwen21_block_forward_device(qzen_qwen21_model *model, int layer,
         return 0;
     }
     if (!q21_gpu_block_run(ctx, &ctx->blocks[layer], ctx->carrier, tokens,
-                           text_tokens, error, error_size)) {
+                           layout.prefix_rows, 0, error, error_size)) {
         return 0;
     }
     if (!qzen_gpu_tensor_read_f32(ctx->carrier, out, dim)) {

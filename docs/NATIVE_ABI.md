@@ -31,10 +31,12 @@
 | `QZI_FEATURE_ZIMAGE_CONTROL` | `0x2` | 该库实现了 `qzi_generate_zimage_control()`（Z-Image Turbo Fun ControlNet Union） |
 | `QZI_FEATURE_QWEN21_EDIT_ADV` | `0x4` | 该库实现了 `qzi_generate_qwen21_edit_ex()`（Red Canvas 外扩 / LanPaint / RGBA 输出） |
 | `QZI_FEATURE_ZIMAGE_INPAINT` | `0x8` | 该库实现了 `qzi_generate_zimage_inpaint()`（Z-Image Union 2.x 遮罩重绘） |
+| `QZI_FEATURE_QWEN21_IDENTITY_REF` | `0x10` | 该库实现了 `qzi_generate_qwen21_identity_ref()`（Qwen-Image 2.1 身份参考 / Wan2GP `image_refs`） |
+| `QZI_FEATURE_LOW_VRAM` | `0x20` | 该库实现了 `qzi_engine_set_memory_profile()` / `qzi_engine_memory_plan()`（低显存预算 / Wan2GP mmgp 风格 profile） |
 
-当前两个内置 backend 的 `qzi_abi_features()` 均返回 `0xF`。
+当前两个内置 backend 的 `qzi_abi_features()` 均返回 `0x3F`。
 
-> 能力位描述的是**库**是否实现了入口，不是当前注册的 backend 是否支持：自定义 backend 把对应 vtable 槽留成 `NULL` 时，四个 `qzi_generate_qwen21_edit()` / `qzi_generate_zimage_control()` / `qzi_generate_qwen21_edit_ex()` / `qzi_generate_zimage_inpaint()` 入口都返回 `QZI_ERR_UNSUPPORTED`，而 `qzi_abi_features()` 依旧带该位。老版本库根本不导出 `qzi_abi_features()`，托管侧用 `NativeLibrary.TryGetExport` 探测，缺失即视为「所有可选能力都不支持」。
+> 能力位描述的是**库**是否实现了入口，不是当前注册的 backend 是否支持：自定义 backend 把对应 vtable 槽留成 `NULL` 时，五个生成入口（`qzi_generate_qwen21_edit()` / `qzi_generate_zimage_control()` / `qzi_generate_qwen21_edit_ex()` / `qzi_generate_zimage_inpaint()` / `qzi_generate_qwen21_identity_ref()`）以及 `qzi_engine_set_memory_profile()` 都返回 `QZI_ERR_UNSUPPORTED`，而 `qzi_abi_features()` 依旧带该位。老版本库根本不导出 `qzi_abi_features()`，托管侧用 `NativeLibrary.TryGetExport` 探测，缺失即视为「所有可选能力都不支持」。
 
 `qzi_abi_layout(size_t *sizes, size_t count)` 按以下槽位写 `sizeof()`（x86-64 / 64 位平台上实测值）：
 
@@ -49,7 +51,7 @@
 
 > 32 位平台上的尺寸会不同，这是允许的：托管与 native 必须来自**同一次构建/同一个 ABI**，由 `qzi_abi_layout()` 在运行时校验，而不是硬编码字节数。托管侧结构体见 `src/QwenZImage.NET/Native/NativeStructs.cs`，函数指针用 `IntPtr` 表示以保证 blittable。
 
-`qzi_qwen21_edit_layout()` / `qzi_zimage_control_layout()` / `qzi_qwen21_edit_ex_layout()` / `qzi_zimage_inpaint_layout()` 分别返回四个增量请求结构体的 `sizeof()`。它们**不占用**上面 6 个槽位：这样旧库不必导出新符号，`AbiGuard` 也能在把编辑 / ControlNet / 高级编辑 / inpaint 请求指针跨边界传出去之前，先比对结构体尺寸，packing 不匹配立即抛异常。缺席对应导出同样意味着「不支持该能力」。具体字节数不要硬编码，32 位平台会不同，一律以函数返回值与托管侧 `sizeof` 比对。
+`qzi_qwen21_edit_layout()` / `qzi_zimage_control_layout()` / `qzi_qwen21_edit_ex_layout()` / `qzi_zimage_inpaint_layout()` / `qzi_qwen21_identity_ref_layout()` / `qzi_memory_plan_layout()` 分别返回六个增量结构体的 `sizeof()`。它们**不占用**上面 6 个槽位：这样旧库不必导出新符号，`AbiGuard` 也能在把编辑 / ControlNet / 高级编辑 / inpaint / 身份参考请求指针或 memory plan 跨边界传出去之前，先比对结构体尺寸，packing 不匹配立即抛异常。缺席对应导出同样意味着「不支持该能力」。具体字节数不要硬编码，32 位平台会不同，一律以函数返回值与托管侧 `sizeof` 比对。
 
 托管侧 `LibraryImport` 的调用约定由源生成器按平台处理；`qzi_progress_fn` / `qzi_cancel_fn` 反向回调在 `.NET` 侧用 `static` + `[UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]` 实现，不分配 delegate。
 
@@ -59,11 +61,13 @@
 | --- | --- |
 | `uint32_t qzi_abi_version(void)` | 返回 `QZI_ABI_VERSION` |
 | `const char *qzi_status_text(qzi_status)` | 静态状态描述，不释放 |
-| `uint32_t qzi_abi_features(void)` | 增量能力位；当前返回 `QZI_FEATURE_QWEN21_EDIT \| QZI_FEATURE_ZIMAGE_CONTROL \| QZI_FEATURE_QWEN21_EDIT_ADV \| QZI_FEATURE_ZIMAGE_INPAINT`（`0xF`）。旧版 v1 库不导出此符号 |
+| `uint32_t qzi_abi_features(void)` | 增量能力位；当前返回六个能力位（`0x3F`）。旧版 v1 库不导出此符号 |
 | `size_t qzi_qwen21_edit_layout(void)` | 返回 `sizeof(qzi_qwen21_edit_request)`；旧版 v1 库不导出此符号 |
 | `size_t qzi_zimage_control_layout(void)` | 返回 `sizeof(qzi_zimage_control_request)`；旧版 v1 库不导出此符号 |
 | `size_t qzi_qwen21_edit_ex_layout(void)` | 返回 `sizeof(qzi_qwen21_edit_ex_request)`；第三个增量扩展，旧版 v1 库不导出此符号 |
 | `size_t qzi_zimage_inpaint_layout(void)` | 返回 `sizeof(qzi_zimage_inpaint_request)`；第四个增量扩展，旧版 v1 库不导出此符号 |
+| `size_t qzi_qwen21_identity_ref_layout(void)` | 返回 `sizeof(qzi_qwen21_identity_ref_request)`；第五个增量扩展，旧版 v1 库不导出此符号 |
+| `size_t qzi_memory_plan_layout(void)` | 返回 `sizeof(qzi_memory_plan)`；第六个增量扩展（低显存），旧版 v1 库不导出此符号 |
 | `qzi_status qzi_abi_layout(size_t *sizes, size_t count)` | 写 6 个 `sizeof()`；`count < 6` 返回 `QZI_ERR_INVALID_ARGUMENT` |
 | `qzi_status qzi_register_backend(const qzi_backend *)` | 复制 vtable，运行时覆盖编译期默认 backend；`NULL` 恢复编译期默认值（reference 构建 → 参考后端，CUDA 构建 → 真实后端）；必须在 `qzi_engine_create` 之前调用 |
 | `qzi_status qzi_engine_create(const qzi_engine_config *, qzi_engine **, char *error, size_t cap)` | 创建 engine；`config->abi_version` 必须等于 `QZI_ABI_VERSION` |
@@ -76,9 +80,12 @@
 | `qzi_status qzi_generate_zimage_control(...)` | 同步用 ControlNet Union 生成 Z-Image，见下节；backend 无 control 槽时返回 `QZI_ERR_UNSUPPORTED`，真实后端未配置权重时返回 `QZI_ERR_NOT_CONFIGURED` |
 | `qzi_status qzi_generate_qwen21_edit_ex(...)` | 同步高级编辑（Red Canvas / LanPaint / RGBA），见下节；backend 无 advanced-edit 槽时返回 `QZI_ERR_UNSUPPORTED` |
 | `qzi_status qzi_generate_zimage_inpaint(...)` | 同步 Z-Image Union 2.x 遮罩重绘，见下节；backend 无 inpaint 槽时返回 `QZI_ERR_UNSUPPORTED`，真实后端未配置 Union 权重或加载了 16 通道 v1 权重时分别返回 `QZI_ERR_NOT_CONFIGURED` / `QZI_ERR_ENGINE` |
+| `qzi_status qzi_generate_qwen21_identity_ref(...)` | 同步身份参考生成（Wan2GP `image_refs`），见下节；backend 无对应槽时返回 `QZI_ERR_UNSUPPORTED`，真实 CUDA backend 已实现 condition-prefix DiT 注入 |
+| `qzi_status qzi_engine_set_memory_profile(qzi_engine *, qzi_memory_profile, char *, size_t)` | 第六增量：设置低显存预算 profile（控制面，不加载模型/不占 served 计数），见「低显存」节；backend 无对应槽时返回 `QZI_ERR_UNSUPPORTED` |
+| `qzi_status qzi_engine_memory_plan(qzi_engine *, qzi_memory_plan *, char *, size_t)` | 第六增量：读取已解析的预算与实时 VRAM（设备级 free/total，查询失败为 -1） |
 | `void qzi_image_release(qzi_engine *, qzi_image *)` | 释放 `data` 并把结构体清零；对已清零的结构体是幂等的 |
 
-`qzi_register_backend` 引用的 `qzi_backend` 定义在 `native/include/qzi_backend.h`，现含 **11 个回调**（7 个原有 + 末尾四个可选的 `generate_qwen21_edit` / `generate_zimage_control` / `generate_qwen21_edit_ex` / `generate_zimage_inpaint`；槽位留 `NULL` 时对应能力返回 `QZI_ERR_UNSUPPORTED`，t2i 不受影响），由 `qzi_reference_backend()` 导出内置参考 vtable 供包装/对照使用。默认 vtable 由 `qzi.c` 的 `ensure_backend()` **编译期**选择：定义 `QZI_HAS_REAL_BACKEND` 时取 `qzi_real_backend()`（真实 C/CUDA 引擎），否则取 `qzi_reference_vtable`。这样 real 构建不依赖 DLL 构造函数顺序，reference 构建也完全不含引擎符号。
+`qzi_register_backend` 引用的 `qzi_backend` 定义在 `native/include/qzi_backend.h`，现含 **13 个回调**（7 个原有 + 末尾六个可选槽：`generate_qwen21_edit` / `generate_zimage_control` / `generate_qwen21_edit_ex` / `generate_zimage_inpaint` / `generate_qwen21_identity_ref` / `set_memory_profile`；槽位留 `NULL` 时对应能力返回 `QZI_ERR_UNSUPPORTED`，t2i 不受影响），由 `qzi_reference_backend()` 导出内置参考 vtable 供包装/对照使用。默认 vtable 由 `qzi.c` 的 `ensure_backend()` **编译期**选择：定义 `QZI_HAS_REAL_BACKEND` 时取 `qzi_real_backend()`（真实 C/CUDA 引擎），否则取 `qzi_reference_vtable`。这样 real 构建不依赖 DLL 构造函数顺序，reference 构建也完全不含引擎符号。
 
 ## 状态码
 
@@ -162,7 +169,7 @@ if (!has_export("qzi_abi_features") ||
     return QZI_ERR_UNSUPPORTED;
 ```
 
-backend 侧对应 `qzi_backend.generate_qwen21_edit`，是 vtable 倒数第二个槽位（保持前 7 个槽位偏移不变）。留空为 `NULL` 时，t2i 照常工作，`qzi_generate_qwen21_edit()` 返回 `QZI_ERR_UNSUPPORTED`。单飞、进度、取消、`QZI_ERR_BUSY`、错误缓冲与 `qzi_image_release()` 的所有权规则与 `qzi_generate_qwen21()` 完全一致。
+backend 侧对应 `qzi_backend.generate_qwen21_edit`，是第 8 个槽位（前 7 个槽位偏移不变，其后五个可选槽追加在末尾）。留空为 `NULL` 时，t2i 照常工作，`qzi_generate_qwen21_edit()` 返回 `QZI_ERR_UNSUPPORTED`。单飞、进度、取消、`QZI_ERR_BUSY`、错误缓冲与 `qzi_image_release()` 的所有权规则与 `qzi_generate_qwen21()` 完全一致。
 
 ## Z-Image ControlNet Union（ABI v1 增量扩展）
 
@@ -252,7 +259,7 @@ if (!has_export("qzi_abi_features") ||
     return QZI_ERR_UNSUPPORTED;
 ```
 
-普通编辑能力是前置条件，因为高级请求内嵌了它。`qzi_qwen21_edit_ex_layout()` **不占用** `qzi_abi_layout()` 的 6 个槽位，与前面两个 `*_layout()` 同理。backend 侧对应 `qzi_backend.generate_qwen21_edit_ex`（第四个增量 `generate_zimage_inpaint` 追加在它之后，现共 11 个回调、末尾四个可选槽顺序固定）；留 `NULL` 时 `qzi_generate_qwen21_edit_ex()` 返回 `QZI_ERR_UNSUPPORTED`，四条既有生成路径不受影响。单飞、进度、取消、错误缓冲与 `qzi_image_release()` 的所有权规则与 `qzi_generate_qwen21_edit()` 完全一致。
+普通编辑能力是前置条件，因为高级请求内嵌了它。`qzi_qwen21_edit_ex_layout()` **不占用** `qzi_abi_layout()` 的 6 个槽位，与前面两个 `*_layout()` 同理。backend 侧对应 `qzi_backend.generate_qwen21_edit_ex`（第四、第五、第六个增量 `generate_zimage_inpaint` / `generate_qwen21_identity_ref` / `set_memory_profile` 追加在它之后，现共 13 个回调、末尾六个可选槽顺序固定）；留 `NULL` 时 `qzi_generate_qwen21_edit_ex()` 返回 `QZI_ERR_UNSUPPORTED`，四条既有生成路径不受影响。单飞、进度、取消、错误缓冲与 `qzi_image_release()` 的所有权规则与 `qzi_generate_qwen21_edit()` 完全一致。
 
 参考后端把边距 / `model_mode` / `rgba` 纳入确定性哈希，并在 `rgba != 0` 时用 `qzi_png_encode_rgba8()` 产出 colour type 6 的 PNG，使无 GPU 的 `ctest` / xUnit 能验证参数贯通与输出格式；真实引擎的三段实现见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
 
@@ -303,11 +310,49 @@ if (!has_export("qzi_abi_features") ||
     return QZI_ERR_UNSUPPORTED;
 ```
 
-`qzi_zimage_inpaint_layout()` 同样**不占用** `qzi_abi_layout()` 的 6 个槽位。backend 侧对应 `qzi_backend.generate_zimage_inpaint`，是 vtable **最后一个**槽位（现共 11 个回调，末尾四个可选槽顺序固定）；留 `NULL` 时 `qzi_generate_zimage_inpaint()` 返回 `QZI_ERR_UNSUPPORTED`，五条既有生成路径不受影响。单飞、进度、取消、错误缓冲与 `qzi_image_release()` 的所有权规则与 `qzi_generate_zimage_control()` 完全一致；`control_rgb` 与 `mask` 都只在调用期间读取，所有权始终归调用方。
+`qzi_zimage_inpaint_layout()` 同样**不占用** `qzi_abi_layout()` 的 6 个槽位。backend 侧对应 `qzi_backend.generate_zimage_inpaint`，是 vtable **倒数第三个**槽位（现共 13 个回调，末尾六个可选槽顺序固定）；留 `NULL` 时 `qzi_generate_zimage_inpaint()` 返回 `QZI_ERR_UNSUPPORTED`，五条既有生成路径不受影响。单飞、进度、取消、错误缓冲与 `qzi_image_release()` 的所有权规则与 `qzi_generate_zimage_control()` 完全一致；`control_rgb` 与 `mask` 都只在调用期间读取，所有权始终归调用方。
 
 参考后端把 mask 内容、mask 尺寸与「这是 inpaint 请求」纳入确定性哈希，并上报**两个** `"image encode"` 阶段（对应真实后端的两次 VAE 编码），使无 GPU 的 `ctest` / xUnit 能验证参数贯通；真实引擎实现见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
 
 已知边界：仅 Union **v2 / v2.1**（33 通道）支持，v1（16 通道）在权重加载时就会被拒绝；`control_type` 仍是描述性元数据，不运行预处理器；WanGP 的 `input_ref_images` 替换 `control_latent` 分支（其 UI 选项上游已禁用）不在本库范围内。
+
+## 身份参考 / Wan2GP image_refs（ABI v1 第五增量扩展）
+
+`qzi_generate_qwen21_identity_ref()` 是**身份条件**入口，不是 img2img：参考图经 VAE 编码后作为 condition 注入，去噪从纯噪声开始，因此可以锁住人物身份同时大幅改变服装 / 姿势 / 视角。它与 `qzi_generate_qwen21_edit()` 的 `init_latent` 路径完全分离，两条路径可以并存于同一个 v1 库。
+
+```c
+#define QZI_MAX_IDENTITY_REFS                10u
+#define QZI_IDENTITY_REF_DEFAULT_WEIGHT      70.0f
+#define QZI_REFERENCE_ENCODE_DEFAULT_MAX_SIDE 768u
+
+typedef struct qzi_qwen21_identity_ref_request {
+    qzi_qwen21_request   base;                  /* 首成员：普通 t2i 校验原样复用 */
+    const uint8_t *const *reference_rgb;        /* 每张 [R][G][B] 平面，调用方持有 */
+    const uint32_t       *reference_widths;
+    const uint32_t       *reference_heights;
+    uint32_t              reference_count;      /* 1..QZI_MAX_IDENTITY_REFS */
+    float                 identity_ref_weight;  /* 0 = 默认 70；否则 20..100 */
+    uint32_t              reference_encode_max_side; /* 0 = 默认 768；否则 16 的倍数 16..2048 */
+    uint32_t              flags;                /* 保留，必须为 0 */
+} qzi_qwen21_identity_ref_request;
+```
+
+- `qzi_validate_qwen21_identity_ref()` 先复用 `qzi_validate_qwen21()`，再校验参考数组（非空指针、每边 1..4096、总像素 ≤ 2048²）、权重与编码上限；NaN / Inf 一律拒绝，不静默 coerce。
+- `qzi_normalize_qwen21_identity_ref()` 只把两个 `0` sentinel 解析为 70 / 768；像素缓冲区只按指针借用，整个同步调用期间由调用方保证存活，ABI 不接管所有权。
+- `qzi_qwen21_identity_ref_layout()` **不占用** 6 个 layout 槽位；托管侧 `AbiGuard` 同时检查 `qzi_abi_features()`、`*_layout()`、`qzi_generate_qwen21_identity_ref()` 三个导出与结构体尺寸，缺一即视为不支持。
+- backend 侧 `generate_qwen21_identity_ref` 是 vtable 第 12 个槽位（第六增量的 `set_memory_profile` 追加在它之后，成为新的最后一位）。参考后端把每张参考图的像素 / 尺寸、数量、权重、编码上限混入确定性 PNG tag，并按参考图数量上报 `"image encode"` 阶段（每张 2 个进度事件），因此无 GPU 也能验证参数贯通。
+- **真实 CUDA backend 已实现 condition-prefix 注入**：`q21_layout` 把 DiT 序列排成 `[text ; ref_0 ... ref_n ; target]`，共享 `img_in`，prefix 用 t=0 modulation，target 用实际 sigma，最终只取 target tail；GPU 用 `qzen_gpu_prefix_limited_bf16()` 重算 prefix 行的可见 key 范围（text causal、每个 reference block 只看自己及更早 prefix、target 看全部），CPU 用 `q21_key_limit()` 同语义。RoPE 按块递增 frame 位置；`ref_count == 0` 时仍走旧的两段 kernels，t2i / 编辑字节级不变。
+- 权重语义：WanGP 的 `image_refs_relative_size` 是参考图**相对分辨率**，不是 attention 权重。真实后端把 `identity_ref_weight / 100` 乘到目标 latent 网格得到参考编码网格，再 cover-fit 源图到该尺寸直接 VAE 编码；`reference_encode_max_side` 只是显存护栏。编辑路径仍用 `encode_reference_capped()` 的降采样 + latent 上采样：最长边超过 cap 的参考图先 cover-fit 降采样再 VAE 编码，然后把 latent 双线性上采样回目标网格；参考图本身不超过 cap 时直接走原路径，旧行为字节级不变。两者共同避免 1024² 参考图在 768 通道 F32 平面上约 12.9 GiB 的分配。
+- 保真度边界：文本塔仍是 text-only，未移植 Qwen3-VL `visual.*` 权重与 `<|image_pad|>` 视觉 embedding；身份信息由 VAE latent 前缀承载。真图回归显示可锁脸并大改服装，但与 WanGP 的视觉语义条件不是逐像素等价。
+
+```c
+if (!has_export("qzi_abi_features") ||
+    !(qzi_abi_features() & QZI_FEATURE_QWEN21_IDENTITY_REF) ||
+    !has_export("qzi_qwen21_identity_ref_layout") ||
+    qzi_qwen21_identity_ref_layout() != sizeof(qzi_qwen21_identity_ref_request) ||
+    !has_export("qzi_generate_qwen21_identity_ref"))
+    /* 该库不支持身份参考；t2i 与既有增量仍可用 */;
+```
 
 ## 典型调用序列
 
@@ -402,13 +447,51 @@ if (s == QZI_OK) qzi_image_release(engine, &result);
 
 ## 版本演进规则
 
-只要以下任一项变化，就**必须**提升 `QZI_ABI_VERSION`：既有结构体字段增删/顺序变化、既有函数签名变化、状态码语义变化、缓冲区所有权变化、**改变既有** phase 字面量的含义。新增可选能力应优先用能力位或新增独立导出函数表达，并保持旧结构体布局不变；`qzi_qwen21_edit_request` / `qzi_zimage_control_request` / `qzi_qwen21_edit_ex_request` / `qzi_zimage_inpaint_request` / `qzi_abi_features()` / 四个 `*_layout()` / 四个 `qzi_generate_*_edit|control|edit_ex|inpaint()` 都是这种增量形式，因此图像编辑、ControlNet、高级编辑与遮罩重绘仍留在 v1。
+只要以下任一项变化，就**必须**提升 `QZI_ABI_VERSION`：既有结构体字段增删/顺序变化、既有函数签名变化、状态码语义变化、缓冲区所有权变化、**改变既有** phase 字面量的含义。新增可选能力应优先用能力位或新增独立导出函数表达，并保持旧结构体布局不变；`qzi_qwen21_edit_request` / `qzi_zimage_control_request` / `qzi_qwen21_edit_ex_request` / `qzi_zimage_inpaint_request` / `qzi_qwen21_identity_ref_request` / `qzi_abi_features()` / 五个 `*_layout()` / 五个 `qzi_generate_*_edit|control|edit_ex|inpaint|identity_ref()` 都是这种增量形式，因此图像编辑、ControlNet、高级编辑、遮罩重绘与身份参考仍留在 v1。
 
-对 phase 字面量的例外说明：**新增**一个仅伴随新增能力出现的可选字面量（本次的 `"image encode"`）属于 additive，不必升版本——旧库根本不会上报它，托管侧对未知 phase 一律降级为 `GenerationPhase.Unknown`，不会抛异常也不会破坏既有枚举值。但**改动或删除**任何既有字面量、或改变其 `completed/total` 语义，仍必须升版本。inpaint 只是把同一个 `"image encode"` 阶段上报两次（`(0,2)/(1,2)` 与 `(1,2)/(2,2)`），普通编辑 / ControlNet 仍是 `(0,1)/(1,1)`，没有改变既有语义。`QwenZImage.NET` 的 `AbiGuard` 会同时校验版本号、6 个结构体尺寸，以及（若导出存在）四个扩展结构体尺寸分别匹配 `qzi_qwen21_edit_layout()` / `qzi_zimage_control_layout()` / `qzi_qwen21_edit_ex_layout()` / `qzi_zimage_inpaint_layout()`；第三个能力要求普通编辑能力已通过探测，第四个要求 ControlNet 能力已通过探测。因此不兼容的 native 库会在构造 `QziClient` 时立刻报错。
+对 phase 字面量的例外说明：**新增**一个仅伴随新增能力出现的可选字面量（本次的 `"image encode"`）属于 additive，不必升版本——旧库根本不会上报它，托管侧对未知 phase 一律降级为 `GenerationPhase.Unknown`，不会抛异常也不会破坏既有枚举值。但**改动或删除**任何既有字面量、或改变其 `completed/total` 语义，仍必须升版本。inpaint 只是把同一个 `"image encode"` 阶段上报两次（`(0,2)/(1,2)` 与 `(1,2)/(2,2)`），普通编辑 / ControlNet 仍是 `(0,1)/(1,1)`，没有改变既有语义。`QwenZImage.NET` 的 `AbiGuard` 会同时校验版本号、6 个结构体尺寸，以及（若导出存在）五个扩展结构体尺寸分别匹配 `qzi_qwen21_edit_layout()` / `qzi_zimage_control_layout()` / `qzi_qwen21_edit_ex_layout()` / `qzi_zimage_inpaint_layout()` / `qzi_qwen21_identity_ref_layout()`；第三个能力要求普通编辑能力已通过探测，第四个要求 ControlNet 能力已通过探测，第五个是独立能力位。因此不兼容的 native 库会在构造 `QziClient` 时立刻报错。
 
 ## 两个内置 backend
 
-- **参考后端**：`native/src/qzi_stub.c` 实现的 `qzi-reference`，无需 GPU/权重/网络，按**所有会改变引擎输出的字段**（prompt、seed、尺寸、模型标签、tier、lora、lora_scale、steps、guidance、negative_prompt，编辑时另加参考图 / mask / strength / masking_strength / 参考尺寸，ControlNet 时另加控制图 / control_type / control_scale / 控制图尺寸，高级编辑时另加四边距 / model_mode / rgba，inpaint 时另加 mask 内容 / mask 尺寸）生成确定性噪点图，再由 `native/src/qzi_png.c` 编码为 PNG（stored DEFLATE 块，无 zlib 依赖）；`rgba != 0` 时走 `qzi_png_encode_rgba8()` 产出 colour type 6 的 RGBA PNG，供无 GPU 测试验证输出格式。它跟踪模型 / tier / adapter / scale / control 变化并像真实后端一样上报 `"model load"`，还跑完整的阶段（编辑 / ControlNet / 高级编辑时多一个 `"image encode"`，inpaint 时多两个）与 `dit` 步；编辑请求按 WanGP 的 `first_step` 规则只跑剩余步数，高级编辑与 inpaint 会给调用打上独立标记以便 C smoke 区分各条路径。`qzi_health.reference_backend == 1`。用途：CI、托管单测、C smoke test、ABI 对照与参数贯通验证。**它不是图像模型，输出不是真实生成结果。**
+- **参考后端**：`native/src/qzi_stub.c` 实现的 `qzi-reference`，无需 GPU/权重/网络，按**所有会改变引擎输出的字段**（prompt、seed、尺寸、模型标签、tier、lora、lora_scale、steps、guidance、negative_prompt，编辑时另加参考图 / mask / strength / masking_strength / 参考尺寸，ControlNet 时另加控制图 / control_type / control_scale / 控制图尺寸，高级编辑时另加四边距 / model_mode / rgba，inpaint 时另加 mask 内容 / mask 尺寸，身份参考时另加每张参考图内容 / 尺寸 / 数量 / 权重 / 编码上限）生成确定性噪点图，再由 `native/src/qzi_png.c` 编码为 PNG（stored DEFLATE 块，无 zlib 依赖）；`rgba != 0` 时走 `qzi_png_encode_rgba8()` 产出 colour type 6 的 RGBA PNG，供无 GPU 测试验证输出格式。它跟踪模型 / tier / adapter / scale / control 变化并像真实后端一样上报 `"model load"`，还跑完整的阶段（编辑 / ControlNet / 高级编辑时多一个 `"image encode"`，inpaint 时多两个，身份参考时按参考图数量上报）与 `dit` 步；编辑请求按 WanGP 的 `first_step` 规则只跑剩余步数，高级编辑与 inpaint 会给调用打上独立标记以便 C smoke 区分各条路径。`qzi_health.reference_backend == 1`。用途：CI、托管单测、C smoke test、ABI 对照与参数贯通验证。**它不是图像模型，输出不是真实生成结果。**
 - **真实后端**：`native/src/qzi_engine_backend.c` + `engine/` 的 C/CUDA 引擎，仅在 `-DQZI_WITH_CUDA_ENGINE=ON` 时链入。做文本编码、DiT 去噪与 VAE 解码；编辑时额外把参考图 VAE 编码为 latents 并按 mask 恢复轨迹，ControlNet 时编码控制图、懒加载 Union 2.1 权重并逐步注入 hint，inpaint 时再编码一次遮罩后的控制图并填 `keep_mask` / `inpaint_latent` 两个 context 段；PNG 直接在内存里编码，`qzi_health.reference_backend == 0`。需要 CUDA Toolkit、匹配的 SM 架构以及自备的模型权重。
 
-`native/tests/qzi_abi_smoke.c` 会根据 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release、LoRA / 编辑 / 控制 / 高级编辑 / inpaint 参数的字节差异、RGB 与 RGBA 的 PNG colour type、`"model load"` phase、inpaint 的两个 `"image encode"` 阶段与常驻权重复用），两种构建都跑 ABI 布局、四个能力位（含 `qzi_abi_features() == 0xF`）/ 四个扩展结构体尺寸 / 编辑 / 控制 / 高级编辑 / inpaint 参数边界（边距对齐、LanPaint 与外扩互斥、RGBA 取值、mask 必填 / 尺寸 / flags / 继承的 ControlNet 规则）与 legacy backend（四个可选槽为 `NULL` 时返回 `QZI_ERR_UNSUPPORTED`）、LoRA 裸文件名 / 长度 / scale 边界与 fp4 大小写校验，真实构建**不加载多 GB 权重**。详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
+`native/tests/qzi_abi_smoke.c` 会根据 `health.reference_backend` 分支：reference 构建跑完整生成契约（PNG 签名、确定性、release、LoRA / 编辑 / 控制 / 高级编辑 / inpaint 参数的字节差异、RGB 与 RGBA 的 PNG colour type、`"model load"` phase、inpaint 的两个 `"image encode"` 阶段与常驻权重复用），两种构建都跑 ABI 布局、六个能力位（含 `qzi_abi_features() == 0x3F`）/ 六个扩展结构体尺寸 / 编辑 / 控制 / 高级编辑 / inpaint / 身份参考参数边界（含参考数量、像素预算、权重与编码上限）/ 低显存 profile 校验与预算解析 / 与 legacy backend（六个可选槽为 `NULL` 时返回 `QZI_ERR_UNSUPPORTED`）、LoRA 裸文件名 / 长度 / scale 边界与 fp4 大小写校验，真实构建**不加载多 GB 权重**。详见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
+
+## 低显存 / 内存 profile（ABI v1 第六增量）
+
+WanGP 用 mmgp 把 7B 模型跑在小显存卡上；本引擎保持 INT8 DiT 常驻，等价的可调杠杆是「异步分配器的释放阈值」与「参考图 VAE 编码最长边」。`qzi_memory_profile` 把它们打成命名预设，避免调用方知道每个旋钮：
+
+```c
+typedef enum qzi_memory_profile {
+    QZI_MEMORY_AUTO = 0, QZI_MEMORY_HIGH = 1, QZI_MEMORY_BALANCED = 2,
+    QZI_MEMORY_LOW = 3, QZI_MEMORY_LOWEST = 4
+} qzi_memory_profile;
+
+typedef struct qzi_memory_plan {
+    int32_t  profile;               /* 已解析，绝不为 AUTO */
+    int64_t  total_vram_mib;        /* -1 = 设备不可查询 */
+    int64_t  free_vram_mib;
+    int32_t  pool_release_mib;      /* 异步分配器释放阈值 */
+    int32_t  reference_encode_cap;  /* 参考图编码最长边 px */
+    uint32_t flags;                 /* 保留，0 */
+} qzi_memory_plan;
+```
+
+预算表（`AUTO` 按设备总显存解析：≥20480→high，≥12288→balanced，≥8192→low，否则 lowest；未知显存→balanced）：
+
+| profile | pool_release_mib | reference_encode_cap |
+|---|---|---|
+| high | 24576（历史默认，24 GiB） | 768 |
+| balanced | 4096 | 768 |
+| low | 1024 | 512 |
+| lowest | 256 | 384 |
+
+- `qzi_engine_set_memory_profile()` 是控制面调用：不加载模型、不占 `served` 计数、busy 时返回 `QZI_ERR_BUSY`；`AUTO` 会按实时 VRAM 重新解析。backend 无 `set_memory_profile` 槽时返回 `QZI_ERR_UNSUPPORTED`。
+- `qzi_engine_memory_plan()` 读取已解析预算与**设备级** free/total VRAM（`qzen_gpu_device_memory()`，即 nvidia-smi 口径，不是本进程占用），查询失败留 `-1`。
+- 真实后端通过 `QZEN_GPU_POOL_RELEASE_MIB`（MiB）把释放阈值交给 `qzen_gpu_create()`（面向**后续新建**的显存上下文，所以 profile 应在首次生成前设置；config/env 就是这么做的）；`QZEN_GPU_POOL_RELEASE_MIB` 由调用方手工设置时优先于 profile。参考图编码上限对显式传 `reference_encode_max_side` 的请求不生效（显式值优先），仅作用于 0 哨兵。
+- `QZI_MEMORY_PROFILE`（auto / high / balanced / low / lowest，或 0..4）由托管 `NativeConfigScope` 在 `qzi_engine_create` 周围发布，引擎在 create 时解析并压入 backend；非法值被忽略而非令引擎创建失败。
+- `.NET` 侧：`QziClient.SupportsLowVram` / `SetMemoryProfile(QziMemoryProfile)` / `GetMemoryPlan()`，类型 `QziMemoryProfile` / `QziMemoryPlan`；WebUI `/api/health` 暴露 `supports_low_vram`、`engine.memory_profile` / `pool_release_mib` / `reference_encode_cap`，`POST /api/memory-profile` 运行时切换。
+- 参考后端无 GPU，上报合成显存 16384/12288 MiB（AUTO→balanced），profile 只改可观测预算、不改生成字节，因此无 GPU 也能测完整契约。
+
+六个扩展结构体尺寸分别由 `*_layout()` 返回；`AbiGuard.LowVramSupported` 探测 `qzi_abi_features() & 0x20`、`qzi_memory_plan_layout()` 尺寸以及 `qzi_engine_set_memory_profile()` / `qzi_engine_memory_plan()` 导出。这是独立能力位，不依赖其它可选能力。

@@ -709,6 +709,302 @@ static void check_inpaint_generation(qzi_engine *engine,
     qzi_image_release(engine, &z);
 }
 
+/* Qwen-Image identity references are the FIFTH additive ABI v1 extension
+ * (Wan2GP image_refs). Validation runs in qzi.c before any backend call, so
+ * all cases work on the real CUDA build without weights. */
+#define EXPECT_IDREF_INVALID(call, label) do {                         \
+    if ((call) != QZI_ERR_INVALID_ARGUMENT) {                          \
+        fprintf(stderr, "FAIL: identity-ref validation %s (%s)\n",    \
+                label, error[0] ? error : "no error");                 \
+        failures++;                                                    \
+    }                                                                  \
+    rejected++;                                                        \
+} while (0)
+
+static int check_identity_ref_validation(qzi_engine *engine,
+                                         const qzi_qwen21_request *base,
+                                         char *error, size_t error_cap)
+{
+    static uint8_t rgb[3 * 64 * 64];
+    static uint32_t widths[QZI_MAX_IDENTITY_REFS + 1];
+    static uint32_t heights[QZI_MAX_IDENTITY_REFS + 1];
+    static const uint8_t *pointers[QZI_MAX_IDENTITY_REFS + 1];
+    qzi_qwen21_identity_ref_request r;
+    qzi_image image;
+    int i, rejected = 0;
+
+    memset(&image, 0, sizeof(image));
+    memset(rgb, 0x55, sizeof(rgb));
+    for (i = 0; i <= (int)QZI_MAX_IDENTITY_REFS; i++) {
+        pointers[i] = rgb;
+        widths[i] = 64;
+        heights[i] = 64;
+    }
+    memset(&r, 0, sizeof(r));
+    r.base = *base;
+    r.reference_rgb = pointers;
+    r.reference_widths = widths;
+    r.reference_heights = heights;
+    r.reference_count = 1;
+    r.identity_ref_weight = 70.0f;
+    r.reference_encode_max_side = 768u;
+
+    r.reference_count = 0;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "zero references");
+    r.reference_count = QZI_MAX_IDENTITY_REFS + 1;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "too many references");
+    r.reference_count = 1;
+
+    r.reference_rgb = NULL;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "rgb array required");
+    r.reference_rgb = pointers;
+    r.reference_widths = NULL;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "width array required");
+    r.reference_widths = widths;
+    r.reference_heights = NULL;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "height array required");
+    r.reference_heights = heights;
+
+    pointers[0] = NULL;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "null reference buffer");
+    pointers[0] = rgb;
+    widths[0] = 0;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "zero reference width");
+    widths[0] = 64;
+    widths[0] = 4097;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "reference side bound");
+    widths[0] = 4096;
+    heights[0] = 4096;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "reference pixel budget");
+    widths[0] = 64;
+    heights[0] = 64;
+
+    r.identity_ref_weight = 19.0f;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "weight lower bound");
+    r.identity_ref_weight = 101.0f;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "weight upper bound");
+    {
+        uint32_t nan_bits = 0x7fc00000u;
+        memcpy(&r.identity_ref_weight, &nan_bits, sizeof(nan_bits));
+    }
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "non-finite weight");
+    r.identity_ref_weight = 70.0f;
+
+    r.reference_encode_max_side = 15u;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "encode cap lower bound");
+    r.reference_encode_max_side = 17u;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "encode cap alignment");
+    r.reference_encode_max_side = 2064u;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "encode cap upper bound");
+    r.reference_encode_max_side = 768u;
+
+    r.flags = 1;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "reserved flags");
+    r.flags = 0;
+    r.base.width = 100;
+    EXPECT_IDREF_INVALID(qzi_generate_qwen21_identity_ref(engine, &r, NULL,
+                             &image, error, error_cap), "embedded base validation");
+    r.base.width = 64;
+    return rejected;
+}
+
+#undef EXPECT_IDREF_INVALID
+
+/* The deterministic backend hashes every reference buffer, the count, weight
+ * and encode cap into its PNG tag and reports one VAE encode phase per image.
+ * Five successful generations, reference backend only. */
+static void check_identity_ref_generation(qzi_engine *engine,
+                                          const qzi_qwen21_request *base,
+                                          char *error, size_t error_cap)
+{
+    static uint8_t first[3 * 64 * 64];
+    static uint8_t second[3 * 64 * 64];
+    static const uint8_t *references[2];
+    static uint32_t widths[2] = {64, 64};
+    static uint32_t heights[2] = {64, 64};
+    qzi_qwen21_identity_ref_request r;
+    qzi_callbacks callbacks;
+    qzi_image a, b, c, d, e, f;
+    qzi_status status;
+
+    memset(&a, 0, sizeof(a)); memset(&b, 0, sizeof(b));
+    memset(&c, 0, sizeof(c)); memset(&d, 0, sizeof(d));
+    memset(&e, 0, sizeof(e)); memset(&f, 0, sizeof(f));
+    memset(&callbacks, 0, sizeof(callbacks));
+    memset(&r, 0, sizeof(r));
+    memset(first, 0x31, sizeof(first));
+    memset(second, 0x82, sizeof(second));
+    references[0] = first;
+    references[1] = second;
+    r.base = *base;
+    r.reference_rgb = references;
+    r.reference_widths = widths;
+    r.reference_heights = heights;
+    r.reference_count = 2;
+    r.identity_ref_weight = 70.0f;
+    r.reference_encode_max_side = 768u;
+    callbacks.progress = on_progress;
+
+    image_encode_seen = 0;
+    status = qzi_generate_qwen21_identity_ref(engine, &r, &callbacks, &a,
+                                              error, error_cap);
+    CHECK(status == QZI_OK, "identity-ref generate");
+    if (status != QZI_OK) fprintf(stderr, "  identity-ref error: %s\n", error);
+    CHECK(is_png(&a), "identity-ref png signature");
+    /* Each VAE-encode stage emits a start and an end progress event. */
+    CHECK(image_encode_seen == 4, "one encode stage per reference");
+
+    memset(second, 0xE4, sizeof(second));
+    status = qzi_generate_qwen21_identity_ref(engine, &r, NULL, &b, error,
+                                              error_cap);
+    CHECK(status == QZI_OK, "identity-ref different reference");
+    CHECK(status != QZI_OK ||
+          (a.size == b.size && memcmp(a.data, b.data, a.size) != 0),
+          "reference content changes output bytes");
+
+    memset(second, 0x82, sizeof(second));
+    r.identity_ref_weight = 90.0f;
+    status = qzi_generate_qwen21_identity_ref(engine, &r, NULL, &c, error,
+                                              error_cap);
+    CHECK(status == QZI_OK, "identity-ref weight generate");
+    CHECK(status != QZI_OK ||
+          (a.size == c.size && memcmp(a.data, c.data, a.size) != 0),
+          "identity weight changes output bytes");
+
+    r.identity_ref_weight = 70.0f;
+    r.reference_encode_max_side = 512u;
+    status = qzi_generate_qwen21_identity_ref(engine, &r, NULL, &d, error,
+                                              error_cap);
+    CHECK(status == QZI_OK, "identity-ref encode cap generate");
+    CHECK(status != QZI_OK ||
+          (a.size == d.size && memcmp(a.data, d.data, a.size) != 0),
+          "encode cap changes output bytes");
+
+    r.reference_encode_max_side = 768u;
+    status = qzi_generate_qwen21_identity_ref(engine, &r, NULL, &e, error,
+                                              error_cap);
+    CHECK(status == QZI_OK, "identity-ref repeat generate");
+    CHECK(status != QZI_OK ||
+          (a.size == e.size && memcmp(a.data, e.data, a.size) == 0),
+          "identical identity-ref request is byte-identical");
+
+    r.reference_count = 1;
+    status = qzi_generate_qwen21_identity_ref(engine, &r, NULL, &f, error,
+                                              error_cap);
+    CHECK(status == QZI_OK, "identity-ref single reference generate");
+    CHECK(status != QZI_OK ||
+          (a.size == f.size && memcmp(a.data, f.data, a.size) != 0),
+          "reference count changes output bytes");
+
+    qzi_image_release(engine, &a);
+    qzi_image_release(engine, &b);
+    qzi_image_release(engine, &c);
+    qzi_image_release(engine, &d);
+    qzi_image_release(engine, &e);
+    qzi_image_release(engine, &f);
+}
+
+/* SIXTH additive ABI v1 increment: low-VRAM memory profile. Validation of the
+ * public enum, deterministic plan resolution, VRAM health plumbing, and a
+ * legacy backend (no slot) answering UNSUPPORTED are all checked here. This is
+ * control-plane only: it must NOT consume a served slot or change image bytes. */
+static int check_memory_profile(qzi_engine *engine, int is_reference,
+                                char *error, size_t error_cap)
+{
+    qzi_memory_plan plan;
+
+    /* Out-of-range profiles are rejected with INVALID_ARGUMENT. */
+    CHECK(qzi_engine_set_memory_profile(engine, (qzi_memory_profile)5,
+                                        error, error_cap) == QZI_ERR_INVALID_ARGUMENT,
+          "profile 5 rejected");
+    CHECK(qzi_engine_set_memory_profile(engine, (qzi_memory_profile)-1,
+                                        error, error_cap) == QZI_ERR_INVALID_ARGUMENT,
+          "profile -1 rejected");
+
+    /* Initial plan: AUTO resolves from the device's reported total VRAM using
+     * the documented cut points (20480/12288/8192 MiB). The reference backend
+     * reports a fixed 16 GiB; the real backend reports the live GPU, so compute
+     * the expected profile from whatever total it gave us. Concrete profiles
+     * then pass through and tighten the two budgets in a fixed order. */
+    CHECK(qzi_engine_memory_plan(engine, &plan, error, error_cap) == QZI_OK,
+          "memory plan query");
+    CHECK(plan.flags == 0, "memory plan flags zero");
+    if (is_reference) {
+        CHECK(plan.total_vram_mib == 16384, "reference backend synthetic VRAM");
+    } else {
+        CHECK(plan.total_vram_mib > 0, "real backend reports total VRAM");
+        CHECK(plan.free_vram_mib >= 0, "real backend reports free VRAM");
+    }
+    {
+        int64_t total = plan.total_vram_mib;
+        int expected = total >= 20480 ? QZI_MEMORY_HIGH
+                     : total >= 12288 ? QZI_MEMORY_BALANCED
+                     : total >= 8192  ? QZI_MEMORY_LOW
+                                      : QZI_MEMORY_LOWEST;
+        CHECK(plan.profile == expected, "AUTO resolves from reported VRAM");
+        /* Concrete budgets must agree with the resolved profile. */
+        int exp_pool = expected == QZI_MEMORY_HIGH ? 24576
+                     : expected == QZI_MEMORY_LOW ? 1024
+                     : expected == QZI_MEMORY_LOWEST ? 256 : 4096;
+        int exp_cap = (expected == QZI_MEMORY_LOW || expected == QZI_MEMORY_LOWEST)
+                    ? (expected == QZI_MEMORY_LOW ? 512 : 384) : 768;
+        CHECK(plan.pool_release_mib == exp_pool, "AUTO pool threshold matches profile");
+        CHECK(plan.reference_encode_cap == exp_cap, "AUTO encode cap matches profile");
+    }
+
+    CHECK(qzi_engine_set_memory_profile(engine, QZI_MEMORY_HIGH,
+                                        error, error_cap) == QZI_OK,
+          "set high profile");
+    CHECK(qzi_engine_memory_plan(engine, &plan, error, error_cap) == QZI_OK,
+          "high plan query");
+    CHECK(plan.profile == QZI_MEMORY_HIGH, "high profile passes through");
+    CHECK(plan.pool_release_mib == 24576, "high pool threshold 24 GiB");
+    CHECK(plan.reference_encode_cap == 768, "high encode cap");
+
+    CHECK(qzi_engine_set_memory_profile(engine, QZI_MEMORY_LOWEST,
+                                        error, error_cap) == QZI_OK,
+          "set lowest profile");
+    CHECK(qzi_engine_memory_plan(engine, &plan, error, error_cap) == QZI_OK,
+          "lowest plan query");
+    CHECK(plan.profile == QZI_MEMORY_LOWEST, "lowest profile passes through");
+    CHECK(plan.pool_release_mib == 256, "lowest pool threshold");
+    CHECK(plan.reference_encode_cap == 384, "lowest encode cap");
+
+    /* AUTO after a concrete set re-resolves from live VRAM, not from the last
+     * concrete value. */
+    CHECK(qzi_engine_set_memory_profile(engine, QZI_MEMORY_AUTO,
+                                        error, error_cap) == QZI_OK,
+          "set auto profile");
+    CHECK(qzi_engine_memory_plan(engine, &plan, error, error_cap) == QZI_OK,
+          "auto plan query");
+    {
+        int64_t total = plan.total_vram_mib;
+        int expected = total >= 20480 ? QZI_MEMORY_HIGH
+                     : total >= 12288 ? QZI_MEMORY_BALANCED
+                     : total >= 8192  ? QZI_MEMORY_LOW
+                                      : QZI_MEMORY_LOWEST;
+        CHECK(plan.profile == expected, "auto re-resolves from VRAM, not last concrete");
+    }
+
+    return 0;
+}
+
 /* A backend built against the pre-edit qzi_backend.h has no edit slot.
  * Registering one must keep text-to-image intact, and the additive edit entry
  * point must answer QZI_ERR_UNSUPPORTED instead of calling a NULL pointer.
@@ -767,21 +1063,25 @@ static void check_legacy_backend(const qzi_engine_config *config,
 {
     static uint8_t rgb[3 * 64 * 64];
     static uint8_t mask[64 * 64];
+    static const uint8_t *identity_rgb[1];
     qzi_backend legacy;
     qzi_qwen21_edit_request e;
     qzi_qwen21_edit_ex_request x;
     qzi_zimage_control_request c;
     qzi_zimage_inpaint_request p;
+    qzi_qwen21_identity_ref_request id;
     qzi_zimage_request z;
     qzi_image image;
     qzi_engine *engine = NULL;
     qzi_status status;
+    uint32_t widths = 64, heights = 64;
 
     memset(&legacy, 0, sizeof(legacy));
     memset(&e, 0, sizeof(e));
     memset(&x, 0, sizeof(x));
     memset(&c, 0, sizeof(c));
     memset(&p, 0, sizeof(p));
+    memset(&id, 0, sizeof(id));
     memset(&z, 0, sizeof(z));
     memset(&image, 0, sizeof(image));
     memset(rgb, 0x33, sizeof(rgb));
@@ -800,6 +1100,16 @@ static void check_legacy_backend(const qzi_engine_config *config,
     p.mask = mask;
     p.mask_width = 64;
     p.mask_height = 64;
+    id.base = *base;
+    identity_rgb[0] = rgb;
+    id.reference_rgb = identity_rgb;
+    id.reference_widths = &widths;
+    id.reference_heights = &heights;
+    widths = 64;
+    heights = 64;
+    id.reference_count = 1;
+    id.identity_ref_weight = 70.0f;
+    id.reference_encode_max_side = 768u;
     legacy.abi_version = QZI_ABI_VERSION;
     legacy.name = "legacy-v1";
     legacy.init = legacy_init;
@@ -809,12 +1119,14 @@ static void check_legacy_backend(const qzi_engine_config *config,
     legacy.health = legacy_health;
     legacy.unload = legacy_unload;
     legacy.release_image = legacy_release;
-    /* All four additive slots stay NULL: a backend compiled before the
-     * inpaint increment must still load and answer UNSUPPORTED. */
+    /* All six additive slots stay NULL: a backend compiled before the
+     * low-VRAM increment must still load and answer UNSUPPORTED. */
     legacy.generate_qwen21_edit = NULL;
     legacy.generate_zimage_control = NULL;
     legacy.generate_qwen21_edit_ex = NULL;
     legacy.generate_zimage_inpaint = NULL;
+    legacy.generate_qwen21_identity_ref = NULL;
+    legacy.set_memory_profile = NULL;
 
     CHECK(qzi_register_backend(&legacy) == QZI_OK, "register legacy backend");
     status = qzi_engine_create(config, &engine, error, cap);
@@ -838,6 +1150,14 @@ static void check_legacy_backend(const qzi_engine_config *config,
         CHECK(qzi_generate_zimage_inpaint(engine, &p, NULL, &image, error, cap) ==
                   QZI_ERR_UNSUPPORTED,
               "legacy backend rejects Z-Image inpainting");
+        CHECK(qzi_generate_qwen21_identity_ref(engine, &id, NULL, &image,
+                                               error, cap) == QZI_ERR_UNSUPPORTED,
+              "legacy backend rejects identity references");
+        CHECK(qzi_engine_set_memory_profile(engine, QZI_MEMORY_LOW,
+                                            error, cap) == QZI_ERR_UNSUPPORTED,
+              "legacy backend rejects memory profile");
+        CHECK(qzi_engine_memory_plan(engine, NULL, error, cap) == QZI_ERR_INVALID_ARGUMENT,
+              "legacy backend memory plan NULL out validated");
         qzi_engine_destroy(engine);
     }
     CHECK(qzi_register_backend(NULL) == QZI_OK, "restore default backend");
@@ -915,7 +1235,11 @@ int main(void)
           "advanced image editing feature advertised");
     CHECK((qzi_abi_features() & QZI_FEATURE_ZIMAGE_INPAINT) != 0,
           "Z-Image inpainting feature advertised");
-    CHECK(qzi_abi_features() == 0xFu, "feature mask is 0xF");
+    CHECK((qzi_abi_features() & QZI_FEATURE_QWEN21_IDENTITY_REF) != 0,
+          "identity-reference feature advertised");
+    CHECK((qzi_abi_features() & QZI_FEATURE_LOW_VRAM) != 0,
+          "low-VRAM feature advertised");
+    CHECK(qzi_abi_features() == 0x3Fu, "feature mask is 0x3F");
     CHECK(qzi_qwen21_edit_layout() == sizeof(qzi_qwen21_edit_request),
           "edit request layout size");
     CHECK(qzi_zimage_control_layout() == sizeof(qzi_zimage_control_request),
@@ -924,6 +1248,10 @@ int main(void)
           "advanced edit request layout size");
     CHECK(qzi_zimage_inpaint_layout() == sizeof(qzi_zimage_inpaint_request),
           "inpaint request layout size");
+    CHECK(qzi_qwen21_identity_ref_layout() == sizeof(qzi_qwen21_identity_ref_request),
+          "identity-ref request layout size");
+    CHECK(qzi_memory_plan_layout() == sizeof(qzi_memory_plan),
+          "memory plan layout size");
     CHECK(strcmp(qzi_status_text(QZI_ERR_BUSY),
                  "a generation owns the device") == 0, "status text");
     CHECK(qzi_abi_layout(sizes, QZI_LAYOUT_SLOTS) == QZI_OK, "abi layout");
@@ -951,6 +1279,10 @@ int main(void)
     reference = health.reference_backend == 1;
     printf("qzi_abi_smoke: backend = %s\n",
            reference ? "deterministic reference" : "real C/CUDA engine");
+
+    /* Control-plane checks run first: no served/rejected counters are touched.
+     * Leave the engine on AUTO (balanced) for the generation checks below. */
+    check_memory_profile(engine, reference, error, sizeof(error));
 
     qwen.prompt = "a red fox in snow";
     qwen.width = 64;
@@ -1031,6 +1363,7 @@ int main(void)
         check_inpaint_generation(engine, &zimage, error, sizeof(error));
         check_edit_generation(engine, &qwen, error, sizeof(error));
         check_edit_ex_generation(engine, &qwen, error, sizeof(error));
+        check_identity_ref_generation(engine, &qwen, error, sizeof(error));
     } else {
         printf("qzi_abi_smoke: generation skipped (real backend needs model "
                "weights configured in QwenZImage.config.json)\n");
@@ -1070,14 +1403,16 @@ int main(void)
                                                sizeof(error));
     extra_rejected += check_inpaint_validation(engine, &zimage, error,
                                                sizeof(error));
+    extra_rejected += check_identity_ref_validation(engine, &qwen, error,
+                                                    sizeof(error));
 
     CHECK(qzi_engine_health(engine, &health, error, sizeof(error)) == QZI_OK,
           "health");
     if (reference) {
         /* 2 baseline + 2 LoRA + 1 zimage + 6 control (1 plain t2i + 5
          * control) + 5 inpaint (1 plain control + 4 inpaint) + 3 image-edit
-         * + 4 advanced-edit generations. */
-        CHECK(health.served == 23, "served counter");
+         * + 4 advanced-edit + 6 identity-ref generations. */
+        CHECK(health.served == 29, "served counter");
         CHECK(health.rejected == 2 + extra_rejected, "rejected counter");
         CHECK(health.reference_backend == 1, "reference backend flag");
         /* The last four generations are qwen21 advanced edits, so the resident

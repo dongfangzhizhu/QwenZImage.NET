@@ -54,6 +54,13 @@ typedef struct qzen_state {
     char zimage_control_dir[QZEN_PATH_CAP];  /* ControlNet Union 2.1 weights */
     char text_cache_dir[QZEN_PATH_CAP];
     int  device_id;
+    /* Low-VRAM budget. Resolved concrete profile plus the two active levers;
+     * set at create from QZI_MEMORY_PROFILE, or later via the setter. The pool
+     * threshold is applied to NEW contexts (set before the first generation);
+     * the encode cap is applied to every subsequent request. */
+    qzi_memory_profile memory_profile;
+    int32_t  pool_release_mib;
+    uint32_t reference_encode_cap;
 
     /* Qwen-Image 2.1 pack. */
     char q_turbo[QZEN_PATH_CAP];
@@ -312,6 +319,102 @@ static int downsample_mask_keep(const uint8_t *canvas_mask, uint32_t w,
         }
     }
     return 1;
+}
+
+/* Fix for the 1024x1024 reference-encode OOM (gap analysis P1): the Qwen-Image
+ * VAE encoder allocates four 768-channel F32 planes at the INPUT resolution,
+ * so a 1024x1024 reference needs ~13 GiB and dies at "encode stages". The real
+ * engine has no tiled encode yet, so decouple reference-encode resolution from
+ * the output canvas: cover-fit the reference down to at most `cap` pixels on
+ * its longest side (rounded to the 16-pixel VAE grid), encode there, then
+ * bilinearly upsample the 64-channel latent back to the output grid. When the
+ * reference is already <= cap this is a byte-identical passthrough to the
+ * original qzen_qwen21_vae_encode(), so every existing edit / outpaint path
+ * keeps its exact behaviour below the threshold.
+ *
+ * `rgb_canvas` / `cw` / `ch` are the already cover-fitted planar RGB8 image at
+ * the OUTPUT canvas. `out_latent` is [64][latent_h][latent_w]. Returns 1 on
+ * success. Callers own all buffers. */
+static int encode_reference_capped(qzen_qwen21_vae *vae,
+                                   const uint8_t *rgb_canvas, uint32_t cw, uint32_t ch,
+                                   uint32_t cap, int latent_w, int latent_h,
+                                   float *out_latent, char *error, size_t error_cap)
+{
+    if (!vae || !rgb_canvas || !out_latent || !cw || !ch || !cap ||
+        latent_w <= 0 || latent_h <= 0) {
+        qzi_set_error(error, error_cap, "capped encode: invalid arguments");
+        return 0;
+    }
+    cap = cap < 16u ? 16u : cap;
+    /* Largest canvas dimension that fits `cap`, rounded DOWN to a multiple of
+     * 16 (the VAE encode grid). The encoder also needs >= 16 per side. */
+    uint32_t max_side = cw > ch ? cw : ch;
+    uint32_t ew = cw, eh = ch;
+    if (max_side > cap) {
+        double scale = (double)cap / (double)max_side;
+        ew = (uint32_t)((double)cw * scale);
+        eh = (uint32_t)((double)ch * scale);
+        ew = ew < 16u ? 16u : (ew / 16u) * 16u;
+        eh = eh < 16u ? 16u : (eh / 16u) * 16u;
+    }
+    if (ew == cw && eh == ch) {
+        return qzen_qwen21_vae_encode(vae, rgb_canvas, (int)ch, (int)cw,
+                                      out_latent, error, error_cap);
+    }
+
+    const size_t enc_pixels = (size_t)ew * eh;
+    const int enc_lw = (int)(ew / 16u), enc_lh = (int)(eh / 16u);
+    const size_t enc_plane = (size_t)enc_lw * enc_lh;
+    uint8_t *small = (uint8_t *)malloc(3u * enc_pixels);
+    float *small_latent = (float *)malloc((size_t)QZEN_QWEN21_VAE_CHANNELS *
+                                          enc_plane * sizeof(float));
+    int ok = 0;
+    if (!small || !small_latent) {
+        qzi_set_error(error, error_cap,
+                      "capped encode: out of memory for the downscaled reference");
+        goto done;
+    }
+    if (!resample_planar_cover(rgb_canvas, cw, ch, ew, eh, 3u, small)) {
+        qzi_set_error(error, error_cap, "capped encode: cannot downscale the reference");
+        goto done;
+    }
+    {
+        char enc_err[QZEN_ERR_CAP];
+        enc_err[0] = '\0';
+        if (!qzen_qwen21_vae_encode(vae, small, (int)eh, (int)ew,
+                                    small_latent, enc_err, sizeof(enc_err))) {
+            qzi_set_error_fmt(error, error_cap, "reference VAE encode: %s", enc_err);
+            goto done;
+        }
+    }
+    /* Bilinear upsample each of the 64 channel planes from the reduced grid
+     * to the output latent grid. */
+    for (int c = 0; c < QZEN_QWEN21_VAE_CHANNELS; c++) {
+        const float *src = small_latent + (size_t)c * enc_plane;
+        float *dst = out_latent + (size_t)c * (size_t)latent_w * latent_h;
+        for (int y = 0; y < latent_h; y++) {
+            double sy = enc_lh > 1 ? (double)y * (enc_lh - 1) / (latent_h - 1) : 0.0;
+            int y0 = (int)sy;
+            int y1 = y0 + 1 < enc_lh ? y0 + 1 : y0;
+            double fy = sy - y0;
+            for (int x = 0; x < latent_w; x++) {
+                double sx = enc_lw > 1 ? (double)x * (enc_lw - 1) / (latent_w - 1) : 0.0;
+                int x0 = (int)sx;
+                int x1 = x0 + 1 < enc_lw ? x0 + 1 : x0;
+                double fx = sx - x0;
+                double v = src[(size_t)y0 * enc_lw + x0] * (1 - fx) * (1 - fy) +
+                           src[(size_t)y0 * enc_lw + x1] * fx * (1 - fy) +
+                           src[(size_t)y1 * enc_lw + x0] * (1 - fx) * fy +
+                           src[(size_t)y1 * enc_lw + x1] * fx * fy;
+                dst[(size_t)y * latent_w + x] = (float)v;
+            }
+        }
+    }
+    ok = 1;
+done:
+    free(small);
+    free(small_latent);
+    return ok;
 }
 
 /* Planar RGB8 [3][H][W] + alpha plane [H][W] -> interleaved RGBA8. */
@@ -812,6 +915,12 @@ static qzi_status qzen_init(void **out_context,
     copy_path(s->zimage_control_dir, sizeof(s->zimage_control_dir),
               qzen_config_field(&file, "zimage_control_dir"));
     s->device_id = config->device_id;
+    /* Default to the historical budget so existing behaviour is byte-identical
+     * when QZI_MEMORY_PROFILE is unset: 24 GiB pool threshold, 768 encode cap,
+     * no automatic VRAM query needed. */
+    s->memory_profile = QZI_MEMORY_HIGH;
+    s->pool_release_mib = 24576;
+    s->reference_encode_cap = QZI_REFERENCE_ENCODE_DEFAULT_MAX_SIDE;
     s->tier_resident = -1;
     s->started = qzi_now_seconds();
 
@@ -868,6 +977,7 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
                                             const qzi_qwen21_request *base,
                                             const qzi_qwen21_edit_request *edit,
                                             const qzi_qwen21_edit_ex_request *adv,
+                                            const qzi_qwen21_identity_ref_request *identity,
                                             const qzi_callbacks *callbacks,
                                             qzi_image *out_image,
                                             char *error, size_t error_cap)
@@ -876,7 +986,8 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     progress_bridge bridge = {callbacks, qzi_now_seconds(), 0};
     char local[QZEN_ERR_CAP] = "";
     const qzi_qwen21_edit_request *edit_ref = adv ? &adv->base : edit;
-    const qzi_qwen21_request *request = edit_ref ? &edit_ref->base : base;
+    const qzi_qwen21_request *request = identity ? &identity->base
+                                        : (edit_ref ? &edit_ref->base : base);
     const int turbo = !(request->tier && *request->tier &&
                         strcmp(request->tier, "base") == 0);
     /* qzi.c resolves the zero sentinels before calling a backend; repeat it
@@ -901,15 +1012,21 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     uint8_t *rgb = NULL, *packed = NULL, *alpha = NULL;
     uint8_t *reference = NULL, *canvas_mask = NULL, *latent_mask = NULL;
     uint8_t *red_canvas = NULL;
+    float *identity_latents[QZI_MAX_IDENTITY_REFS] = {NULL};
+    const float *identity_ptrs[QZI_MAX_IDENTITY_REFS] = {NULL};
+    int identity_heights[QZI_MAX_IDENTITY_REFS] = {0};
+    int identity_widths[QZI_MAX_IDENTITY_REFS] = {0};
+    uint8_t *identity_canvas = NULL;
     char *prompt_owned = NULL;
     qzi_status status = QZI_ERR_ENGINE;
 
     /* qzi.c validates on the way in, but the backend is also a public
      * native/native contract: never read caller-owned pixels before checking
      * the dimensions that describe them. */
-    status = adv ? qzi_validate_qwen21_edit_ex(adv, error, error_cap)
-          : edit_ref ? qzi_validate_qwen21_edit(edit_ref, error, error_cap)
-                     : qzi_validate_qwen21(request, error, error_cap);
+    status = identity ? qzi_validate_qwen21_identity_ref(identity, error, error_cap)
+            : adv ? qzi_validate_qwen21_edit_ex(adv, error, error_cap)
+            : edit_ref ? qzi_validate_qwen21_edit(edit_ref, error, error_cap)
+                       : qzi_validate_qwen21(request, error, error_cap);
     if (status != QZI_OK) return status;
 
     status = resolve_qwen21_pack(s, error, error_cap);
@@ -993,6 +1110,86 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
         qzi_set_error(error, error_cap, "out of memory for the latent/RGB buffers");
         status = QZI_ERR_OUT_OF_MEMORY;
         goto done;
+    }
+
+    if (identity) {
+        /* WanGP's image_refs_relative_size controls how large each reference
+         * is relative to the output: it is a RESOLUTION, not an attention
+         * weight. Encode every reference at (weight/100) of the target latent
+         * grid, cover-fitting the source into that rectangle. Weight 70 (the
+         * default used by the character pipeline) therefore gives 49% as many
+         * condition tokens as the target. reference_encode_max_side is an
+         * additional memory guard, not a second semantic knob. */
+        const float weight = identity->identity_ref_weight > 0.0f
+                           ? identity->identity_ref_weight : 70.0f;
+        /* An explicit request cap wins; the 0 sentinel adopts the active
+         * low-VRAM profile's cap (768 on high/balanced, 512/384 on low/lowest).
+         * This is the real memory lever: a 1024² reference at cap 768 still
+         * allocates a 768-channel F32 plane, so smaller budgets matter. */
+        const uint32_t cap = identity->reference_encode_max_side
+                           ? identity->reference_encode_max_side
+                           : s->reference_encode_cap;
+        const double ratio = (double)weight / 100.0;
+        int ref_lw = (int)(latent_w * ratio + 0.5);
+        int ref_lh = (int)(latent_h * ratio + 0.5);
+        const int cap_latent = (int)(cap / 16u);
+        if (ref_lw < 1) ref_lw = 1;
+        if (ref_lh < 1) ref_lh = 1;
+        if (ref_lw > cap_latent) ref_lw = cap_latent;
+        if (ref_lh > cap_latent) ref_lh = cap_latent;
+        const uint32_t ref_pixels = (uint32_t)ref_lw * (uint32_t)ref_lh;
+        identity_canvas = (uint8_t *)malloc((size_t)ref_pixels * 16u * 16u * 3u);
+        if (!identity_canvas) {
+            qzi_set_error(error, error_cap,
+                          "out of memory for the identity reference canvas");
+            status = QZI_ERR_OUT_OF_MEMORY;
+            goto done;
+        }
+        for (uint32_t index = 0; index < identity->reference_count; index++) {
+            bridge_emit(&bridge, "image encode", (int32_t)index,
+                        (int32_t)identity->reference_count);
+            if (bridge.cancelled || qzi_cancelled(callbacks)) {
+                qzi_set_error(error, error_cap,
+                              "cancelled during reference encoding");
+                status = QZI_ERR_CANCELLED;
+                goto done;
+            }
+            if (!resample_planar_cover(identity->reference_rgb[index],
+                                       identity->reference_widths[index],
+                                       identity->reference_heights[index],
+                                       (uint32_t)ref_lw * 16u,
+                                       (uint32_t)ref_lh * 16u, 3u,
+                                       identity_canvas)) {
+                qzi_set_error_fmt(error, error_cap,
+                                  "cannot fit identity reference %u",
+                                  (unsigned)index);
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            identity_latents[index] = (float *)malloc(
+                (size_t)QZEN_QWEN21_VAE_CHANNELS * ref_pixels * sizeof(float));
+            if (!identity_latents[index]) {
+                qzi_set_error(error, error_cap,
+                              "out of memory for the identity reference latent");
+                status = QZI_ERR_OUT_OF_MEMORY;
+                goto done;
+            }
+            local[0] = '\0';
+            if (!qzen_qwen21_vae_encode(
+                    s->vae, identity_canvas, (int)(ref_lh * 16u),
+                    (int)(ref_lw * 16u), identity_latents[index],
+                    local, sizeof(local))) {
+                qzi_set_error_fmt(error, error_cap,
+                                  "identity reference VAE encode: %s", local);
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            identity_ptrs[index] = identity_latents[index];
+            identity_heights[index] = ref_lh;
+            identity_widths[index] = ref_lw;
+            bridge_emit(&bridge, "image encode", (int32_t)(index + 1),
+                        (int32_t)identity->reference_count);
+        }
     }
 
     if (edit_ref) {
@@ -1121,9 +1318,10 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
          * latent is already normalised with the checkpoint's mean/std, which
          * is the space the Euler sampler integrates. */
         local[0] = '\0';
-        if (!qzen_qwen21_vae_encode(s->vae, ref_planar, (int)canvas_h,
-                                    (int)canvas_w, init_latent, local,
-                                    sizeof(local))) {
+        if (!encode_reference_capped(s->vae, ref_planar, canvas_w, canvas_h,
+                                     s->reference_encode_cap,
+                                     latent_w, latent_h, init_latent,
+                                     local, sizeof(local))) {
             qzi_set_error_fmt(error, error_cap,
                               "reference VAE encode: %s", local);
             status = QZI_ERR_ENGINE;
@@ -1179,7 +1377,11 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
         text, text_tokens, negative, negative_tokens, latent,
         latent_h, latent_w, sigmas, steps, guidance,
         init_latent, strength, latent_mask, masking_strength,
-        outpainting, lanpaint_steps, lanpaint_seed, alpha
+        outpainting, lanpaint_steps, lanpaint_seed, alpha,
+        identity ? identity_ptrs : NULL,
+        identity ? identity_heights : NULL,
+        identity ? identity_widths : NULL,
+        identity ? (int)identity->reference_count : 0
     };
     local[0] = '\0';
     if (!qzen_qwen21_pipeline_run_ex(s->dit, s->vae, &sample, rgb,
@@ -1214,6 +1416,9 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     if (status == QZI_OK) s->served++;
 
 done:
+    for (uint32_t index = 0; index < QZI_MAX_IDENTITY_REFS; index++)
+        free(identity_latents[index]);
+    free(identity_canvas);
     free(latent_mask);
     free(canvas_mask);
     free(reference);
@@ -1235,7 +1440,7 @@ static qzi_status qzen_generate_qwen21(void *context,
                                        qzi_image *out_image,
                                        char *error, size_t error_cap)
 {
-    return qzen_generate_qwen21_impl(context, request, NULL, NULL, callbacks,
+    return qzen_generate_qwen21_impl(context, request, NULL, NULL, NULL, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -1245,7 +1450,7 @@ static qzi_status qzen_generate_qwen21_edit(void *context,
                                             qzi_image *out_image,
                                             char *error, size_t error_cap)
 {
-    return qzen_generate_qwen21_impl(context, NULL, request, NULL, callbacks,
+    return qzen_generate_qwen21_impl(context, NULL, request, NULL, NULL, callbacks,
                                      out_image, error, error_cap);
 }
 
@@ -1258,8 +1463,26 @@ static qzi_status qzen_generate_qwen21_edit_ex(void *context,
                                                qzi_image *out_image,
                                                char *error, size_t error_cap)
 {
-    return qzen_generate_qwen21_impl(context, NULL, NULL, request, callbacks,
+    return qzen_generate_qwen21_impl(context, NULL, NULL, request, NULL, callbacks,
                                      out_image, error, error_cap);
+}
+
+/* Fifth additive ABI v1 slot: Qwen-Image 2.1 identity reference (WanGP
+ * image_refs / video_prompt_type "I"). The references are encoded at a
+ * weight-controlled resolution and injected as a condition prefix in front of
+ * the noisy target; the sampler still starts from pure noise. All existing
+ * t2i / edit / ControlNet paths go through the same orchestration with a NULL
+ * identity request, so their behavior is unchanged. */
+static qzi_status qzen_generate_qwen21_identity_ref(
+                        void *context,
+                        const qzi_qwen21_identity_ref_request *request,
+                        const qzi_callbacks *callbacks,
+                        qzi_image *out_image,
+                        char *error, size_t error_cap)
+{
+    return qzen_generate_qwen21_impl(context, &request->base, NULL, NULL,
+                                     request, callbacks, out_image,
+                                     error, error_cap);
 }
 
 /* ---------------------------------------------------------- vtable: zimage */
@@ -1670,8 +1893,57 @@ static qzi_status qzen_health(void *context, qzi_health *out,
     if (!s || !out) return QZI_ERR_INVALID_ARGUMENT;
     out->device_id = s->device_id;
     out->reference_backend = 0;
+    /* Device-wide VRAM, the same numbers nvidia-smi reports. The engine keeps
+     * a pool whose release threshold may be well below the GPU total, so this
+     * is what an application needs to size its canvas / pick a profile. A
+     * failed query leaves the ABI layer's -1 ("unknown") in place. */
+    {
+        uint64_t free_bytes = 0, total_bytes = 0;
+        if (qzen_gpu_device_memory(&free_bytes, &total_bytes) && total_bytes) {
+            if (free_bytes > (uint64_t)INT64_MAX) free_bytes = (uint64_t)INT64_MAX;
+            if (total_bytes > (uint64_t)INT64_MAX) total_bytes = (uint64_t)INT64_MAX;
+            out->free_vram_mib = (int64_t)(free_bytes >> 20);
+            out->total_vram_mib = (int64_t)(total_bytes >> 20);
+        }
+    }
     /* The ABI layer fills resident_model, served, busy and uptime. The
      * backend only needs to declare that this is NOT the noise reference. */
+    return QZI_OK;
+}
+
+/* Sixth additive ABI v1 slot: apply a resolved (non-AUTO) low-VRAM profile.
+ * The control layer resolves AUTO and validates the range before this call.
+ * The encode cap is stored for the next request; the pool threshold is pushed
+ * into an env switch that qzen_gpu_create() reads when the NEXT device context
+ * is built. Contexts already live keep their threshold (the caller should set
+ * the profile before the first generation, which is what config/env does). */
+static qzi_status qzen_set_memory_profile(void *context,
+                                          qzi_memory_profile profile,
+                                          char *error, size_t error_cap)
+{
+    (void)error; (void)error_cap;
+    qzen_state *s = (qzen_state *)context;
+    if (!s || profile < QZI_MEMORY_HIGH || profile > QZI_MEMORY_LOWEST)
+        return QZI_ERR_INVALID_ARGUMENT;
+
+    int64_t total = -1, free = -1;
+    uint64_t free_bytes = 0, total_bytes = 0;
+    if (qzen_gpu_device_memory(&free_bytes, &total_bytes) && total_bytes) {
+        total = (int64_t)(total_bytes >> 20);
+        free = (int64_t)(free_bytes >> 20);
+    }
+    qzi_memory_plan plan;
+    qzi_fill_memory_plan(profile, total, free, &plan);
+    s->memory_profile = profile;
+    s->pool_release_mib = plan.pool_release_mib;
+    s->reference_encode_cap = (uint32_t)plan.reference_encode_cap;
+
+    /* Publish the pool threshold to the engine. enable_env() respects an
+     * explicit caller override, so QZEN_GPU_POOL_RELEASE_MIB set by hand still
+     * wins over a profile. */
+    char value[32];
+    snprintf(value, sizeof(value), "%d", s->pool_release_mib);
+    enable_env("QZEN_GPU_POOL_RELEASE_MIB", value);
     return QZI_OK;
 }
 
@@ -1717,7 +1989,9 @@ static const qzi_backend qzen_vtable = {
     qzen_generate_qwen21_edit,
     qzen_generate_zimage_control,
     qzen_generate_qwen21_edit_ex,
-    qzen_generate_zimage_inpaint
+    qzen_generate_zimage_inpaint,
+    qzen_generate_qwen21_identity_ref,
+    qzen_set_memory_profile
 };
 
 const qzi_backend *qzi_real_backend(void)

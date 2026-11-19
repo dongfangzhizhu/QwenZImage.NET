@@ -33,6 +33,18 @@ internal static unsafe partial class NativeMethods
     /// </summary>
     internal const uint FeatureZImageInpaint = 0x8u;
 
+    /// <summary>
+    /// Capability bit for Qwen-Image 2.1 identity reference (WanGP image_refs /
+    /// video_prompt_type "I"). Added without bumping the ABI.
+    /// </summary>
+    internal const uint FeatureQwen21IdentityRef = 0x10u;
+
+    /// <summary>
+    /// Capability bit for low-VRAM / memory profile (WanGP mmgp-style budgets).
+    /// Added without bumping the ABI.
+    /// </summary>
+    internal const uint FeatureLowVram = 0x20u;
+
     [LibraryImport(LibraryName, EntryPoint = "qzi_abi_version")]
     internal static partial uint AbiVersion();
 
@@ -139,6 +151,35 @@ internal static unsafe partial class NativeMethods
                                                        QziCallbacks* callbacks,
                                                        QziImage* image,
                                                        byte* error, nuint errorCap);
+
+    /// <summary>
+    /// Additive in ABI v1, fifth increment. Older libraries do not export this
+    /// symbol, so never call it until
+    /// <see cref="AbiGuard.Qwen21IdentityRefSupported"/> has confirmed the
+    /// export exists (otherwise an EntryPointNotFoundException escapes).
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "qzi_generate_qwen21_identity_ref")]
+    internal static partial int GenerateQwen21IdentityRef(
+                                    IntPtr engine,
+                                    QziQwen21IdentityRefRequest* request,
+                                    QziCallbacks* callbacks,
+                                    QziImage* image,
+                                    byte* error, nuint errorCap);
+
+    /// <summary>
+    /// Additive in ABI v1, sixth increment (low-VRAM). Never call until
+    /// <see cref="AbiGuard.LowVramSupported"/> has confirmed the exports exist.
+    /// </summary>
+    [LibraryImport(LibraryName, EntryPoint = "qzi_memory_plan_layout")]
+    internal static partial nuint MemoryPlanLayout();
+
+    [LibraryImport(LibraryName, EntryPoint = "qzi_engine_set_memory_profile")]
+    internal static partial int EngineSetMemoryProfile(IntPtr engine, int profile,
+                                                       byte* error, nuint errorCap);
+
+    [LibraryImport(LibraryName, EntryPoint = "qzi_engine_memory_plan")]
+    internal static partial int EngineMemoryPlan(IntPtr engine, QziMemoryPlan* plan,
+                                                 byte* error, nuint errorCap);
 
     [LibraryImport(LibraryName, EntryPoint = "qzi_image_release")]
     internal static partial void ImageRelease(IntPtr engine, QziImage* image);

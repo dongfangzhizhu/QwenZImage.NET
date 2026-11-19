@@ -99,6 +99,28 @@ typedef struct qzi_backend {
                                           const qzi_callbacks *callbacks,
                                           qzi_image *out_image,
                                           char *error, size_t error_cap);
+
+    /* Optional, additive in ABI v1: Qwen-Image 2.1 identity reference (WanGP
+     * video_prompt_type "I" / image_refs). NULL makes
+     * qzi_generate_qwen21_identity_ref() report QZI_ERR_UNSUPPORTED while all
+     * six older generate paths keep working unchanged. Like every optional
+     * slot it stays at the END of the vtable so an integrator that recompiles
+     * against this header keeps every existing slot at the same offset.
+     * Always the LAST slot. */
+    qzi_status (*generate_qwen21_identity_ref)(
+                                    void *context,
+                                    const qzi_qwen21_identity_ref_request *request,
+                                    const qzi_callbacks *callbacks,
+                                    qzi_image *out_image,
+                                    char *error, size_t error_cap);
+
+    /* Optional, additive in ABI v1: low-VRAM / memory profile. NULL makes
+     * qzi_engine_set_memory_profile() report QZI_ERR_UNSUPPORTED while all six
+     * older generate paths keep working. The vtable slot receives an already
+     * validated, NON-AUTO profile; the backend resolves it to concrete VRAM
+     * budgets and applies them to subsequent generations. Always the LAST slot. */
+    qzi_status (*set_memory_profile)(void *context, qzi_memory_profile profile,
+                                     char *error, size_t error_cap);
 } qzi_backend;
 
 /* Filled in by the built-in deterministic reference backend. Exposed so an

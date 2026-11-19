@@ -28,6 +28,30 @@ public sealed class GenerateRequest
     public string? ReferenceImage { get; set; }
 
     /// <summary>
+    /// Qwen-Image 2.1 identity reference (the additive fifth ABI v1 increment,
+    /// Wan2GP <c>image_refs</c>): 1..10 PNG images, each either a base64 data
+    /// URL or a local file path. Unlike <see cref="ReferenceImage"/> these are
+    /// identity conditions, not a denoising start point, so the face can be
+    /// locked while clothing / pose / viewpoint change completely.
+    /// Mutually exclusive with <see cref="ReferenceImage"/> and ControlNet.
+    /// </summary>
+    public List<string>? IdentityRefs { get; set; }
+
+    /// <summary>
+    /// Identity condition weight (20..100, default 70). Mirrors Wan2GP's
+    /// <c>image_refs_relative_size</c>. Requires <see cref="IdentityRefs"/>.
+    /// </summary>
+    public float? IdentityRefWeight { get; set; }
+
+    /// <summary>
+    /// Longest side used when VAE-encoding each reference (16..2048, multiple
+    /// of 16, default 768). Lower values bound reference-encoder memory so a
+    /// 1024x1024 reference no longer needs a 768-channel full-size plane.
+    /// Requires <see cref="IdentityRefs"/>.
+    /// </summary>
+    public uint? ReferenceEncodeMaxSide { get; set; }
+
+    /// <summary>
     /// Optional single-channel brush mask at the reference resolution. White
     /// pixels are regenerated, black pixels follow the reference trajectory.
     /// Reused by Z-Image Union 2.x inpaint (white = repaint, black = keep),
@@ -131,6 +155,10 @@ public sealed class JobDto
     public string State { get; init; } = "queued";
     public string Model { get; init; } = "none";
     public bool Edit { get; init; }
+    /// <summary>Identity-condition job (Wan2GP-style image_refs), not img2img.</summary>
+    public bool IdentityRef { get; init; }
+    /// <summary>Number of identity reference images attached to the job.</summary>
+    public int IdentityRefCount { get; init; }
     public bool HasMask { get; init; }
     public bool AdvancedEdit { get; init; }
     public bool Outpaint { get; init; }
@@ -167,6 +195,7 @@ public sealed class JobDto
         (bool control, bool hasControl) = ControlState(request);
         (bool advanced, bool outpaint, bool rgba) = AdvancedEditState(request);
         (bool inpaint, bool hasInpaintMask) = InpaintState(request);
+        (bool identityRef, int identityRefCount) = IdentityRefState(request);
         return new JobDto
         {
             Id = job.Id,
@@ -180,6 +209,8 @@ public sealed class JobDto
             // Qwen21EditOptions derives from QwenImageOptions, so the model id
             // alone cannot tell an edit job apart in the gallery / job list.
             Edit = request is Qwen21EditOptions,
+            IdentityRef = identityRef,
+            IdentityRefCount = identityRefCount,
             HasMask = request is Qwen21EditOptions { Mask: not null } || hasInpaintMask,
             AdvancedEdit = advanced,
             Outpaint = outpaint,
@@ -208,6 +239,12 @@ public sealed class JobDto
             Client = runtime.ClientFor(job.Id)
         };
     }
+
+    internal static (bool IdentityRef, int Count) IdentityRefState(
+        GenerationOptions request)
+        => request is Qwen21IdentityRefOptions identity
+            ? (true, identity.References.Count)
+            : (false, 0);
 
     /// <summary>
     /// ControlNet state derived from a request. Kept as a pure function so the
@@ -286,6 +323,13 @@ public sealed class OutputEntryDto
     public DateTimeOffset ModTime { get; init; }
     public string Url { get; init; } = "";
     public string ContentType { get; init; } = "application/octet-stream";
+}
+
+/// <summary>Request body for POST /api/memory-profile.</summary>
+public sealed class MemoryProfileRequest
+{
+    /// <summary>auto, high, balanced, low or lowest (case-insensitive).</summary>
+    public string? Profile { get; init; }
 }
 
 /// <summary>Common error envelope.</summary>

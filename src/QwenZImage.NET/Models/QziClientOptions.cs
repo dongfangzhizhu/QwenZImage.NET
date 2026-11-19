@@ -57,6 +57,14 @@ public sealed class QziClientOptions
     public int ThreadCount { get; init; } = 0;
 
     /// <summary>
+    /// Low-VRAM memory profile: "auto" (default), "high", "balanced", "low" or
+    /// "lowest". Scoped as <c>QZI_MEMORY_PROFILE</c> around engine creation;
+    /// the native engine resolves AUTO against live device VRAM. A blank value
+    /// leaves the ambient setting (or the config file) untouched.
+    /// </summary>
+    public string? MemoryProfile { get; init; }
+
+    /// <summary>
     /// Reads <c>QwenZImage.config.json</c> (explicit path, <c>QZI_CONFIG</c>,
     /// next to the app binary, the working directory, then
     /// <c>~/.config/QwenZImage/config.json</c>) and turns it into options.

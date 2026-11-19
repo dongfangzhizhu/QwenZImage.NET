@@ -122,7 +122,7 @@ public class ZImageInpaintTests
         Assert.True(NativeLibrary.TryGetExport(handle, "qzi_abi_features",
                                                out IntPtr features));
         uint bits = ((delegate* unmanaged<uint>)features)();
-        Assert.Equal(0u, bits & ~0xFu); // no stray bits beyond the four increments
+        Assert.Equal(0u, bits & ~0x3Fu); // no stray bits beyond the six increments
 
         if (!client.SupportsInpaint)
         {
@@ -133,8 +133,8 @@ public class ZImageInpaintTests
             return;
         }
 
-        // Fresh library: all four bits and a matching layout export.
-        Assert.Equal(0xFu, bits);
+        // Fresh library: all six bits and a matching layout export.
+        Assert.Equal(0x3Fu, bits);
         Assert.True(NativeLibrary.TryGetExport(handle, "qzi_zimage_inpaint_layout",
                                                out IntPtr layout));
         Assert.True(NativeLibrary.TryGetExport(handle, "qzi_generate_zimage_inpaint", out _));

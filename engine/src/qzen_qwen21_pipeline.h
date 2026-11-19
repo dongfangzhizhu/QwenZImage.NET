@@ -82,6 +82,16 @@ typedef struct {
     int lanpaint_steps;     /* 0 = off; 2/5/10/15 inner Langevin iterations */
     uint64_t lanpaint_seed; /* deterministic stream for the Langevin noise */
     unsigned char *alpha;   /* optional [1][16*height][16*width] RGBA plane */
+    /* Wan2GP-style identity condition (video_prompt_type "I"). Each ref is a
+     * normalised [64][h][w] VAE latent, conveyed to the DiT as a condition
+     * prefix BEFORE the noisy target. The sampler still starts from pure
+     * noise: references are never an img2img starting point. NULL / 0 leaves
+     * the original two-segment DiT path untouched. Appended so existing
+     * positional initialisers keep their meaning. */
+    const float *const *image_refs;
+    const int *ref_heights;
+    const int *ref_widths;
+    int ref_count;
 } qzen_qwen21_sample;
 
 /* Phase progress for the resident service: "dit" with (step, steps) before each
