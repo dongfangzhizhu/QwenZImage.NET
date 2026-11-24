@@ -248,7 +248,7 @@ dotnet run --project tools/PublishedPackageSmokeTest -c Release -- \
   --out artifacts/published-smoke
 ```
 
-程序强制 `QZI_REQUIRE_REAL_BACKEND=1`，拒绝回退到噪点后端；它读取 `QwenZImage.config.json` 中的本地权重，依次验证 Z-Image 文生图、Qwen-Image 2.1 文生图、身份参考以及 `low` profile 的逐块换入换出（同 prompt / seed 与 `high` 输出 SHA-256 对比），全部通过才返回 0。
+程序设置 `QZI_REQUIRE_REAL_BACKEND=1`（WebUI 的同名约定）并显式检查 `GetHealth().IsReferenceBackend`，一旦加载到噪点后端立即失败；它读取 `QwenZImage.config.json` 中的本地权重，依次验证 Z-Image 文生图、Qwen-Image 2.1 文生图、身份参考以及 `low` profile 的逐块换入换出（同 prompt / seed 与 `high` 输出 SHA-256 对比），全部通过才返回 0。
 
 ## 许可与声明
 

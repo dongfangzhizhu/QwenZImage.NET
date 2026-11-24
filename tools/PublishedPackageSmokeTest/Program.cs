@@ -51,7 +51,9 @@ internal static class Program
 
         native = Path.GetFullPath(native);
         Environment.SetEnvironmentVariable("QZI_NATIVE_LIBRARY", native);
-        // Never let a missing GPU silently fall back to the noise backend.
+        // Same convention the WebUI uses. The core library does not read this
+        // variable, so the explicit IsReferenceBackend check below is what
+        // actually rejects the deterministic noise backend.
         Environment.SetEnvironmentVariable("QZI_REQUIRE_REAL_BACKEND", "1");
         if (config is not null)
             Environment.SetEnvironmentVariable("QZI_CONFIG", Path.GetFullPath(config));
