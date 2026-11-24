@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -503,6 +504,20 @@ int qzen_st_read_data(const qzen_st_header *header, const qzen_st_tensor *tensor
         if (error && error_size) snprintf(error, error_size, "invalid tensor read request");
         return 0;
     }
+    /* GGUF container: the tensor's file_offset carries its index and the
+     * reader dequantises straight into `data`. The virtual header's dtype is
+     * BF16/F32 so callers request the right byte count; the callback validates
+     * it. No pread of a byte range happens. */
+    if (header->gguf && header->gguf_read) {
+        if (!header->gguf_read(header->gguf, tensor->file_offset, data, bytes,
+                               error, error_size)) {
+            if (error && error_size && !*error)
+                snprintf(error, error_size, "%s: cannot dequantise %s",
+                         header->path, tensor->name ? tensor->name : "tensor");
+            return 0;
+        }
+        return 1;
+    }
     uint64_t tensor_bytes = tensor->data_end - tensor->data_begin;
     if (tensor_bytes != bytes) {
         if (error && error_size) {
@@ -618,19 +633,25 @@ static float qzen_half_to_float(uint16_t value) {
     return result;
 }
 
-/* In-place 256-point regular Hadamard (R(256), not Sylvester): four butterfly
- * passes over strides 1, 4, 16, 64 with the 4x4 kernel [[1,1,1,-1] rows].
- * The 256 block is viewed as (256/(4*stride), 4, stride) and the four points of
- * a group are 4*stride apart inside one lane. The 1/16 normalisation is folded
- * into the INT8 scale by the caller so it is applied exactly once. */
-static void qzen_convrot_hadamard_256(float *block) {
-    static const int strides[] = {1, 4, 16, 64};
-    for (size_t pass = 0; pass < sizeof(strides) / sizeof(strides[0]); pass++) {
-        int stride = strides[pass];
-        int groups = 256 / (4 * stride);
-        for (int group = 0; group < groups; group++) {
-            float *base = block + (size_t)group * 4 * stride;
-            for (int lane = 0; lane < stride; lane++) {
+static float qzen_bf16_to_float(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+/* In-place regular Hadamard R(group), not Sylvester: butterfly passes over
+ * strides 1, 4, 16, ... with the 4x4 kernel [[1,1,1,-1] rows]. The block is
+ * viewed as (group/(4*stride), 4, stride) and the four points of a group are
+ * 4*stride apart inside one lane. The 1/sqrt(group) normalisation is folded
+ * into the INT8 scale by the caller so it is applied exactly once. `group` is
+ * 256 for the language tower / DiT and 64 for Qwen3-VL vision blocks. */
+static void qzen_convrot_hadamard(float *block, uint32_t group) {
+    for (uint32_t stride = 1; 4u * stride <= group; stride *= 4u) {
+        uint32_t groups = group / (4 * stride);
+        for (uint32_t group_index = 0; group_index < groups; group_index++) {
+            float *base = block + (size_t)group_index * 4 * stride;
+            for (uint32_t lane = 0; lane < stride; lane++) {
                 float x0 = base[lane];
                 float x1 = base[stride + lane];
                 float x2 = base[2 * stride + lane];
@@ -674,21 +695,24 @@ typedef struct {
     uint64_t columns;
     uint64_t row_start;
     uint64_t row_end;
+    uint32_t group;
+    float factor;
 } qzen_convrot_dequant_job;
 
 static void qzen_convrot_dequant_rows(qzen_convrot_dequant_job *job) {
     const uint64_t columns = job->columns;
     for (uint64_t row = job->row_start; row < job->row_end; row++) {
-        /* 1/16 folded into the row scale: scaling by 2^-4 is exact, so this is
-         * bit-identical to rotating first and dividing the block afterwards. */
-        const float factor = job->scales[row] * 0.0625f;
+        /* 1/sqrt(group) folded into the row scale: scaling by a power of two
+         * is exact, so this is bit-identical to rotating first and dividing
+         * the block afterwards. */
+        const float factor = job->scales[row] * job->factor;
         const int8_t *source = job->quantized + row * columns;
         float *target = job->values + row * columns;
         for (uint64_t index = 0; index < columns; index++) {
             target[index] = (float)source[index] * factor;
         }
-        for (uint64_t group = 0; group < columns; group += 256) {
-            qzen_convrot_hadamard_256(target + group);
+        for (uint64_t offset = 0; offset < columns; offset += job->group) {
+            qzen_convrot_hadamard(target + offset, job->group);
         }
     }
 }
@@ -700,14 +724,14 @@ static void *qzen_convrot_dequant_thread(void *opaque) {
 
 static int qzen_convrot_dequantize(const int8_t *quantized, const float *scales,
                                  uint64_t rows, uint64_t columns,
-                                 float *values) {
+                                 uint32_t group, float factor, float *values) {
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cores < 1) cores = 1;
     if ((uint64_t)cores > rows) cores = (long)rows;
     if (cores > 32) cores = 32;
     if (cores <= 1) {
         qzen_convrot_dequant_job job = {quantized, values, scales, rows, columns,
-                                      0, rows};
+                                      0, rows, group, factor};
         qzen_convrot_dequant_rows(&job);
         return 1;
     }
@@ -718,7 +742,8 @@ static int qzen_convrot_dequantize(const int8_t *quantized, const float *scales,
     for (long index = 0; index < cores; index++) {
         uint64_t end = rows * (uint64_t)(index + 1) / (uint64_t)cores;
         jobs[index] = (qzen_convrot_dequant_job){quantized, values, scales, rows,
-                                               columns, (uint64_t)started, end};
+                                               columns, (uint64_t)started, end,
+                                               group, factor};
         started = (long)end;
         if (end == jobs[index].row_start) continue;
         if (pthread_create(&threads[created], NULL, qzen_convrot_dequant_thread,
@@ -732,10 +757,11 @@ static int qzen_convrot_dequantize(const int8_t *quantized, const float *scales,
     return ok;
 }
 
-int qzen_st_read_f32(const qzen_st_header *header, const qzen_st_tensor *tensor,
-                   const qzen_st_header *scale_header,
-                   const qzen_st_tensor *scale, float **values,
-                   char *error, size_t error_size) {
+int qzen_st_read_f32_convrot(const qzen_st_header *header,
+                             const qzen_st_tensor *tensor,
+                             const qzen_st_header *scale_header,
+                             const qzen_st_tensor *scale, uint32_t group,
+                             float **values, char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (values) *values = NULL;
     if (!header || !tensor || !values) {
@@ -779,6 +805,21 @@ int qzen_st_read_f32(const qzen_st_header *header, const qzen_st_tensor *tensor,
         *values = buffer;
         return 1;
     }
+    if (tensor->dtype == QZEN_DTYPE_BF16) {
+        uint16_t *halves = malloc((size_t)elements * sizeof(*halves));
+        if (!halves) {
+            if (error && error_size) snprintf(error, error_size, "%s: out of memory reading BF16 payload", tensor->name ? tensor->name : "tensor");
+            free(buffer);
+            return 0;
+        }
+        int ok = qzen_st_read_data(header, tensor, halves, (size_t)elements * sizeof(*halves), error, error_size);
+        for (uint64_t index = 0; ok && index < elements; index++)
+            buffer[index] = qzen_bf16_to_float(halves[index]);
+        free(halves);
+        if (!ok) { free(buffer); return 0; }
+        *values = buffer;
+        return 1;
+    }
     if (tensor->dtype == QZEN_DTYPE_I8) {
         const char *name = tensor->name ? tensor->name : "tensor";
         if (tensor->ndim != 2) {
@@ -787,8 +828,13 @@ int qzen_st_read_f32(const qzen_st_header *header, const qzen_st_tensor *tensor,
             return 0;
         }
         uint64_t rows = tensor->shape[0], columns = tensor->shape[1];
-        if (!rows || !columns || columns % 256) {
-            if (error && error_size) snprintf(error, error_size, "%s: INT8 ConvRot input size %llu is not a multiple of 256", name, (unsigned long long)columns);
+        if (!group || (group & (group - 1)) || group > 256) {
+            if (error && error_size) snprintf(error, error_size, "%s: invalid ConvRot group %u", name, group);
+            free(buffer);
+            return 0;
+        }
+        if (!rows || !columns || columns % group) {
+            if (error && error_size) snprintf(error, error_size, "%s: INT8 ConvRot input size %llu is not a multiple of %u", name, (unsigned long long)columns, group);
             free(buffer);
             return 0;
         }
@@ -815,7 +861,8 @@ int qzen_st_read_f32(const qzen_st_header *header, const qzen_st_tensor *tensor,
                  qzen_st_read_data(scale_header, scale, scales, (size_t)rows * sizeof(*scales), error, error_size);
         if (ok) {
             double started = qzen_monotonic_seconds();
-            ok = qzen_convrot_dequantize(quantized, scales, rows, columns, buffer);
+            ok = qzen_convrot_dequantize(quantized, scales, rows, columns, group,
+                                         1.0f / sqrtf((float)group), buffer);
             qzen_convrot_dequant_seconds += qzen_monotonic_seconds() - started;
             qzen_convrot_dequant_elements += elements;
         }
@@ -834,4 +881,12 @@ int qzen_st_read_f32(const qzen_st_header *header, const qzen_st_tensor *tensor,
     if (error && error_size) snprintf(error, error_size, "%s: dtype %s cannot be normalised to F32", tensor->name ? tensor->name : "tensor", qzen_dtype_name(tensor->dtype));
     free(buffer);
     return 0;
+}
+
+int qzen_st_read_f32(const qzen_st_header *header, const qzen_st_tensor *tensor,
+                     const qzen_st_header *scale_header,
+                     const qzen_st_tensor *scale, float **values,
+                     char *error, size_t error_size) {
+    return qzen_st_read_f32_convrot(header, tensor, scale_header, scale, 256,
+                                    values, error, error_size);
 }

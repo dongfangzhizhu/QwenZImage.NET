@@ -39,12 +39,22 @@ typedef struct {
     uint64_t file_offset;
 } qzen_st_tensor;
 
+/* Opaque reader for a non-safetensors container (GGUF) presented through a
+ * synthetic header. When `gguf` is non-NULL, qzen_st_read_data() calls
+ * `gguf_read` to dequantise the tensor (whose file_offset carries the tensor
+ * index) instead of pread()-ing bytes. This keeps every component loader —
+ * which all call qzen_st_read_data — agnostic of the container format. */
+typedef int (*qzen_st_gguf_read_fn)(void *gguf, uint64_t index, void *data,
+                                    size_t bytes, char *error, size_t error_size);
+
 typedef struct {
     char *path;
     uint64_t file_size;
     uint64_t header_size;
     qzen_st_tensor *tensors;
     size_t tensor_count;
+    void *gguf;                       /* NULL for a real safetensors header */
+    qzen_st_gguf_read_fn gguf_read;   /* set together with gguf */
 } qzen_st_header;
 
 int qzen_st_read_header(const char *path, qzen_st_header *header,
@@ -63,6 +73,15 @@ int qzen_st_read_f32(const qzen_st_header *header, const qzen_st_tensor *tensor,
                    const qzen_st_header *scale_header,
                    const qzen_st_tensor *scale, float **values,
                    char *error, size_t error_size);
+
+/* Same ConvRot INT8 dequantiser with an explicit Hadamard group size. Qwen3-VL
+ * vision blocks use group 64; the language tower and DiT use group 256. Other
+ * dtypes ignore `group`. */
+int qzen_st_read_f32_convrot(const qzen_st_header *header,
+                             const qzen_st_tensor *tensor,
+                             const qzen_st_header *scale_header,
+                             const qzen_st_tensor *scale, uint32_t group,
+                             float **values, char *error, size_t error_size);
 /* Host-side ConvRot dequantiser telemetry (arithmetic only, no disk I/O). */
 void qzen_st_reset_dequant_stats(void);
 void qzen_st_dequant_stats(double *seconds, uint64_t *elements);

@@ -3,8 +3,9 @@
   "_note": "The Windows paths below are absolute so this file works as-is on the machine that owns the weights. The 'h3-models' segment is just that machine's existing on-disk data directory name (inherited from the upstream project); it is NOT a product, symbol or artifact name - no QwenZImageNative artifact uses it. Rename it freely, or edit these values / set QZI_QWEN21_DIR and QZI_ZIMAGE_DIR on any other host.",
   "device_id": -1,
   "thread_count": 0,
-  "_memory_profile": "Low-VRAM budget: auto (default, resolved from device VRAM), high, balanced, low or lowest. On small cards 'low'/'lowest' lower the allocator release threshold and the reference-image VAE encode cap so the same weights fit without OOM (WanGP mmgp-style). QZI_MEMORY_PROFILE overrides this key.",
+  "_memory_profile": "Low-VRAM budget: auto (default, resolved from device VRAM), high, balanced, low or lowest. On small cards 'low'/'lowest' enable real DiT block swapping (only 1 of 32 layers resident on GPU, the rest streamed from the checkpoint per step, numerically lossless) and lower the allocator release threshold and reference-image VAE encode cap so the same weights fit without OOM (WanGP mmgp-style). LoRA requests fall back to fully resident. QZI_MEMORY_PROFILE overrides this key.",
   "memory_profile": "auto",
+  "_zimage_components": "Optional per-component overrides (file or directory), uncomment/set to mix versions. Empty = derive each from zimage_dir. zimage_dit_dir / zimage_vae_dir / zimage_text_dir select the DiT, VAE and text encoder independently (safetensors / FP8 / GGUF / nunchaku); zimage_tokenizer_path selects tokenizer.json when the text weights are a single file. Env overrides: QZI_ZIMAGE_DIT_DIR / QZI_ZIMAGE_VAE_DIR / QZI_ZIMAGE_TEXT_DIR / QZI_ZIMAGE_TOKENIZER_PATH.",
   "windows": {
     "qwen21_dir": "D:/AI/convert/minimax/h3-models/qwen21",
     "qwen21_lora_dir": "D:/AI/convert/minimax/h3-models/qwen21/loras",

@@ -1152,6 +1152,125 @@ void qzen_tokenizer_ids_free(uint32_t *ids) {
     free(ids);
 }
 
+int qzen_tokenizer_token_id(const qzen_tokenizer *tokenizer, const char *token,
+                            uint32_t *id) {
+    if (!tokenizer || !token || !id) return 0;
+    return qzen_map_get(&tokenizer->added_tokens, token, id);
+}
+
+int qzen_tokenizer_encode_spans(const qzen_tokenizer *tokenizer, const char *utf8,
+                                const char *marker, uint32_t **ids, int32_t **slots,
+                                size_t *count, char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!tokenizer || !utf8 || !marker || !ids || !slots || !count) return 0;
+    *ids = NULL;
+    *slots = NULL;
+    *count = 0;
+    if (!qzen_valid_utf8(utf8)) {
+        qzen_tok_error(error, error_size, "prompt is not valid UTF-8");
+        return 0;
+    }
+    qzen_u32_array output = {0};
+    int32_t *marks = NULL;
+    size_t marks_count = 0;
+    size_t marks_cap = 0;
+    uint32_t marker_id = 0;
+    int have_marker = qzen_map_get(&tokenizer->added_tokens, marker, &marker_id);
+    size_t start = 0;
+    size_t text_len = strlen(utf8);
+    int ok = 0;
+    while (start < text_len) {
+        size_t match_start = 0;
+        size_t match_len = 0;
+        const char *added = NULL;
+        if (!qzen_added_match(tokenizer, utf8, start, &match_start, &match_len, &added))
+            break;
+        if (match_start > start) {
+            char *plain = malloc(match_start - start + 1);
+            if (!plain) goto done;
+            memcpy(plain, utf8 + start, match_start - start);
+            plain[match_start - start] = '\0';
+            int plain_ok = qzen_encode_plain(tokenizer, plain, &output, error, error_size);
+            free(plain);
+            if (!plain_ok) goto done;
+            if (marks_count + output.count > marks_cap) {
+                size_t wanted = marks_count + output.count;
+                int32_t *grown = realloc(marks, wanted * sizeof(*grown));
+                if (!grown) {
+                    qzen_tok_error(error, error_size, "out of memory encoding prompt");
+                    goto done;
+                }
+                memset(grown + marks_cap, 0xff,
+                       (wanted - marks_cap) * sizeof(*grown));
+                marks = grown;
+                marks_cap = wanted;
+            }
+            marks_count += output.count;
+        }
+        uint32_t token_id;
+        if (!qzen_map_get(&tokenizer->added_tokens, added, &token_id)) {
+            qzen_tok_error(error, error_size, "tokenizer failure");
+            goto done;
+        }
+        if (!qzen_u32_array_push(&output, token_id)) {
+            qzen_tok_error(error, error_size, "out of memory encoding prompt");
+            goto done;
+        }
+        if (marks_count == marks_cap) {
+            size_t wanted = marks_cap ? marks_cap * 2 : 16;
+            int32_t *grown = realloc(marks, wanted * sizeof(*grown));
+            if (!grown) {
+                qzen_tok_error(error, error_size, "out of memory encoding prompt");
+                goto done;
+            }
+            memset(grown + marks_cap, 0xff, (wanted - marks_cap) * sizeof(*grown));
+            marks = grown;
+            marks_cap = wanted;
+        }
+        /* Record the output token position, not an encounter ordinal: callers
+         * need to overwrite the matching text hidden row. */
+        marks[marks_count] = (have_marker && token_id == marker_id)
+                                 ? (int32_t)(output.count - 1) : -1;
+        marks_count++;
+        start = match_start + match_len;
+    }
+    if (start < text_len) {
+        size_t before = output.count;
+        if (!qzen_encode_plain(tokenizer, utf8 + start, &output, error, error_size))
+            goto done;
+        if (marks_count + (output.count - before) > marks_cap) {
+            size_t wanted = marks_count + (output.count - before);
+            int32_t *grown = realloc(marks, wanted * sizeof(*grown));
+            if (!grown) {
+                qzen_tok_error(error, error_size, "out of memory encoding prompt");
+                goto done;
+            }
+            memset(grown + marks_cap, 0xff, (wanted - marks_cap) * sizeof(*grown));
+            marks = grown;
+            marks_cap = wanted;
+        }
+        marks_count += output.count - before;
+    }
+    if (!output.count) {
+        qzen_tok_error(error, error_size, "prompt tokenised to zero tokens");
+        goto done;
+    }
+    *ids = malloc(output.count * sizeof(**ids));
+    if (!*ids) {
+        qzen_tok_error(error, error_size, "out of memory encoding prompt");
+        goto done;
+    }
+    memcpy(*ids, output.items, output.count * sizeof(**ids));
+    *slots = marks;
+    *count = output.count;
+    marks = NULL;
+    ok = 1;
+done:
+    free(marks);
+    qzen_u32_array_free(&output);
+    return ok;
+}
+
 char *qzen_tokenizer_decode(const qzen_tokenizer *tokenizer, const uint32_t *ids,
                           size_t count, char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';

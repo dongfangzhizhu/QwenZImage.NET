@@ -4,11 +4,13 @@
 
 - NuGet：<https://www.nuget.org/packages/QwenZImage.NET>
 - 仓库：<https://github.com/dongfangzhizhu/QwenZImage.NET>
+- 当前版本：**0.3.0**
 
 ## 目录
 
 - [安装与前置条件](#安装与前置条件)
 - [快速上手](#快速上手)
+- [0.3.0 新增能力](#030-新增能力)
 - [能力](#能力)
 - [配置](#配置)
 - [模型权重](#模型权重)
@@ -61,6 +63,16 @@ Console.WriteLine(client.GetHealth().IsReferenceBackend
 | `new QziClient(QziClientOptions.FromConfig(path))` | 指定配置文件 |
 | `new QziClient(new QziClientOptions { ... })` | 完全用代码指定，优先级最高 |
 
+## 0.3.0 新增能力
+
+| 新增 | 说明 | 入口 |
+| --- | --- | --- |
+| 完整 Qwen3-VL 视觉塔 | 身份参考不再只靠 VAE latent：`<\|image_pad\|>` + deepstack + 图像 grid mRoPE 与 VAE 参考 latent 双条件化，DiT 按 Wan2GP 4-slot joint 展开 | `GenerateQwen21IdentityRef(Async)` |
+| 真正的低显存换入换出 | `low` / `lowest` 让 GPU 只保留 1 层 DiT 权重（约 0.2 GiB），其余每层每步从 checkpoint 换入；同种子输出与 `high` 字节一致。LoRA 请求自动回退常驻 | `SetMemoryProfile` |
+| Z-Image 逐组件替换 | DiT / VAE / text encoder / tokenizer 可分别指向 BF16、Quanto INT8、Nunchaku int4、FP8 或 GGUF 文件；不设置时保持原单包行为 | `zimage_*_dir` 配置项或 `QZI_ZIMAGE_*` 环境变量 |
+
+这三项改动已通过 **C ABI 冒烟测试 + 250 个托管单元测试**，并在本机 RTX 4090 + 本地模型上用真实 CUDA 后端完成出图验证；验证方式见[发布包真机验证](#发布包真机验证)。
+
 ## 能力
 
 | 能力 | 入口 |
@@ -87,8 +99,8 @@ SupportsInpaint        SupportsIdentityReference SupportsLowVram
 
 ### 关键语义
 
-- **身份参考**：对齐 Wan2GP `image_refs`，支持 1–10 张带权重的参考图与编码上限；真实 CUDA 后端从纯噪声起步，用 VAE 参考 latent 作为 condition prefix，可同时锁脸与大改服装。文本塔仍是 text-only，未移植 Qwen3-VL 视觉 embedding。
-- **低显存 profile**：`auto` 按设备总显存选择预算；`high` / `balanced` / `low` / `lowest` 分别调整 CUDA 分配器释放阈值（默认 24 GiB，`low` 为 1 GiB，`lowest` 为 256 MiB）与参考图编码上限（768 → 512 / 384 px）。WebUI 顶栏提供对应的 `VRAM: ...` 下拉。该 profile 是内存预算控制，不是完整的 mmgp 逐块 offload。
+- **身份参考**：对齐 Wan2GP `image_refs`，支持 1–10 张带权重的参考图与编码上限。真实 CUDA 后端从纯噪声起步，用 VAE 参考 latent 与完整 Qwen3-VL 视觉塔（`<|image_pad|>` + deepstack + 图像 grid mRoPE）双条件化；DiT 采用 Wan2GP 的 4-slot joint 展开，可同时锁脸与大改服装。
+- **低显存 profile**：`auto` 按设备总显存选择预算；`high` / `balanced` / `low` / `lowest` 调整 CUDA 分配器释放阈值（默认 24 GiB，`lowest` 为 256 MiB）与参考图编码上限（768 → 512 / 384 px）。`low` / `lowest` 还启用真正的 **DiT 逐块换入换出**（mmgp block swapping）：GPU 只保留 1 层 INT8 权重，其余 31 层每步从 checkpoint 换入，DiT 显存从 6.8 GiB 降到约 0.2 GiB，数值无损（同种子输出 SHA-256 与 `high` 一致）；带 LoRA 时自动回退常驻。WebUI 顶栏提供 `VRAM: ...` 下拉。
 - **控制图**：核心库按 **raw raster** 语义消费，不做姿态 / 边缘 / 深度估计；WebUI 负责把上传的普通照片预处理成 guide。
 
 ### 并发
@@ -109,6 +121,10 @@ SupportsInpaint        SupportsIdentityReference SupportsLowVram
   "zimage_dir": "/models/zimage",
   "zimage_nunchaku_dir": "/models/zimage_nunchaku",
   "zimage_control_dir": "/models/zimage/control_union_2.1.safetensors",
+  "zimage_dit_dir": "/models/zimage/dit_fp8.safetensors",
+  "zimage_vae_dir": "/models/zimage/vae_gguf.gguf",
+  "zimage_text_dir": "/models/zimage/text_int8",
+  "zimage_tokenizer_path": "/models/zimage/tokenizer.json",
   "text_cache_dir": "/models/cache",
   "windows": { "qwen21_dir": "D:/models/qwen21" }
 }
@@ -124,7 +140,8 @@ SupportsInpaint        SupportsIdentityReference SupportsLowVram
 | `QZI_NATIVE_LIBRARY` | 指定 native 库路径（切换到 CUDA 构建） |
 | `QZI_REQUIRE_REAL_BACKEND` | 设为 `1` 时禁止加载参考后端 |
 | `QZI_QWEN21_DIR` / `QZI_QWEN21_LORA_DIR` | Qwen-Image 2.1 权重目录 |
-| `QZI_ZIMAGE_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_ZIMAGE_CONTROL_DIR` | Z-Image 各权重路径 |
+| `QZI_ZIMAGE_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_ZIMAGE_CONTROL_DIR` | Z-Image 默认 / Nunchaku / ControlNet 权重路径 |
+| `QZI_ZIMAGE_DIT_DIR` / `QZI_ZIMAGE_VAE_DIR` / `QZI_ZIMAGE_TEXT_DIR` / `QZI_ZIMAGE_TOKENIZER_PATH` | 逐组件覆盖 DiT / VAE / text encoder / tokenizer，支持 BF16 / FP8 / GGUF / 现有 INT4、INT8 |
 | `QZI_MODEL_CACHE` | 文本编码缓存目录 |
 | `QZI_DEVICE_ID` | GPU 设备号 |
 | `QZI_MEMORY_PROFILE` | `auto` / `high` / `balanced` / `low` / `lowest` |
@@ -166,7 +183,7 @@ ASP.NET Core Minimal API，Windows / Linux 同一套代码，提供 health、pre
 
 ## NuGet 包内容
 
-以 `QwenZImage.NET.0.2.0.nupkg` 为例：
+以 `QwenZImage.NET.0.3.0.nupkg` 为例：
 
 ```text
 ├─ lib/net10.0/QwenZImage.NET.dll
@@ -207,7 +224,31 @@ dotnet pack  src/QwenZImage.NET/QwenZImage.NET.csproj -c Release -o artifacts/pa
 
 ## 发布
 
-发布走 **NuGet Trusted Publishing**：`.github/workflows/release.yml` 在 `v*` tag 上触发（或手动 dispatch），用 GitHub OIDC token 换短期 API key，仓库不保存长期 `NUGET_API_KEY`。已发布版本：`0.1.0`、`0.2.0`。
+发布走 **NuGet Trusted Publishing**：`.github/workflows/release.yml` 在 `v*` tag 上触发（或手动 dispatch），用 GitHub OIDC token 换短期 API key，仓库不保存长期 `NUGET_API_KEY`。版本以 `v<version>` tag 为准（tag 会覆盖 csproj 里的 `<Version>` 作为打包版本）。已发布版本：`0.1.0`、`0.2.0`、`0.2.1`、`0.3.0`。
+
+从源码发版：
+
+```bash
+# 1. 本地先验证（参考后端，无需 GPU）
+dotnet build QwenZImage.NET.sln -c Release
+dotnet test  QwenZImage.NET.sln -c Release --no-build
+
+# 2. 提升 csproj <Version>，提交后打 tag 推送，CI 自动打包发布
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+### 发布包真机验证
+
+NuGet 包内是**参考后端**（确定性噪点），真图验证需另建 CUDA native 并让包 API 指向它。`tools/PublishedPackageSmokeTest` 是一个**独立控制台项目**：只有 `PackageReference`，没有对仓库源码的 `ProjectReference`，因此加载的就是 nuget.org 上刚发布的 DLL。
+
+```bash
+# 先编译真实后端：scripts/build-native-cuda.bat 89（按 GPU 架构调整）
+dotnet run --project tools/PublishedPackageSmokeTest -c Release -- \
+  --native artifacts/native/Windows-AMD64-cuda/QwenZImageNative.dll \
+  --out artifacts/published-smoke
+```
+
+程序强制 `QZI_REQUIRE_REAL_BACKEND=1`，拒绝回退到噪点后端；它读取 `QwenZImage.config.json` 中的本地权重，依次验证 Z-Image 文生图、Qwen-Image 2.1 文生图、身份参考以及 `low` profile 的逐块换入换出（同 prompt / seed 与 `high` 输出 SHA-256 对比），全部通过才返回 0。
 
 ## 许可与声明
 

@@ -33,12 +33,21 @@ typedef struct qzen_qwen21_request {
     const int *ref_heights;
     const int *ref_widths;
     int ref_count;
+    /* Wan2GP 4-slot joint layout. One byte per text token; 1 marks an
+     * <|image_pad|> whose four VAE latent tokens replace that single text row.
+     * NULL keeps the legacy [text ; refs ; target] layout. */
+    const uint8_t *image_pad_mask;
 } qzen_qwen21_request;
 
 /* Open a single-file checkpoint and read the resident (non-block) weights.
- * thread_count <= 0 selects the online CPU count, capped at QZEN_QWEN21_THREADS. */
+ * thread_count <= 0 selects the online CPU count, capped at QZEN_QWEN21_THREADS.
+ * stream_blocks != 0 keeps only ONE transformer layer of INT8 weights on the
+ * GPU and re-reads each layer from the checkpoint before it runs (mmgp-style
+ * block swapping): the DiT's resident weight footprint drops from 32 layers
+ * to 1. The checkpoint file stays open for the model's lifetime. Resident mode
+ * (0) uploads all 32 layers once and is byte-for-byte unchanged. */
 qzen_qwen21_model *qzen_qwen21_open(const char *checkpoint, int thread_count,
-                                char *error, size_t error_size);
+                                int stream_blocks, char *error, size_t error_size);
 void qzen_qwen21_close(qzen_qwen21_model *model);
 
 /* Full forward for every sigma in one pass over the block weights.

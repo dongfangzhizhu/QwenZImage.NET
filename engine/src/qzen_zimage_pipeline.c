@@ -265,11 +265,16 @@ void qzen_zpipe_free(qzen_zimage_pipeline *pipe) {
 
 /* --- text -------------------------------------------------------------------- */
 
-int qzen_zpipe_attach_text(qzen_zimage_pipeline *pipe, const char *qwen_dir,
-                         char *error, size_t error_size) {
+int qzen_zpipe_attach_text_ex(qzen_zimage_pipeline *pipe, const char *qwen_dir,
+                              const char *tokenizer_path,
+                              char *error, size_t error_size) {
     if (pipe->text_model) return 1;
-    char tokenizer_path[512];
-    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", qwen_dir);
+    char tokenizer_buf[1024];
+    if (!tokenizer_path || !*tokenizer_path) {
+        snprintf(tokenizer_buf, sizeof(tokenizer_buf), "%s/tokenizer.json",
+                 qwen_dir);
+        tokenizer_path = tokenizer_buf;
+    }
     pipe->tokenizer = qzen_tokenizer_load(tokenizer_path, error, error_size);
     if (!pipe->tokenizer) return 0;
     pipe->text_config = qzen_ztext_default_config();
@@ -279,6 +284,11 @@ int qzen_zpipe_attach_text(qzen_zimage_pipeline *pipe, const char *qwen_dir,
                                            error, error_size);
     qzen_weight_store_free(store);
     return pipe->text_model != NULL;
+}
+
+int qzen_zpipe_attach_text(qzen_zimage_pipeline *pipe, const char *qwen_dir,
+                         char *error, size_t error_size) {
+    return qzen_zpipe_attach_text_ex(pipe, qwen_dir, NULL, error, error_size);
 }
 
 void qzen_zpipe_release_text(qzen_zimage_pipeline *pipe) {

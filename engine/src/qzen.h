@@ -104,8 +104,10 @@ typedef struct {
     /* Restore the released spatial RoPE grid at 256x256. The default applies
      * a visually validated half-scale grid only at that native canvas. */
     int use_reference_rope;
-    /* Keep only two original BF16 DiT blocks in memory and overlap reading the
-     * next block from the checkpoint with execution of the current block. */
+    /* Reserved (declared but not consumed by the Qwen21 engine). The Qwen21
+     * low-VRAM path implements block swapping via qzen_qwen21_open()'s
+     * stream_blocks argument instead, which keeps one INT8 layer resident and
+     * re-reads each layer from the checkpoint during the forward pass. */
     int ssd_streaming;
     /* Optional lower internal model canvas. Both must be zero (exact output
      * canvas) or valid same-aspect dimensions no larger than width/height. */

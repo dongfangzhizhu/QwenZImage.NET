@@ -37,6 +37,10 @@ static const config_field config_fields[] = {
     CONFIG_FIELD(qwen21_lora_dir),
     CONFIG_FIELD(zimage_dir),
     CONFIG_FIELD(zimage_nunchaku_dir),
+    CONFIG_FIELD(zimage_dit_dir),
+    CONFIG_FIELD(zimage_vae_dir),
+    CONFIG_FIELD(zimage_text_dir),
+    CONFIG_FIELD(zimage_tokenizer_path),
     CONFIG_FIELD(zimage_control_dir),
     CONFIG_FIELD(text_cache_dir),
 };
@@ -311,6 +315,10 @@ static const struct {
     {"QZI_ZIMAGE_DIR",           "zimage_dir"},
     {"QZI_QWEN21_LORA_DIR",      "qwen21_lora_dir"},
     {"QZI_ZIMAGE_NUNCHAKU_DIR",  "zimage_nunchaku_dir"},
+    {"QZI_ZIMAGE_DIT_DIR",       "zimage_dit_dir"},
+    {"QZI_ZIMAGE_VAE_DIR",       "zimage_vae_dir"},
+    {"QZI_ZIMAGE_TEXT_DIR",      "zimage_text_dir"},
+    {"QZI_ZIMAGE_TOKENIZER_PATH","zimage_tokenizer_path"},
     {"QZI_ZIMAGE_CONTROL_DIR",   "zimage_control_dir"},
     {"QZI_MODEL_CACHE",          "text_cache_dir"},
 };

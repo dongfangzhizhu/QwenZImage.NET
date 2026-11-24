@@ -200,6 +200,7 @@ unchanged.
 | `QZI_QWEN21_DIR` / `QZI_ZIMAGE_DIR` | from config | Per-model directory overrides |
 | `QZI_ZIMAGE_NUNCHAKU_DIR` / `QZI_QWEN21_LORA_DIR` | from config | Pack directories for LoRA / Nunchaku weights. Read by both `QziConfig` and the native config loader; code-level `QziClientOptions` values are scoped through these variables during engine creation so the engine sees them |
 | `QZI_ZIMAGE_CONTROL_DIR` | from config | `zimage_control_dir`: path to the Z-Image Turbo Fun ControlNet Union 2.1 `.safetensors`. Only needed for `zimage-control` jobs; missing → `QZI_ERR_NOT_CONFIGURED` |
+| `QZI_ZIMAGE_DIT_DIR` / `QZI_ZIMAGE_VAE_DIR` / `QZI_ZIMAGE_TEXT_DIR` / `QZI_ZIMAGE_TOKENIZER_PATH` | from config | Component-level overrides for Z-Image DiT / VAE / text encoder / tokenizer. Each accepts a file or directory; paths win over the `Checkpoint`-derived pack layout. Use the tokenizer override when the text encoder is a single FP8/GGUF file. See [PARAMETERS.md](PARAMETERS.md) |
 | `QZI_MODEL_CACHE` | from config | Text-encoder cache directory |
 | `QZI_NATIVE_LIBRARY` | auto-probe | Full path to `QwenZImageNative.dll` / `libQwenZImageNative.so`. When set, it is authoritative — a missing/unloadable file is an error, never a silent fallback to the reference build |
 | `QZI_WEBUI_NATIVE` | `auto` | `auto` (detect a local `-cuda` build), `reference` (force the bundled stub), or an explicit library path |
@@ -684,16 +685,16 @@ local path; the browser UI does that automatically through a canvas.
 Submitted jobs appear with `"identity_ref": true` and `"identity_ref_count": N`.
 `/api/health` exposes `supports_identity_reference`; when `false` the UI
 disables the mode, and the server rejects such jobs with `400` before queueing.
-**Real CUDA backend note**: the CUDA backend implements this mode with a
-condition-prefix DiT: references are VAE-encoded at a weight-controlled
-resolution, prepended to the noisy target, and the sampler still starts from
-pure noise. The text tower is text-only (no Qwen3-VL `visual.*` port), so visual
-semantics come from the VAE condition tokens rather than `<|image_pad|>`
-embeddings. See [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md).
+**Real CUDA backend note**: the CUDA backend implements this mode with both
+Wan2GP condition channels. References are VAE-encoded at a weight-controlled
+resolution and expanded 4 latent rows per `<|image_pad|>` slot in the DiT joint
+sequence; the Qwen3-VL visual tower writes merged embeddings into the same pad
+rows (plus deepstack and image-grid mRoPE). The sampler still starts from pure
+noise. See [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md).
 
 ### 低显存 / 内存 profile（第六增量）
 
-WanGP 靠 mmgp profile 在低显存卡上跑同一份 7B 模型；QZI 用引擎级 profile 达到同类效果。它对所有生成模式生效，不是请求字段，也不产生作业 / 不占 `served` 计数。
+WanGP 靠 mmgp profile 在低显存卡上跑同一份 7B 模型；QZI 用引擎级 profile 达到同类效果——`low` / `lowest` 会启用真正的 DiT 逐块换入换出（GPU 只留 1 层权重，其余每步从 checkpoint 换入，数值无损），`high` / `balanced` 保持 32 层常驻。它对所有生成模式生效，不是请求字段，也不产生作业 / 不占 `served` 计数。带 LoRA 的请求自动回退常驻。
 
 - `QwenZImage.config.json` 的 `memory_profile`（或环境变量 `QZI_MEMORY_PROFILE`）：`auto`（默认）/ `high` / `balanced` / `low` / `lowest`，创建引擎时生效。小显存卡建议 `low` 或 `lowest`。
 - 顶栏的 `VRAM: ...` 下拉仅在 `/api/health` 返回 `supports_low_vram: true` 时出现；切换即 `POST /api/memory-profile`，返回已解析预算（profile / 设备 VRAM / 分配器释放阈值 / 参考图编码上限），前端随即刷新 health pill。

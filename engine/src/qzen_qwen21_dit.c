@@ -103,8 +103,8 @@ static void q21_dump_bf16(const char *stage, qzen_gpu_tensor *tensor,
 #define Q21_IN_CHANNELS 64
 
 struct q21_gpu_ctx;
-static struct q21_gpu_ctx *q21_gpu_open(qzen_qwen21_model *model, char *error,
-                                        size_t error_size);
+static struct q21_gpu_ctx *q21_gpu_open(qzen_qwen21_model *model, int stream_blocks,
+                                        char *error, size_t error_size);
 static void q21_gpu_free(struct q21_gpu_ctx *ctx);
 static int q21_forward_device(qzen_qwen21_model *model,
                               const qzen_qwen21_request *request,
@@ -168,19 +168,48 @@ static void q21_gated_residual(float *restrict x, const float *restrict y, int t
 /* ------------------------------------------------------------------ layout */
 
 #define Q21_MAX_REFS 10
+#define Q21_LATENT_PER_PAD 4
 
+/* Two compatible token layouts:
+ *   legacy (no image_pad_mask): [text ; ref_0 ... ref_n ; target]
+ *   Wan2GP: each text <|image_pad|> expands to four VAE latent rows in place,
+ *           then the target latent is appended. The 3D RoPE frame/height/width
+ *           grids and the prefix attention segments follow the expanded rows.
+ */
 typedef struct {
     int text_tokens;
     int ref_count;
-    int ref_tokens[Q21_MAX_REFS]; /* cumulative END offset of each ref block */
-    int prefix_rows;              /* text + all reference tokens */
     int target_tokens;
+    int prefix_rows;  /* text + condition-image rows, before target */
     int tokens;
+    int image_pad_count;
+    int legacy;
+    uint64_t hash;    /* layout identity, invalidates the device scratch cache */
+    uint8_t *is_image;    /* [tokens]: 1 for every VAE latent row */
+    uint8_t *is_target;   /* [tokens]: 1 only for the denoised target */
+    int *source_index;    /* [tokens]: text index or concatenated latent index */
+    int *key_limit;       /* [tokens]: visible keys for this query row */
+    int *ref_end;         /* [ref_count+1]: cumulative latent token ends */
 } q21_layout;
+
+static void q21_layout_free(q21_layout *layout) {
+    if (!layout) return;
+    free(layout->is_image);
+    free(layout->is_target);
+    free(layout->source_index);
+    free(layout->key_limit);
+    free(layout->ref_end);
+    memset(layout, 0, sizeof(*layout));
+}
 
 static int q21_layout_from_request(const qzen_qwen21_request *request, q21_layout *layout,
                                    char *error, size_t error_size) {
     memset(layout, 0, sizeof(*layout));
+    if (!request || request->text_tokens <= 0 ||
+        request->height <= 0 || request->width <= 0) {
+        snprintf(error, error_size, "invalid Qwen-Image 2.1 layout request");
+        return 0;
+    }
     layout->text_tokens = request->text_tokens;
     layout->target_tokens = request->height * request->width;
     layout->ref_count = request->ref_count;
@@ -188,96 +217,193 @@ static int q21_layout_from_request(const qzen_qwen21_request *request, q21_layou
         snprintf(error, error_size, "DiT supports at most %d reference latents", Q21_MAX_REFS);
         return 0;
     }
-    int cursor = layout->text_tokens;
+    int ref_tokens = 0;
+    layout->ref_end = calloc((size_t)layout->ref_count + 1u, sizeof(int));
+    if (!layout->ref_end) {
+        snprintf(error, error_size, "out of memory for reference layout");
+        return 0;
+    }
     for (int index = 0; index < layout->ref_count; index++) {
         if (!request->image_refs || !request->image_refs[index] ||
             !request->ref_heights || !request->ref_widths) {
             snprintf(error, error_size, "reference latent %d is missing", index);
+            q21_layout_free(layout);
             return 0;
         }
         int h = request->ref_heights[index], w = request->ref_widths[index];
         if (h <= 0 || w <= 0) {
             snprintf(error, error_size, "reference latent %d has invalid dimensions", index);
+            q21_layout_free(layout);
             return 0;
         }
-        cursor += h * w;
-        layout->ref_tokens[index] = cursor;
+        ref_tokens += h * w;
+        layout->ref_end[index] = ref_tokens;
     }
-    layout->prefix_rows = cursor;
-    layout->tokens = cursor + layout->target_tokens;
+    layout->ref_end[layout->ref_count] = ref_tokens;
+
+    int pad_count = 0;
+    if (request->image_pad_mask) {
+        for (int t = 0; t < layout->text_tokens; t++)
+            if (request->image_pad_mask[t]) pad_count++;
+    }
+    layout->image_pad_count = pad_count;
+    layout->legacy = (!request->image_pad_mask || layout->ref_count == 0);
+    if (!layout->legacy && ref_tokens != pad_count * Q21_LATENT_PER_PAD) {
+        snprintf(error, error_size,
+                 "image pad slots (%d) do not match reference latent rows (%d)",
+                 pad_count, ref_tokens);
+        q21_layout_free(layout);
+        return 0;
+    }
+    const int text_rows = layout->text_tokens +
+                          (layout->legacy ? 0 : pad_count * (Q21_LATENT_PER_PAD - 1));
+    layout->prefix_rows = text_rows;
+    layout->tokens = text_rows + layout->target_tokens;
+
+    const size_t n = (size_t)layout->tokens;
+    layout->is_image = calloc(n, sizeof(uint8_t));
+    layout->is_target = calloc(n, sizeof(uint8_t));
+    layout->source_index = calloc(n, sizeof(int));
+    layout->key_limit = calloc(n, sizeof(int));
+    if (!layout->is_image || !layout->is_target || !layout->source_index ||
+        !layout->key_limit) {
+        snprintf(error, error_size, "out of memory for %d joint rows", layout->tokens);
+        q21_layout_free(layout);
+        return 0;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    #define Q21_HASH(value) do { hash ^= (uint64_t)(value); hash *= 1099511628211ULL; } while (0)
+    Q21_HASH(layout->text_tokens);
+    Q21_HASH(layout->ref_count);
+    Q21_HASH(layout->target_tokens);
+    Q21_HASH(layout->legacy);
+    for (int i = 0; i < layout->ref_count; i++) {
+        Q21_HASH(request->ref_heights[i]);
+        Q21_HASH(request->ref_widths[i]);
+    }
+    int row = 0, image_cursor = 0;
+    for (int t = 0; t < layout->text_tokens; t++) {
+        int pad = !layout->legacy && request->image_pad_mask[t];
+        if (pad) Q21_HASH(t);
+        int copies = pad ? Q21_LATENT_PER_PAD : 1;
+        for (int k = 0; k < copies; k++, row++) {
+            layout->is_image[row] = pad ? 1u : 0u;
+            layout->source_index[row] = pad ? image_cursor++ : t;
+            layout->key_limit[row] = row + 1; /* text rows stay causal */
+        }
+    }
+    for (int t = 0; t < layout->target_tokens; t++, row++, image_cursor++) {
+        layout->is_image[row] = 1u;
+        layout->is_target[row] = 1u;
+        layout->source_index[row] = image_cursor;
+        layout->key_limit[row] = layout->tokens;
+    }
+    #undef Q21_HASH
+    layout->hash = hash;
+    if (row != layout->tokens || image_cursor != ref_tokens + layout->target_tokens) {
+        snprintf(error, error_size, "joint layout bookkeeping mismatch");
+        q21_layout_free(layout);
+        return 0;
+    }
+    /* Condition-image rows see keys up to the end of their own image block,
+     * matching _qwenimage21_prefix_segments(). */
+    for (int block = 0; block < layout->ref_count; block++) {
+        int last = -1;
+        for (int r = 0; r < layout->prefix_rows; r++) {
+            if (!layout->is_image[r] || layout->is_target[r]) continue;
+            int index = layout->source_index[r];
+            if (index >= (block ? layout->ref_end[block - 1] : 0) &&
+                index < layout->ref_end[block]) last = r;
+        }
+        if (last >= 0) {
+            for (int r = 0; r < layout->prefix_rows; r++) {
+                if (!layout->is_image[r] || layout->is_target[r]) continue;
+                int index = layout->source_index[r];
+                if (index >= (block ? layout->ref_end[block - 1] : 0) &&
+                    index < layout->ref_end[block]) layout->key_limit[r] = last + 1;
+            }
+        }
+    }
     return 1;
 }
 
-/* Visible-key count for a query row. Text is causal; each reference block sees
- * itself and earlier prefixes but not later references or the target; target
- * rows see the whole joint sequence. */
 static int q21_key_limit(const q21_layout *layout, int row) {
-    if (row < layout->text_tokens) return row + 1;
-    if (row < layout->prefix_rows) {
-        for (int index = 0; index < layout->ref_count; index++)
-            if (row < layout->ref_tokens[index]) return layout->ref_tokens[index];
-    }
-    return layout->tokens;
+    return layout->key_limit[row];
 }
 
 /* -------------------------------------------------------------------- rope */
 
-/* Axes [16, 56, 56] -> 8 + 28 + 28 complex pairs. A text token t sits at
- * (frame, height, width) = (t, t, t). Each image block shares one frame
+/* Axes [16, 56, 56] -> 8 + 28 + 28 complex pairs. Text rows sit at
+ * (frame, height, width) = (t, t, t). Every image block shares one frame
  * position (advanced by max(h,w) between blocks) and centred height/width
- * indices in raster order (QwenImage21Rope). */
+ * indices in raster order. In the Wan2GP layout the blocks are interleaved
+ * with the text rows that host their four latent tokens. */
+static int q21_image_block(const q21_layout *layout, int row) {
+    if (!layout->is_image[row]) return -1;
+    int index = layout->source_index[row];
+    for (int block = 0; block < layout->ref_count; block++)
+        if (index < layout->ref_end[block]) return block;
+    return layout->ref_count;
+}
+
 static void q21_rope_tables(const qzen_qwen21_request *request, const q21_layout *layout,
                             float *cos_tab, float *sin_tab) {
     int tokens = layout->tokens;
+    int *frame = calloc((size_t)tokens, sizeof(int));
+    int *high = calloc((size_t)tokens, sizeof(int));
+    int *wide = calloc((size_t)tokens, sizeof(int));
+    if (!frame || !high || !wide) {
+        free(frame); free(high); free(wide);
+        memset(cos_tab, 0, (size_t)tokens * Q21_GROUPS * sizeof(float));
+        memset(sin_tab, 0, (size_t)tokens * Q21_GROUPS * sizeof(float));
+        return;
+    }
+    int position = 0;
+    int row = 0;
+    for (int block = 0; block <= layout->ref_count; block++) {
+        int height = block < layout->ref_count ? request->ref_heights[block] : request->height;
+        int width  = block < layout->ref_count ? request->ref_widths[block]  : request->width;
+        while (row < tokens &&
+               !(layout->is_image[row] && q21_image_block(layout, row) == block)) {
+            frame[row] = high[row] = wide[row] = position;
+            position++;
+            row++;
+        }
+        int count = height * width;
+        for (int i = 0; i < count && row + i < tokens; i++) {
+            frame[row + i] = position;
+            high[row + i] = i / width - (height - height / 2);
+            wide[row + i] = i % width - (width - width / 2);
+        }
+        position += height > width ? height : width;
+        row += count;
+    }
+    while (row < tokens) {
+        frame[row] = high[row] = wide[row] = position;
+        position++;
+        row++;
+    }
     double inverse[Q21_GROUPS];
     int axes[3] = {Q21_ROPE_FRAME, Q21_ROPE_HEIGHT, Q21_ROPE_WIDTH};
     int cursor = 0;
     for (int a = 0; a < 3; a++) {
         int dim = axes[a];
-        for (int p = 0; p < dim / 2; p++) {
+        for (int p = 0; p < dim / 2; p++)
             inverse[cursor++] = exp(-log(Q21_ROPE_THETA) * (double)(2 * p) / (double)dim);
-        }
     }
     const int frame_pairs = Q21_ROPE_FRAME / 2;
     const int height_pairs = Q21_ROPE_HEIGHT / 2;
-    /* One block = all refs in order, then the target. */
-    int block_count = layout->ref_count + 1;
-    int block_heights[Q21_MAX_REFS + 1], block_widths[Q21_MAX_REFS + 1];
-    int block_ends[Q21_MAX_REFS + 1];
-    for (int index = 0; index < layout->ref_count; index++) {
-        block_heights[index] = request->ref_heights[index];
-        block_widths[index] = request->ref_widths[index];
-        block_ends[index] = layout->ref_tokens[index];
-    }
-    block_heights[layout->ref_count] = request->height;
-    block_widths[layout->ref_count] = request->width;
-    block_ends[layout->ref_count] = layout->tokens;
     for (int t = 0; t < tokens; t++) {
-        int frame = 0, high = 0, wide = 0;
-        if (t < layout->text_tokens) {
-            frame = t;
-            high = t;
-            wide = t;
-        } else {
-            int block = 0;
-            while (block < block_count && t >= block_ends[block]) block++;
-            int start = block ? block_ends[block - 1] : layout->text_tokens;
-            int index = t - start;
-            int height = block_heights[block], width = block_widths[block];
-            frame = layout->text_tokens;
-            for (int previous = 0; previous < block; previous++)
-                frame += block_heights[previous] > block_widths[previous]
-                       ? block_heights[previous] : block_widths[previous];
-            high = index / width - (height - height / 2);
-            wide = index % width - (width - width / 2);
-        }
+        int values[3] = {frame[t], high[t], wide[t]};
         for (int p = 0; p < Q21_GROUPS; p++) {
-            int value = p < frame_pairs ? frame : p < frame_pairs + height_pairs ? high : wide;
+            int value = p < frame_pairs ? values[0]
+                      : p < frame_pairs + height_pairs ? values[1] : values[2];
             double angle = (double)value * inverse[p];
             cos_tab[(size_t)t * Q21_GROUPS + p] = (float)cos(angle);
             sin_tab[(size_t)t * Q21_GROUPS + p] = (float)sin(angle);
         }
     }
+    free(frame); free(high); free(wide);
 }
 
 /* Weighted RMSNorm over the head, then the rotation of channel pairs
@@ -604,8 +730,8 @@ static int q21_model_read(qzen_qwen21_model *model, char *error, size_t error_si
     return 1;
 }
 
-qzen_qwen21_model *qzen_qwen21_open(const char *checkpoint, int thread_count, char *error,
-                                size_t error_size) {
+qzen_qwen21_model *qzen_qwen21_open(const char *checkpoint, int thread_count,
+                                int stream_blocks, char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!checkpoint) {
         snprintf(error, error_size, "no Qwen-Image 2.1 checkpoint path");
@@ -631,7 +757,7 @@ qzen_qwen21_model *qzen_qwen21_open(const char *checkpoint, int thread_count, ch
     }
     const char *gpu_env = getenv("QWEN21_GPU");
     if (gpu_env && *gpu_env && strcmp(gpu_env, "0") != 0) {
-        model->gpu_ctx = q21_gpu_open(model, error, error_size);
+        model->gpu_ctx = q21_gpu_open(model, stream_blocks, error, error_size);
         if (!model->gpu_ctx) {
             qzen_qwen21_close(model);
             return NULL;
@@ -705,6 +831,7 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
     if (!request->text || !request->latent || !request->sigmas || text_tokens <= 0 ||
         request->height <= 0 || request->width <= 0 || sigma_count <= 0) {
         snprintf(error, error_size, "Qwen-Image 2.1 forward needs text, latent and sigmas");
+        q21_layout_free(&layout);
         return 0;
     }
     if (model->gpu_ctx) {
@@ -716,6 +843,7 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
             (size_t)image_tokens * Q21_IN_CHANNELS);
         if (!latent_device) {
             snprintf(error, error_size, "out of GPU memory for the latent");
+            q21_layout_free(&layout);
             return 0;
         }
         int ok = 1;
@@ -751,6 +879,7 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
             free(staged);
         }
         qzen_gpu_tensor_free(latent_device);
+        q21_layout_free(&layout);
         return ok;
     }
     const int threads = model->threads;
@@ -800,9 +929,13 @@ int qzen_qwen21_forward(qzen_qwen21_model *model, const qzen_qwen21_request *req
     }
     for (int s = 0; s < sigma_count; s++) {
         float *rows = hidden + (size_t)s * dim;
-        memcpy(rows, prefix, (size_t)text_tokens * Q21_HIDDEN * sizeof(float));
-        memcpy(rows + (size_t)text_tokens * Q21_HIDDEN, image,
-               (size_t)(layout.tokens - text_tokens) * Q21_HIDDEN * sizeof(float));
+        for (int row = 0; row < layout.tokens; row++) {
+            const float *source = layout.is_image[row]
+                ? image + (size_t)layout.source_index[row] * Q21_HIDDEN
+                : prefix + (size_t)layout.source_index[row] * Q21_HIDDEN;
+            memcpy(rows + (size_t)row * Q21_HIDDEN, source,
+                   Q21_HIDDEN * sizeof(float));
+        }
         q21_condition(model, request->sigmas[s], &conditions[s], threads);
     }
     if (!q21_scratch_init(&scratch, tokens, threads, error, error_size)) goto done;
@@ -845,6 +978,7 @@ done:
     free(hidden);
     free(conditions);
     q21_scratch_free(&scratch);
+    q21_layout_free(&layout);
     return ok;
 }
 
@@ -878,10 +1012,12 @@ int qzen_qwen21_block_forward(qzen_qwen21_model *model, int layer, const float *
     int ok = 0;
     if (!rows) {
         snprintf(error, error_size, "out of memory for %d block tokens", tokens);
+        q21_layout_free(&rope_layout);
         return 0;
     }
     if (!q21_scratch_init(&scratch, tokens, model->threads, error, error_size)) {
         free(rows);
+        q21_layout_free(&rope_layout);
         return 0;
     }
     q21_rope_tables(&rope_request, &rope_layout, scratch.cos_tab, scratch.sin_tab);
@@ -897,6 +1033,7 @@ int qzen_qwen21_block_forward(qzen_qwen21_model *model, int layer, const float *
     }
     free(rows);
     q21_scratch_free(&scratch);
+    q21_layout_free(&rope_layout);
     return ok;
 }
 
@@ -970,11 +1107,21 @@ typedef struct q21_gpu_ctx {
     qzen_gpu_tensor *image_bf16; /* BF16 staging for the img_in projection */
     qzen_gpu_tensor *image_f32;  /* F32 staging for the carrier tail */
     qzen_gpu_tensor *velocity[2]; /* BF16 [image_tokens][64] device results */
+    /* Low-VRAM block swapping. When stream_blocks is set only block[0] holds
+     * weights on the device: before every layer the INT8 payloads are re-read
+     * from the checkpoint into that one slot (mmgp block-swap semantics). The
+     * other 31 slots stay empty, cutting resident DiT weights from 32 to 1
+     * layer. The checkpoint header stays open for the lifetime of the model,
+     * so qzen_st_read_data(header, ...) can seek per tensor. HIGH/BALANCED
+     * leave stream_blocks = 0 and keep all 32 layers resident byte-for-byte. */
+    int stream_blocks;
+    qzen_st_header *header;   /* borrowed from the model, never owned/freed here */
     /* Geometry the scratch was sized for. The row map and the RoPE tables
      * depend on it, so a call with the same token count but a different
      * prefix length or canvas has to rebuild them. */
     int tokens, text_tokens, height, width, velocity_slot;
     int prefix_rows, ref_count;
+    uint64_t layout_hash;
     int ref_heights[Q21_MAX_REFS], ref_widths[Q21_MAX_REFS];
 } q21_gpu;
 
@@ -1066,8 +1213,11 @@ static int q21_gpu_load_int8(qzen_st_header *header, qzen_gpu *gpu, const char *
     size_t elements = (size_t)rows * columns;
     int8_t *payload = malloc(elements);
     float *scale_values = malloc((size_t)rows * sizeof(float));
-    *weight = qzen_gpu_tensor_new_i8(gpu, elements);
-    *scales = qzen_gpu_tensor_new_f32(gpu, rows);
+    /* Block-swap streaming reuses one resident slot for every layer: only
+     * allocate when the slot is empty, otherwise overwrite in place. Resident
+     * mode passes NULL slots and therefore allocates exactly as before. */
+    if (!*weight) *weight = qzen_gpu_tensor_new_i8(gpu, elements);
+    if (!*scales) *scales = qzen_gpu_tensor_new_f32(gpu, rows);
     if (!payload || !scale_values || !*weight || !*scales) {
         snprintf(error, error_size, "%s: out of memory for the INT8 weight", name);
         goto fail;
@@ -1097,11 +1247,14 @@ fail:
 }
 
 /* Upload a BF16 checkpoint tensor verbatim (the resident weights are stored
- * BF16, so no dequantisation happens on the host at all). */
-static qzen_gpu_tensor *q21_gpu_load_bf16(qzen_st_header *header, qzen_gpu *gpu,
+ * BF16, so no dequantisation happens on the host at all). `into`, when non-NULL,
+ * is a pre-allocated slot of at least `elements` that is overwritten in place
+ * (block-swap streaming); NULL allocates a fresh tensor as before. */
+static qzen_gpu_tensor *q21_gpu_load_bf16_into(qzen_st_header *header, qzen_gpu *gpu,
                                         const char *name, int ndim,
-                                        const uint64_t *shape, char *error,
-                                        size_t error_size) {
+                                        const uint64_t *shape,
+                                        qzen_gpu_tensor *into,
+                                        char *error, size_t error_size) {
     const qzen_st_tensor *tensor = qzen_st_find(header, name);
     if (!q21_expect(tensor, name, ndim, shape, error, error_size)) return NULL;
     if (tensor->dtype != QZEN_DTYPE_BF16) {
@@ -1110,12 +1263,12 @@ static qzen_gpu_tensor *q21_gpu_load_bf16(qzen_st_header *header, qzen_gpu *gpu,
     }
     size_t elements = (size_t)qzen_st_tensor_elements(tensor);
     uint16_t *payload = malloc(elements * 2);
-    qzen_gpu_tensor *result = qzen_gpu_tensor_new_bf16(gpu, elements);
+    qzen_gpu_tensor *result = into ? into : qzen_gpu_tensor_new_bf16(gpu, elements);
     if (!payload || !result ||
         !qzen_st_read_data(header, tensor, payload, elements * 2, error, error_size) ||
         !qzen_gpu_upload_bf16_pinned(gpu, result, payload, elements)) {
         free(payload);
-        q21_gpu_tensor_free(&result);
+        if (!into) q21_gpu_tensor_free(&result);
         snprintf(error, error_size, "%s: BF16 upload failed", name);
         return NULL;
     }
@@ -1123,10 +1276,21 @@ static qzen_gpu_tensor *q21_gpu_load_bf16(qzen_st_header *header, qzen_gpu *gpu,
     return result;
 }
 
+static qzen_gpu_tensor *q21_gpu_load_bf16(qzen_st_header *header, qzen_gpu *gpu,
+                                        const char *name, int ndim,
+                                        const uint64_t *shape, char *error,
+                                        size_t error_size) {
+    return q21_gpu_load_bf16_into(header, gpu, name, ndim, shape, NULL, error,
+                                  error_size);
+}
+
 static int q21_gpu_load_block(q21_gpu *ctx, qzen_st_header *header, int layer,
                               q21_gpu_block *block, char *error, size_t error_size) {
     char name[192];
-    memset(block, 0, sizeof(*block));
+    /* Streaming reuses block[0] as the single slot: keep its tensor pointers
+     * so the INT8/BF16 loaders overwrite in place instead of reallocating.
+     * Resident mode passes a zeroed slot and allocates each tensor once. */
+    if (!ctx->stream_blocks) memset(block, 0, sizeof(*block));
     struct {
         const char *suffix;
         int rows, columns;
@@ -1152,11 +1316,13 @@ static int q21_gpu_load_block(q21_gpu *ctx, qzen_st_header *header, int layer,
     }
     const uint64_t vector[1] = {Q21_HEAD_DIM};
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_q.weight", layer);
-    block->norm_q = q21_gpu_load_bf16(header, ctx->gpu, name, 1, vector, error,
-                                      error_size);
+    qzen_gpu_tensor *norm_q = q21_gpu_load_bf16_into(
+        header, ctx->gpu, name, 1, vector, block->norm_q, error, error_size);
     snprintf(name, sizeof(name), "transformer_blocks.%d.attn.norm_k.weight", layer);
-    block->norm_k = q21_gpu_load_bf16(header, ctx->gpu, name, 1, vector, error,
-                                      error_size);
+    qzen_gpu_tensor *norm_k = q21_gpu_load_bf16_into(
+        header, ctx->gpu, name, 1, vector, block->norm_k, error, error_size);
+    if (norm_q) block->norm_q = norm_q;
+    if (norm_k) block->norm_k = norm_k;
     return block->norm_q && block->norm_k;
 }
 
@@ -1172,7 +1338,8 @@ static int q21_gpu_scratch_prepare(q21_gpu *ctx,
     int same = ctx->tokens >= tokens && ctx->text_tokens == text_tokens &&
                ctx->height == request->height && ctx->width == request->width &&
                ctx->ref_count == layout->ref_count &&
-               ctx->prefix_rows == layout->prefix_rows;
+               ctx->prefix_rows == layout->prefix_rows &&
+               ctx->layout_hash == layout->hash;
     for (int index = 0; same && index < layout->ref_count; index++) {
         same = ctx->ref_heights[index] == request->ref_heights[index] &&
                ctx->ref_widths[index] == request->ref_widths[index];
@@ -1293,6 +1460,7 @@ static int q21_gpu_scratch_prepare(q21_gpu *ctx,
     ctx->width = request->width;
     ctx->prefix_rows = layout->prefix_rows;
     ctx->ref_count = layout->ref_count;
+    ctx->layout_hash = layout->hash;
     for (int index = 0; index < layout->ref_count; index++) {
         ctx->ref_heights[index] = request->ref_heights[index];
         ctx->ref_widths[index] = request->ref_widths[index];
@@ -1471,8 +1639,8 @@ static int q21_gpu_stage_conditioning(q21_gpu *ctx, qzen_qwen21_model *model,
     return 1;
 }
 
-static struct q21_gpu_ctx *q21_gpu_open(qzen_qwen21_model *model, char *error,
-                                        size_t error_size) {
+static struct q21_gpu_ctx *q21_gpu_open(qzen_qwen21_model *model, int stream_blocks,
+                                        char *error, size_t error_size) {
     q21_gpu *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
         snprintf(error, error_size, "cannot allocate the Qwen GPU context");
@@ -1483,7 +1651,12 @@ static struct q21_gpu_ctx *q21_gpu_open(qzen_qwen21_model *model, char *error,
         free(ctx);
         return NULL;
     }
-    for (int layer = 0; layer < Q21_LAYERS; layer++) {
+    ctx->stream_blocks = stream_blocks ? 1 : 0;
+    ctx->header = &model->header;
+    /* Resident mode: all 32 layers on device. Stream mode: a single reusable
+     * layer slot (block[0]); the per-layer load happens in the forward loop. */
+    const int loaded_layers = ctx->stream_blocks ? 1 : Q21_LAYERS;
+    for (int layer = 0; layer < loaded_layers; layer++) {
         if (!q21_gpu_load_block(ctx, &model->header, layer, &ctx->blocks[layer],
                                 error, error_size)) {
             q21_gpu_free(ctx);
@@ -1835,12 +2008,22 @@ static int q21_forward_device(qzen_qwen21_model *model,
     const int image_tokens = layout.target_tokens;
     const int tokens = layout.tokens;
     const int prefix_rows = layout.prefix_rows;
-    if (!q21_gpu_scratch_prepare(ctx, request, &layout, error, error_size)) return 0;
-    if (!q21_gpu_stage_conditioning(ctx, model, sigma, error, error_size)) return 0;
+    const size_t dim = (size_t)tokens * Q21_HIDDEN;
+    if (!q21_gpu_scratch_prepare(ctx, request, &layout, error, error_size)) {
+        q21_layout_free(&layout);
+        return 0;
+    }
+    if (!q21_gpu_stage_conditioning(ctx, model, sigma, error, error_size)) {
+        q21_layout_free(&layout);
+        return 0;
+    }
     /* Text prefix: exact host path, uploaded into the carrier. */
     float *prefix = q21_text_prefix(model, request->text, text_tokens, error,
                                     error_size);
-    if (!prefix) return 0;
+    if (!prefix) {
+        q21_layout_free(&layout);
+        return 0;
+    }
     int max_latent = image_tokens;
     for (int block = 0; block < layout.ref_count; block++) {
         int count = request->ref_heights[block] * request->ref_widths[block];
@@ -1855,6 +2038,7 @@ static int q21_forward_device(qzen_qwen21_model *model,
         qzen_gpu_tensor_free(projected_f32);
         free(prefix);
         snprintf(error, error_size, "out of GPU memory for the latent staging");
+        q21_layout_free(&layout);
         return 0;
     }
     int ok = 0;
@@ -1906,29 +2090,60 @@ static int q21_forward_device(qzen_qwen21_model *model,
             }
             cursor += count;
         }
-        if (cursor != tokens - text_tokens) {
+        if (cursor != layout.ref_end[layout.ref_count] + layout.target_tokens) {
             if (!error[0])
                 snprintf(error, error_size, "incomplete latent projection");
             break;
         }
-        if (!qzen_gpu_tensor_write_f32_range(ctx->carrier, 0, prefix,
-                                           (size_t)text_tokens * Q21_HIDDEN)) {
+        /* `prefix` only holds the projected text hidden states. The joint
+         * carrier is larger because image-pad slots expand into four latent
+         * rows, but uploading `dim` elements here would read past the host
+         * buffer. Scatter below indexes only [0, text_tokens). */
+        qzen_gpu_tensor *prefix_f32 = qzen_gpu_tensor_from_f32(
+            ctx->gpu, prefix, (size_t)text_tokens * Q21_HIDDEN);
+        if (!prefix_f32) {
             snprintf(error, error_size, "prefix upload failed");
             break;
         }
-        if (!qzen_gpu_copy_d2d_f32(ctx->gpu, ctx->carrier,
-                                 (size_t)text_tokens * Q21_HIDDEN, ctx->image_f32,
-                                 0,
-                                 (size_t)(tokens - text_tokens) * Q21_HIDDEN)) {
-            snprintf(error, error_size, "carrier tail copy failed: %s",
-                     qzen_gpu_error(ctx->gpu));
-            break;
+        int scatter_ok = 1;
+        for (int r = 0; r < tokens && scatter_ok;) {
+            int source = layout.is_image[r] ? 1 : 0;
+            int first = layout.source_index[r];
+            int run = 1;
+            while (r + run < tokens && layout.is_image[r + run] == source &&
+                   layout.source_index[r + run] == first + run) run++;
+            const qzen_gpu_tensor *from = source ? ctx->image_f32 : prefix_f32;
+            if (!qzen_gpu_copy_d2d_f32(ctx->gpu, ctx->carrier,
+                                       (size_t)r * Q21_HIDDEN, from,
+                                       (size_t)first * Q21_HIDDEN,
+                                       (size_t)run * Q21_HIDDEN)) {
+                snprintf(error, error_size, "joint row scatter failed: %s",
+                         qzen_gpu_error(ctx->gpu));
+                scatter_ok = 0;
+            }
+            r += run;
         }
+        qzen_gpu_tensor_free(prefix_f32);
+        if (!scatter_ok) break;
         int layer_failed = 0;
         for (int layer = 0; layer < Q21_LAYERS; layer++) {
-            if (!q21_gpu_block_run(ctx, &ctx->blocks[layer], ctx->carrier, tokens,
-                                   prefix_rows, layout.ref_count, error,
-                                   error_size)) {
+            if (ctx->stream_blocks) {
+                /* Swap this layer's INT8 weights into the single resident slot
+                 * from the still-open checkpoint. Pinned staging in the loader
+                 * keeps the transfer at PCIe speed; the next layer is loaded
+                 * only after this one has been consumed, matching mmgp's
+                 * block-swap budget (one layer of weights on device). */
+                if (!q21_gpu_load_block(ctx, ctx->header, layer, &ctx->blocks[0],
+                                        error, error_size)) {
+                    /* q21_gpu_load_block already filled `error` with the
+                     * concrete tensor/upload failure; do not reformat it. */
+                    layer_failed = 1;
+                    break;
+                }
+            }
+            if (!q21_gpu_block_run(ctx, &ctx->blocks[ctx->stream_blocks ? 0 : layer],
+                                   ctx->carrier, tokens, prefix_rows,
+                                   layout.ref_count, error, error_size)) {
                 layer_failed = 1;
                 break;
             }
@@ -1974,6 +2189,7 @@ static int q21_forward_device(qzen_qwen21_model *model,
     qzen_gpu_tensor_free(projected_f32);
     qzen_gpu_tensor_free(latent_tokens);
     free(prefix);
+    q21_layout_free(&layout);
     return ok;
 }
 
@@ -2024,24 +2240,39 @@ int qzen_qwen21_block_forward_device(qzen_qwen21_model *model, int layer,
     q21_layout layout;
     if (!q21_layout_from_request(&request, &layout, error, error_size) ||
         !q21_gpu_scratch_prepare(ctx, &request, &layout, error, error_size)) {
+        q21_layout_free(&layout);
         return 0;
     }
     const int tokens = layout.tokens;
     const size_t dim = (size_t)tokens * Q21_HIDDEN;
     if (!q21_gpu_stage_conditioning(ctx, model, sigma, error, error_size)) {
+        q21_layout_free(&layout);
         return 0;
     }
     if (!qzen_gpu_tensor_write_f32(ctx->carrier, hidden, dim)) {
         snprintf(error, error_size, "block input upload failed");
+        q21_layout_free(&layout);
         return 0;
     }
-    if (!q21_gpu_block_run(ctx, &ctx->blocks[layer], ctx->carrier, tokens,
+    q21_gpu_block *slot = &ctx->blocks[layer];
+    if (ctx->stream_blocks) {
+        /* Only layer 0 is resident; swap the requested layer into it. */
+        slot = &ctx->blocks[0];
+        if (!q21_gpu_load_block(ctx, ctx->header, layer, slot, error, error_size)) {
+            q21_layout_free(&layout);
+            return 0;
+        }
+    }
+    if (!q21_gpu_block_run(ctx, slot, ctx->carrier, tokens,
                            layout.prefix_rows, 0, error, error_size)) {
+        q21_layout_free(&layout);
         return 0;
     }
     if (!qzen_gpu_tensor_read_f32(ctx->carrier, out, dim)) {
         snprintf(error, error_size, "block output download failed");
+        q21_layout_free(&layout);
         return 0;
     }
+    q21_layout_free(&layout);
     return 1;
 }

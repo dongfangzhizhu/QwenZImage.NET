@@ -76,6 +76,8 @@ endif()
 
 set(QZEN_C_SOURCES
     src/qzen_safetensors.c
+    src/qzi_gguf.c
+    src/qzen_qwen21_vision.c
     src/qzen_weights.c
     src/qzen_quanto.c
     src/qzen_nunchaku.c

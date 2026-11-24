@@ -1,7 +1,9 @@
 #include "qzen_weights.h"
+#include "qzi_gguf.h"
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +14,13 @@
 struct qzen_weight_store {
     qzen_st_header *headers;
     size_t count;
+    /* Non-NULL when the component is a GGUF container. Tensors are presented
+     * through a synthetic header so every component loader can stay agnostic
+     * of the container format. */
+    qzi_gguf *gguf;
+    qzen_st_tensor gguf_slots[4]; /* ring: weight + scale lookups coexist */
+    qzen_st_header gguf_header;
+    unsigned gguf_next;
 };
 
 static void fail(char *error, size_t error_size, const char *format, ...) {
@@ -22,11 +31,109 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
     va_end(arguments);
 }
 
+/* ---------------------------------------------------------------- FP8 -> BF16
+ * Hugging Face FP8 checkpoints scale the whole tensor by a scalar stored either
+ * in __metadata__ ("weight_scale"/"scale") or in a sibling "<name>_scale" /
+ * "<name minus .weight>.weight_scale" tensor. We decode E4M3/E5M2 to F32, apply
+ * the scale, then round once to BF16 (the same rounding the BF16 loader uses). */
+
+static uint16_t f32_to_bf16_rn(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    /* round-to-nearest-even, matching qzen_qwen21_dit.c's q21_f32_to_bf16 */
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static float fp8_e4m3_to_f32(uint8_t byte) {
+    int sign = (byte & 0x80) ? -1 : 1;
+    int exp = (byte >> 3) & 0x0F;
+    int mant = byte & 0x07;
+    if (exp == 0) return sign * ldexpf((float)mant / 8.0f, -6); /* subnormal */
+    if (exp == 15) return mant == 6 ? sign * NAN : sign * INFINITY; /* NaN/Inf */
+    return sign * ldexpf(1.0f + (float)mant / 8.0f, exp - 7);
+}
+
+static float fp8_e5m2_to_f32(uint8_t byte) {
+    int sign = (byte & 0x80) ? -1 : 1;
+    int exp = (byte >> 2) & 0x1F;
+    int mant = byte & 0x03;
+    if (exp == 0) return sign * ldexpf((float)mant / 4.0f, -14); /* subnormal */
+    if (exp == 31) return mant ? sign * NAN : sign * INFINITY;
+    return sign * ldexpf(1.0f + (float)mant / 4.0f, exp - 15);
+}
+
+/* Locate an optional FP8 scale for `name`. Returns 1 and sets *scale when a
+ * sibling tensor is found; otherwise 0 and *scale = 1 (no scale). */
+static int fp8_scale_for(const qzen_weight_store *store, const char *name,
+                         float *scale, char *error, size_t error_size) {
+    *scale = 1.0f;
+    /* Convention A: "<base>.weight_scale" or "<base>_scale" */
+    char base[512];
+    size_t length = strlen(name);
+    size_t keep = length;
+    const char suffix[] = ".weight";
+    if (length >= sizeof(suffix) - 1 &&
+        strcmp(name + length - (sizeof(suffix) - 1), suffix) == 0)
+        keep -= sizeof(suffix) - 1;
+    if (keep >= sizeof(base)) return 1;
+    memcpy(base, name, keep);
+    base[keep] = '\0';
+    const char *candidates[4];
+    char a[512], b[512];
+    snprintf(a, sizeof(a), "%s.weight_scale", base);
+    snprintf(b, sizeof(b), "%s_scale", name);
+    candidates[0] = a; candidates[1] = b; candidates[2] = name; candidates[3] = NULL;
+    for (int i = 0; i < 3; i++) {
+        const qzen_st_header *header = NULL;
+        const qzen_st_tensor *tensor = qzen_weight_find(store, candidates[i], &header);
+        if (!tensor) continue;
+        if (tensor->dtype != QZEN_DTYPE_F32 &&
+            tensor->dtype != QZEN_DTYPE_BF16 &&
+            tensor->dtype != QZEN_DTYPE_F16)
+            continue;
+        float *values = NULL;
+        if (qzen_st_read_f32(header, tensor, NULL, NULL, &values,
+                             error, error_size) && values) {
+            *scale = values[0]; /* per-tensor scale: first element */
+            free(values);
+        }
+        return 1;
+    }
+    return 1;
+}
+
 static int safetensors_name(const char *name) {
     static const char suffix[] = ".safetensors";
     size_t length = strlen(name);
     return length > sizeof(suffix) - 1 &&
            strcmp(name + length - (sizeof(suffix) - 1), suffix) == 0;
+}
+
+static int gguf_name(const char *name) {
+    static const char suffix[] = ".gguf";
+    size_t length = strlen(name);
+    return length > sizeof(suffix) - 1 &&
+           strcmp(name + length - (sizeof(suffix) - 1), suffix) == 0;
+}
+
+/* Callback installed in the synthetic GGUF header: dequantise one tensor's
+ * codes directly into the caller's host buffer. `index` was stashed in the
+ * virtual tensor's file_offset by qzen_weight_find(). The byte count decides
+ * BF16 (2 bytes/elem) vs F32 (4 bytes/elem), matching the virtual dtype. */
+static int gguf_read_callback(void *opaque, uint64_t index, void *data,
+                              size_t bytes, char *error, size_t error_size) {
+    qzi_gguf *gguf = (qzi_gguf *)opaque;
+    uint64_t elements = qzi_gguf_tensor_elements(gguf, (size_t)index);
+    if (bytes == elements * 2)
+        return qzi_gguf_read_bf16(gguf, (size_t)index, (uint16_t *)data,
+                                  error, error_size);
+    if (bytes == elements * 4)
+        return qzi_gguf_read_f32(gguf, (size_t)index, (float *)data,
+                                 error, error_size);
+    if (error && error_size)
+        snprintf(error, error_size, "GGUF tensor read size %zu mismatch", bytes);
+    return 0;
 }
 
 static int compare_paths(const void *left, const void *right) {
@@ -68,6 +175,26 @@ static qzen_weight_store *open_paths(char **paths, size_t count,
     return store;
 }
 
+/* Open a single GGUF container as a synthetic-header store. The reader
+ * presents torch-layout tensors under HF names, so every component loader
+ * (which only knows qzen_weight_find + qzen_st_read_data) works unchanged. */
+static qzen_weight_store *open_gguf(const char *path, char *owned_path,
+                                    char *error, size_t error_size) {
+    qzi_gguf *gguf = qzi_gguf_open(path, error, error_size);
+    if (!gguf) return NULL;
+    qzen_weight_store *store = calloc(1, sizeof(*store));
+    if (!store) {
+        qzi_gguf_free(gguf);
+        fail(error, error_size, "out of memory creating GGUF weight store");
+        return NULL;
+    }
+    store->gguf = gguf;
+    store->gguf_header.path = owned_path; /* borrowed, freed by caller */
+    store->gguf_header.gguf = gguf;
+    store->gguf_header.gguf_read = gguf_read_callback;
+    return store;
+}
+
 qzen_weight_store *qzen_weight_store_open(const char *path,
                                       char *error, size_t error_size) {
     if (!path || !*path) {
@@ -87,16 +214,21 @@ qzen_weight_store *qzen_weight_store_open(const char *path,
     if (S_ISREG(info.st_mode)) {
         const char *name = strrchr(path, '/');
         name = name ? name + 1 : path;
-        if (!safetensors_name(name)) {
-            fail(error, error_size, "not a safetensors file: %s", path);
-            return NULL;
-        }
         char *single = malloc(strlen(path) + 1);
         if (!single) {
             fail(error, error_size, "out of memory resolving the weight shard");
             return NULL;
         }
         strcpy(single, path);
+        if (gguf_name(name)) {
+            /* open_gguf takes ownership of `single` via the synthetic header. */
+            return open_gguf(path, single, error, error_size);
+        }
+        if (!safetensors_name(name)) {
+            free(single);
+            fail(error, error_size, "not a safetensors or gguf file: %s", path);
+            return NULL;
+        }
         qzen_weight_store *store = open_paths(&single, 1, error, error_size);
         free(single);
         return store;
@@ -109,8 +241,23 @@ qzen_weight_store *qzen_weight_store_open(const char *path,
     char **paths = NULL;
     size_t count = 0;
     size_t capacity = 0;
+    char *gguf_path = NULL;
     struct dirent *entry;
     while ((entry = readdir(stream)) != NULL) {
+        if (gguf_name(entry->d_name)) {
+            /* GGUF is a self-contained container: prefer it and ignore shards. */
+            size_t length = strlen(path) + strlen(entry->d_name) + 2;
+            free(gguf_path);
+            gguf_path = malloc(length);
+            if (!gguf_path) {
+                fail(error, error_size, "out of memory resolving GGUF file");
+                closedir(stream);
+                free_paths(paths, count);
+                return NULL;
+            }
+            snprintf(gguf_path, length, "%s/%s", path, entry->d_name);
+            continue;
+        }
         if (!safetensors_name(entry->d_name)) continue;
         if (count == capacity) {
             size_t next = capacity ? capacity * 2 : 8;
@@ -136,8 +283,14 @@ qzen_weight_store *qzen_weight_store_open(const char *path,
         count++;
     }
     closedir(stream);
+    if (gguf_path) {
+        free_paths(paths, count);
+        qzen_weight_store *store = open_gguf(gguf_path, gguf_path, error, error_size);
+        if (!store) free(gguf_path);
+        return store;
+    }
     if (!count) {
-        fail(error, error_size, "no safetensors shards in %s", path);
+        fail(error, error_size, "no safetensors shards or gguf file in %s", path);
         free(paths);
         return NULL;
     }
@@ -153,11 +306,15 @@ void qzen_weight_store_free(qzen_weight_store *store) {
         qzen_st_free_header(&store->headers[index]);
     }
     free(store->headers);
+    if (store->gguf) {
+        qzi_gguf_free(store->gguf);
+        free(store->gguf_header.path); /* the owned path string */
+    }
     free(store);
 }
 
 size_t qzen_weight_store_shards(const qzen_weight_store *store) {
-    return store ? store->count : 0;
+    return store ? (store->gguf ? 1 : store->count) : 0;
 }
 
 const qzen_st_tensor *qzen_weight_find(const qzen_weight_store *store,
@@ -165,6 +322,28 @@ const qzen_st_tensor *qzen_weight_find(const qzen_weight_store *store,
                                    const qzen_st_header **header) {
     if (header) *header = NULL;
     if (!store || !name) return NULL;
+    if (store->gguf) {
+        int index = qzi_gguf_find(store->gguf, name);
+        if (index < 0) return NULL;
+        qzen_weight_store *mutable = (qzen_weight_store *)store;
+        qzen_st_tensor *slot = &mutable->gguf_slots[mutable->gguf_next++ % 4];
+        memset(slot, 0, sizeof(*slot));
+        slot->name = (char *)qzi_gguf_tensor_name(store->gguf, (size_t)index);
+        qzi_gguf_type type = qzi_gguf_tensor_type(store->gguf, (size_t)index);
+        slot->dtype = type == QZI_GGUF_F32 ? QZEN_DTYPE_F32
+                    : type == QZI_GGUF_F16 ? QZEN_DTYPE_F16
+                    : QZEN_DTYPE_BF16;
+        slot->ndim = qzi_gguf_tensor_rank(store->gguf, (size_t)index);
+        const uint64_t *shape = qzi_gguf_tensor_shape(store->gguf, (size_t)index);
+        for (int dimension = 0; dimension < slot->ndim && dimension < 8; dimension++)
+            slot->shape[dimension] = shape[dimension];
+        uint64_t elements = qzi_gguf_tensor_elements(store->gguf, (size_t)index);
+        slot->data_begin = 0;
+        slot->data_end = elements * (slot->dtype == QZEN_DTYPE_F32 ? 4 : 2);
+        slot->file_offset = (uint64_t)index; /* index; read callback dequantises */
+        if (header) *header = &mutable->gguf_header;
+        return slot;
+    }
     for (size_t index = 0; index < store->count; index++) {
         const qzen_st_tensor *tensor = qzen_st_find(&store->headers[index], name);
         if (tensor) {
@@ -185,10 +364,20 @@ static qzen_gpu_tensor *load_tensor(const qzen_weight_store *store, qzen_gpu *gp
         fail(error, error_size, "required weight is absent: %s", name);
         return NULL;
     }
-    if (tensor->dtype != dtype || tensor->ndim != ndim) {
+    /* FP8 checkpoints are decoded into the requested dtype (BF16 or F32).
+     * Everything else must match exactly, as before. */
+    int fp8 = (tensor->dtype == QZEN_DTYPE_F8_E4M3 ||
+               tensor->dtype == QZEN_DTYPE_F8_E5M2) &&
+              (dtype == QZEN_DTYPE_BF16 || dtype == QZEN_DTYPE_F32);
+    if (!fp8 && (tensor->dtype != dtype || tensor->ndim != ndim)) {
         fail(error, error_size, "weight %s has dtype/rank %s/%d, expected %s/%d",
              name, qzen_dtype_name(tensor->dtype), tensor->ndim,
              qzen_dtype_name(dtype), ndim);
+        return NULL;
+    }
+    if (fp8 && tensor->ndim != ndim) {
+        fail(error, error_size, "weight %s rank %d, expected %d",
+             name, tensor->ndim, ndim);
         return NULL;
     }
     uint64_t elements = 1;
@@ -208,7 +397,45 @@ static qzen_gpu_tensor *load_tensor(const qzen_weight_store *store, qzen_gpu *gp
         fail(error, error_size, "weight %s is too large for this process", name);
         return NULL;
     }
-    qzen_gpu_tensor *result = dtype == QZEN_DTYPE_BF16 ?
+    qzen_gpu_tensor *result = NULL;
+    if (fp8) {
+        /* Read the 1-byte-per-element payload, decode to F32, apply the
+         * optional per-tensor scale, then round into the requested format. */
+        uint8_t *raw = malloc((size_t)elements);
+        float *floats = malloc((size_t)elements * sizeof(float));
+        uint16_t *halves = dtype == QZEN_DTYPE_BF16
+                               ? malloc((size_t)elements * sizeof(uint16_t))
+                               : NULL;
+        if (!raw || !floats || (dtype == QZEN_DTYPE_BF16 && !halves)) {
+            fail(error, error_size, "out of memory decoding FP8 weight %s", name);
+            free(raw); free(floats); free(halves);
+            return NULL;
+        }
+        int ok = qzen_st_read_data(header, tensor, raw, (size_t)elements,
+                                   error, error_size);
+        float scale = 1.0f;
+        if (ok) fp8_scale_for(store, name, &scale, error, error_size);
+        if (ok) {
+            int e5m2 = tensor->dtype == QZEN_DTYPE_F8_E5M2;
+            for (size_t i = 0; i < (size_t)elements; i++) {
+                floats[i] = (e5m2 ? fp8_e5m2_to_f32(raw[i])
+                                  : fp8_e4m3_to_f32(raw[i])) * scale;
+            }
+            if (dtype == QZEN_DTYPE_BF16) {
+                for (size_t i = 0; i < (size_t)elements; i++)
+                    halves[i] = f32_to_bf16_rn(floats[i]);
+                result = qzen_gpu_tensor_from_bf16(gpu, halves, (size_t)elements);
+            } else {
+                result = qzen_gpu_tensor_from_f32(gpu, floats, (size_t)elements);
+            }
+        }
+        free(raw); free(floats); free(halves);
+        if (!result && !(error && *error))
+            fail(error, error_size, "cannot upload decoded FP8 weight %s: %s",
+                 name, qzen_gpu_error(gpu));
+        return result;
+    }
+    result = dtype == QZEN_DTYPE_BF16 ?
         qzen_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
                                 (size_t)elements) :
         qzen_gpu_tensor_load_f32(gpu, header->path, tensor->file_offset,
@@ -233,6 +460,89 @@ qzen_gpu_tensor *qzen_weight_load_f32(const qzen_weight_store *store, qzen_gpu *
                                   char *error, size_t error_size) {
     return load_tensor(store, gpu, name, ndim, shape, QZEN_DTYPE_F32,
                        error, error_size);
+}
+
+/* Common host reader. `want_bf16` selects the output format; F32 inputs are
+ * always accepted, FP8 is decoded/scaled and BF16-rounded when requested. */
+static int read_auto(const qzen_weight_store *store, const char *name,
+                     int want_bf16, void **out, uint64_t *count,
+                     char *error, size_t error_size) {
+    *out = NULL;
+    *count = 0;
+    const qzen_st_header *header = NULL;
+    const qzen_st_tensor *tensor = qzen_weight_find(store, name, &header);
+    if (!tensor) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return 0;
+    }
+    uint64_t elements = qzen_st_tensor_elements(tensor);
+    if (elements > SIZE_MAX / (want_bf16 ? 2 : 4)) {
+        fail(error, error_size, "weight %s is too large for this process", name);
+        return 0;
+    }
+    int is_fp8 = tensor->dtype == QZEN_DTYPE_F8_E4M3 ||
+                 tensor->dtype == QZEN_DTYPE_F8_E5M2;
+    if (!is_fp8 && tensor->dtype != QZEN_DTYPE_BF16 &&
+        tensor->dtype != QZEN_DTYPE_F16 && tensor->dtype != QZEN_DTYPE_F32) {
+        fail(error, error_size, "weight %s has unsupported dtype %s", name,
+             qzen_dtype_name(tensor->dtype));
+        return 0;
+    }
+    float *floats = malloc((size_t)elements * sizeof(float));
+    if (!floats) {
+        fail(error, error_size, "out of memory reading %s", name);
+        return 0;
+    }
+    int ok = 1;
+    if (is_fp8) {
+        uint8_t *raw = malloc((size_t)elements);
+        if (!raw) { ok = 0; }
+        else {
+            ok = qzen_st_read_data(header, tensor, raw, (size_t)elements,
+                                   error, error_size);
+            float scale = 1.0f;
+            if (ok) fp8_scale_for(store, name, &scale, error, error_size);
+            if (ok) {
+                int e5m2 = tensor->dtype == QZEN_DTYPE_F8_E5M2;
+                for (size_t i = 0; i < (size_t)elements; i++)
+                    floats[i] = (e5m2 ? fp8_e5m2_to_f32(raw[i])
+                                      : fp8_e4m3_to_f32(raw[i])) * scale;
+            }
+            free(raw);
+        }
+    } else {
+        /* qzen_st_read_f32 normalises F32/F16 (BF16 included) to host F32. */
+        float *values = NULL;
+        ok = qzen_st_read_f32(header, tensor, NULL, NULL, &values,
+                              error, error_size) && values;
+        if (ok) { memcpy(floats, values, (size_t)elements * sizeof(float)); free(values); }
+    }
+    if (!ok) { free(floats); return 0; }
+
+    if (!want_bf16) {
+        *out = floats;
+    } else {
+        uint16_t *halves = malloc((size_t)elements * sizeof(uint16_t));
+        if (!halves) { free(floats); fail(error, error_size, "out of memory reading %s", name); return 0; }
+        for (size_t i = 0; i < (size_t)elements; i++)
+            halves[i] = f32_to_bf16_rn(floats[i]);
+        free(floats);
+        *out = halves;
+    }
+    *count = elements;
+    return 1;
+}
+
+int qzen_weight_read_bf16_auto(const qzen_weight_store *store, const char *name,
+                               uint16_t **out, uint64_t *count,
+                               char *error, size_t error_size) {
+    return read_auto(store, name, 1, (void **)out, count, error, error_size);
+}
+
+int qzen_weight_read_f32_auto(const qzen_weight_store *store, const char *name,
+                              float **out, uint64_t *count,
+                              char *error, size_t error_size) {
+    return read_auto(store, name, 0, (void **)out, count, error, error_size);
 }
 
 int qzen_weight_is_int8(const qzen_weight_store *store, const char *name) {

@@ -61,6 +61,12 @@ void qzen_zpipe_free(qzen_zimage_pipeline *pipe);
  * qzen_zpipe_release_text frees it again (the cap features survive). */
 int qzen_zpipe_attach_text(qzen_zimage_pipeline *pipe, const char *qwen_dir,
                          char *error, size_t error_size);
+/* As above, but with an explicit tokenizer.json path. NULL/empty keeps the
+ * historical "<qwen_dir>/tokenizer.json" derivation. Needed when the text
+ * weights come from a single file (FP8/GGUF) with no sidecar tokenizer. */
+int qzen_zpipe_attach_text_ex(qzen_zimage_pipeline *pipe, const char *qwen_dir,
+                              const char *tokenizer_path,
+                              char *error, size_t error_size);
 void qzen_zpipe_release_text(qzen_zimage_pipeline *pipe);
 
 /* Hand the encoder over without freeing it, and take it back.  The encoder is

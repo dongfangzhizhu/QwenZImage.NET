@@ -60,6 +60,22 @@ qzen_gpu_tensor *qzen_weight_load_i8_convrot(const qzen_weight_store *store, qze
                                          uint64_t cols, qzen_gpu_tensor **scales,
                                          char *error, size_t error_size);
 
+/* Host-side readers that transparently accept FP8 (E4M3/E5M2) checkpoints in
+ * addition to the native format, used by the Z-Image component loaders (which
+ * stage weights on the host before upload). For BF16/F16/F32 inputs the byte
+ * path is unchanged; only FP8 is decoded to F32, scaled and rounded to BF16.
+ *   read_bf16_auto: returns a malloc'd [count] uint16_t BF16 array.
+ *   read_f32_auto:  returns a malloc'd [count] float array.
+ * Both set *count to the tensor's element count and return 1 on success; the
+ * caller owns the returned buffer. An optional per-tensor FP8 scale is applied
+ * ("<base>.weight_scale" / "<name>_scale" sibling). */
+int qzen_weight_read_bf16_auto(const qzen_weight_store *store, const char *name,
+                               uint16_t **out, uint64_t *count,
+                               char *error, size_t error_size);
+int qzen_weight_read_f32_auto(const qzen_weight_store *store, const char *name,
+                              float **out, uint64_t *count,
+                              char *error, size_t error_size);
+
 /* Non-zero when the named tensor exists and is INT8, i.e. the checkpoint stores
  * quantized DiT weights instead of BF16 ones. */
 int qzen_weight_is_int8(const qzen_weight_store *store, const char *name);

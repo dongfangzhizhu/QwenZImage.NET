@@ -124,7 +124,11 @@ WebUI 的等价字段见 [WEBUI.md](WEBUI.md)（`margin_*` / `model_mode` / `rgb
 
 `EffectiveIdentityRefWeight` / `EffectiveReferenceEncodeMaxSide` 是实际发给 native 的有效值（null 已解析为默认值；显式 0 留给 native 归一化）。托管 `RequestValidator.Validate(Qwen21IdentityRefOptions)` 与 native `qzi_validate_qwen21_identity_ref()` 规则一致；NaN / Inf 一律拒绝。老 native 库缺该能力时 `SupportsIdentityReference == false`，调用抛 `QziException(QziStatus.Unsupported)`。能力探测检查 `qzi_abi_features() & 0x10`、`qzi_qwen21_identity_ref_layout()` 尺寸和 `qzi_generate_qwen21_identity_ref()` 导出三项。
 
-**真实后端行为**：CUDA backend 已把权重解释为参考图相对分辨率（`weight/100 ×` 目标 latent 网格），每张参考图 cover-fit 到该尺寸后 VAE 编码，作为 condition prefix 拼在噪声目标前面；`img_in` 共享，prefix 用 t=0 modulation、target 用实际 sigma、attention 按 text / 每个 reference block / target 分段限制可见 key，RoPE 逐块递增 frame，最终只输出 target tail。去噪起点是纯噪声，不经过 img2img。文本塔暂未移植 Qwen3-VL `visual.*`，因此视觉语义完全由 VAE latent 前缀承载；这和 WanGP 的 `<|image_pad|>` 视觉 embedding 不是逐像素等价，但已能在真图回归中同时锁脸与大幅换装。参考后端仍把每张图的像素、尺寸、数量、权重和编码上限混入确定性输出，并按参考图数量上报 `"image encode"` 阶段，供无 GPU 测试验证参数贯通。
+**真实后端行为**：CUDA backend 把权重解释为参考图相对分辨率（`weight/100 ×` 目标 latent 网格），每张参考图 cover-fit 到该尺寸后 VAE 编码；DiT 按 Wan2GP 的 4-slot joint 语义组装：文本 `<|image_pad|>` 原地展开成 4 行 VAE latent，target latent 追加尾部。`img_in` 共享，prefix 用 t=0 modulation、target 用实际 sigma，attention 按 text / 同 block 图像段 / target 分段限制可见 key，RoPE 逐块递增 frame，最终只输出 target tail。去噪起点是纯噪声，不经过 img2img。
+
+文本侧已完整移植 **Qwen3-VL 视觉塔**（与语言塔共用 `text_encoder_int8.safetensors` 中的 567 个 `visual.*` 张量）：32 对齐 RGB → 16×16 patchify + 双线性 `pos_embed` 插值 → 27 层 axial-RoPE vision block（INT8 ConvRot group 64；MLP fc2 为 group 16）→ merger + 三个 deepstack merger。模板按参考图数量展开 `<imageN><|vision_start|>` + N 个 `<|image_pad|>` + `<|vision_end|>`，merged 输出覆盖对应 pad 位置的 embedding，deepstack 在文本第 0/1/2 层后加回；送入 DiT 的仍是 WanGP 要求的 **final RMSNorm 之前** 的最后一层 hidden。`encode_spans` 返回完整模板的 token 位置，写入视觉 embedding 与构造 DiT `image_pad_mask` 时都会换算到丢弃 14 个系统 token 后的下标，保证两条条件落在同一批 pad 行。视觉画布最长边受 `reference_encode_max_side` 约束，并把全部参考图的视觉 token 总量控制在约 1024 patch 以内，避免 10 张图时 SDPA 二次爆炸。
+
+**保真度边界**：DiT 现在按 Wan2GP 的 4-slot joint 展开组织 joint 序列，VAE latent 与 Qwen3-VL `<|image_pad|>` 视觉语义**同时**参与条件化。真图回归 `artifacts/vision-verify-joint6/`（256×256、权重 70、黑发髻年轻男性参考图）显示发髻、五官、耳形和脸部轮廓保持一致，同时可按 prompt 换成红皮夹克 / 白 T 恤；同 seed t2i 的 SHA-256 仍为 `622f020b36c40ba8...`。这里提供身份语义级保真，不对任意照片承诺像素级“人脸完全不变”。参考后端仍把每张图的像素、尺寸、数量、权重和编码上限混入确定性输出，并按参考图数量上报 `"image encode"` 阶段，供无 GPU 测试验证参数贯通。
 
 WebUI 等价字段见 [WEBUI.md](WEBUI.md)（`identity_refs` / `identity_ref_weight` / `reference_encode_max_side`，`model = "qwen21-identity"`）；数组元素可以是 base64 PNG 数据 URL，也可以是本地 PNG 文件路径。
 
@@ -141,13 +145,14 @@ WebUI 等价字段见 [WEBUI.md](WEBUI.md)（`identity_refs` / `identity_ref_wei
 
 解析规则与预算（`AUTO`：≥20 GiB→high，≥12 GiB→balanced，≥8 GiB→low，<8 GiB→lowest；显存未知→balanced）：
 
-| profile | 分配器释放阈值 | 参考图编码上限（0 哨兵时） |
-|---|---|---|
-| high | 24 GiB（历史默认） | 768 px |
-| balanced | 4 GiB | 768 px |
-| low | 1 GiB | 512 px |
-| lowest | 256 MiB | 384 px |
+| profile | DiT 块换出 | 分配器释放阈值 | 参考图编码上限（0 哨兵时） |
+|---|---|---|---|
+| high | 否（32 层常驻） | 24 GiB（历史默认） | 768 px |
+| balanced | 否（32 层常驻） | 4 GiB | 768 px |
+| low | **是（1 层驻留 + 逐层换入）** | 1 GiB | 512 px |
+| lowest | **是（1 层驻留 + 逐层换入）** | 256 MiB | 384 px |
 
+- **`low` / `lowest` 真正降低 DiT 显存**：GPU 只保留 1 层 INT8 权重，其余 31 层在每个去噪步从 checkpoint 逐层换入（纯 IO 换显存，数值无损；`high` 与 `lowest` 同种子输出 SHA-256 相同）。带 LoRA 的请求强制回退 32 层常驻，因为 LoRA delta 合并进设备权重、逐层重载会丢弃它。块换出开关在 DiT 加载时生效，运行时切换 profile 不重载已驻留 DiT（应在首次生成前经 config/env 设定）。
 - 参考图编码上限只作用于请求的 `reference_encode_max_side == 0`（默认）；显式值始终优先。编辑、身份参考两条路径都遵守该默认值。
 - 真实后端把释放阈值写成 `QZEN_GPU_POOL_RELEASE_MIB`，在后续新建显存上下文时生效（低显存卡切换模型 / VAE 阶段时能真正把块还给驱动）；手工设置该环境变量优先于 profile。
 - 老 native 库缺该能力时 `SupportsLowVram == false`，调用 `SetMemoryProfile` / `GetMemoryPlan` 抛 `QziException(QziStatus.Unsupported)`；能力探测检查 `qzi_abi_features() & 0x20`、`qzi_memory_plan_layout()` 尺寸与两个导出。
@@ -162,6 +167,29 @@ WebUI 等价字段见 [WEBUI.md](WEBUI.md)（`identity_refs` / `identity_ref_wei
 | 不支持的 checkpoint | — | 任何含 `fp4` 的 id（**大小写不敏感**，如 `svdq-fp4-r256`、`SVDQ-FP4-r256`）以及未知值 → 托管侧 `ArgumentException`，native 侧 `QZI_ERR_UNSUPPORTED`（引擎只解码 int4）。两侧用同一套大小写无关判定 |
 
 Z-Image Turbo 使用**固定 8 步调度、无 CFG 分支**，因此请求中**没有** `steps`、`guidance`、`negative_prompt` 字段——这不是遗漏，而是模型本身的约束。对应 native 结构体 `qzi_zimage_request`。
+
+### 逐组件替换（引擎配置，不是请求字段）
+
+DiT / transformer、VAE、text encoder 各由独立的 `qzen_weight_store` 加载，可分别指向不同版本与量化格式。`Checkpoint` 只选择默认权重包（`bf16` 或 nunchaku pack id）；下面四个键是**组件级覆盖**，优先于 `Checkpoint` 派生出的路径。它们不进入 ABI 请求结构，也不改变任何请求的字节语义。
+
+| config 键 | 环境变量 | 留空时的回退 |
+| --- | --- | --- |
+| `zimage_dit_dir` | `QZI_ZIMAGE_DIT_DIR` | `<zimage_dir>/<component>`，再回退 `<zimage_dir>`（原单包布局） |
+| `zimage_vae_dir` | `QZI_ZIMAGE_VAE_DIR` | 同上，从 `zimage_dir` 派生 |
+| `zimage_text_dir` | `QZI_ZIMAGE_TEXT_DIR` | 同上，从 `zimage_dir` 派生 |
+| `zimage_tokenizer_path` | `QZI_ZIMAGE_TOKENIZER_PATH` | `<zimage_text_dir>/tokenizer.json`，再回退 `<zimage_dir>/tokenizer.json` |
+
+值可以是目录，也可以是单个 `.safetensors` / `.gguf` 文件；text encoder 当前仍走 Quanto INT8 加载路径，因此用单文件权重时必须显式给 `zimage_tokenizer_path`，否则 tokenizer 无法从权重同目录推导。四个键都留空时路径解析与旧版完全一致（真图回归字节不变）。路径超长在 native 侧返回 `QZI_ERR_ENGINE`，缺少权重返回对应加载错误。
+
+格式由张量 dtype / 张量名自动识别，不靠扩展名猜测：
+
+| 组件 | safetensors BF16 | Quanto qint8 | Nunchaku SVDQ int4 | FP8 E4M3/E5M2 | GGUF 量化 |
+| --- | --- | --- | --- | --- | --- |
+| DiT | ✓ | — | ✓（`Checkpoint = nunchaku[-r<rank>]`） | ✓ 解码到 BF16 | ✓ Q4_0/1、Q5_0/1、Q8_0、Q2_K/Q3_K/Q4_K/Q5_K/Q6_K、F16/BF16 |
+| VAE | ✓ | — | — | ✓ 解码到 BF16/F32 | ✓ 同上 |
+| text encoder | — | ✓（现有 `qwen3_quanto_bf16_int8`） | — | 不适用（组件走 Quanto 路径） | ✓（需自带 tokenizer 或用 `zimage_tokenizer_path`） |
+
+FP8 支持 `<base>.weight_scale` / `<name>_scale` sibling 标量；没有 scale 时按 1.0 处理。GGUF 支持 BF16 / F16 / F32 与全部常见 K-quant，读取时反量化到 BF16/F32，三个组件加载器共用同一个 `qzen_st_read_data()` 分派。**架构约束不变**：DiT 仍是 dim 3840 / 30 heads / 30 层 / cap 2560 / latent 16 通道，换量化版本不能改形状；ControlNet 仍要求 BF16 embedder + Quanto 投影，并与 DiT 共用 GPU context。实现细节见 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)「Z-Image 逐组件替换与量化格式」。
 
 ## Z-Image ControlNet Union（`ZImageControlOptions`）
 

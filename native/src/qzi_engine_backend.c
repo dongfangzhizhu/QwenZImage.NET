@@ -23,6 +23,7 @@
 #include "qzen_tokenizer.h"
 #include "qzen_qwen21_dit.h"
 #include "qzen_qwen21_text.h"
+#include "qzen_qwen21_vision.h"
 #include "qzen_qwen21_vae.h"
 #include "qzen_qwen21_pipeline.h"
 #include "qzen_zimage_pipeline.h"
@@ -52,6 +53,12 @@ typedef struct qzen_state {
     char zimage_dir[QZEN_PATH_CAP];
     char zimage_nunchaku_dir[QZEN_PATH_CAP];
     char zimage_control_dir[QZEN_PATH_CAP];  /* ControlNet Union 2.1 weights */
+    /* Optional per-component Z-Image paths (empty = derive from zimage_dir). */
+    char zimage_dit_dir[QZEN_PATH_CAP];
+    char zimage_vae_dir[QZEN_PATH_CAP];
+    char zimage_text_dir[QZEN_PATH_CAP];
+    char zimage_tokenizer_path[QZEN_PATH_CAP];
+    char z_tokenizer_path[QZEN_PATH_CAP];  /* resolved tokenizer.json for the text component */
     char text_cache_dir[QZEN_PATH_CAP];
     int  device_id;
     /* Low-VRAM budget. Resolved concrete profile plus the two active levers;
@@ -71,6 +78,7 @@ typedef struct qzen_state {
     int  q_paths_resolved;
     qzen_tokenizer     *tokenizer;
     qzen_qwen21_text   *text;
+    qzen_qwen21_vision *vision;   /* borrowed text checkpoint, identity path only */
     qzen_qwen21_model  *dit;
     qzen_qwen21_vae    *vae;
     int   tier_resident;        /* -1 none, 0 base, 1 turbo */
@@ -417,6 +425,33 @@ done:
     return ok;
 }
 
+/* Wan2GP's 4-slot DiT expansion requires one VAE latent cell for every four
+ * Qwen3-VL merged image pads. Both towers therefore have to consume the SAME
+ * reference canvas. The latent grid is rounded to even cells so the visual
+ * patch grid can be split into 2x2 merge blocks. */
+static void identity_reference_grid(const qzi_qwen21_identity_ref_request *identity,
+                                    int latent_w, int latent_h, uint32_t cap,
+                                    int *out_w, int *out_h)
+{
+    const float weight = identity && identity->identity_ref_weight > 0.0f
+                       ? identity->identity_ref_weight : QZI_IDENTITY_REF_DEFAULT_WEIGHT;
+    const double ratio = (double)weight / 100.0;
+    int lw = (int)((double)latent_w * ratio + 0.5);
+    int lh = (int)((double)latent_h * ratio + 0.5);
+    if (lw < 2) lw = 2;
+    if (lh < 2) lh = 2;
+    if (lw & 1) lw++;
+    if (lh & 1) lh++;
+    int cap_latent = (int)(cap / 16u);
+    if (cap_latent > 0 && (cap_latent & 1)) cap_latent--;
+    if (cap_latent >= 2) {
+        if (lw > cap_latent) lw = cap_latent;
+        if (lh > cap_latent) lh = cap_latent;
+    }
+    *out_w = lw;
+    *out_h = lh;
+}
+
 /* Planar RGB8 [3][H][W] + alpha plane [H][W] -> interleaved RGBA8. */
 static void pack_planar_rgba8(const uint8_t *planar, const uint8_t *alpha,
                               uint32_t width, uint32_t height, uint8_t *packed)
@@ -530,6 +565,7 @@ static void release_zimage(qzen_state *s)
 
 static void release_qwen21(qzen_state *s)
 {
+    if (s->vision) { qzen_qwen21_vision_close(s->vision); s->vision = NULL; }
     if (s->text) { qzen_qwen21_text_close(s->text); s->text = NULL; }
     if (s->tokenizer) { qzen_tokenizer_free(s->tokenizer); s->tokenizer = NULL; }
     if (s->dit) { qzen_qwen21_close(s->dit); s->dit = NULL; }
@@ -685,7 +721,15 @@ static qzi_status ensure_qwen21_dit(qzen_state *s, int turbo,
         forget_qwen21_dit(s);
         bridge_emit(bridge, "model load", 0, 1);
         char load_error[QZEN_ERR_CAP] = "";
-        s->dit = qzen_qwen21_open(tier_path, 0, load_error,
+        /* Low-VRAM block swapping: LOW/LOWEST keep only one DiT layer on the
+         * GPU and stream the rest from the checkpoint, cutting the resident
+         * DiT footprint from ~6.8 GiB to ~0.2 GiB. LoRA is mutually exclusive:
+         * its delta is merged into the resident per-layer device tensors and a
+         * per-step reload would discard it. HIGH/BALANCED stay fully resident
+         * and keep the historical byte-for-byte behaviour. */
+        int stream_blocks = (s->memory_profile == QZI_MEMORY_LOW ||
+                             s->memory_profile == QZI_MEMORY_LOWEST) && !*wanted;
+        s->dit = qzen_qwen21_open(tier_path, 0, stream_blocks, load_error,
                                   sizeof(load_error));
         if (!s->dit) {
             qzi_set_error_fmt(error, cap, "qwen21 DiT: %s", load_error);
@@ -770,30 +814,130 @@ static int encode_text(qzen_state *s, const char *prompt,
     return 1;
 }
 
+static int encode_text_vision(qzen_state *s, const char *prompt,
+                              const int *pad_counts, const int *grid_h,
+                              const int *grid_w, int image_count,
+                              const float *visual, int32_t **pad_pos_out,
+                              int *pad_n_out, const float *const deep[3],
+                              float **rows, int *count, char *error, size_t cap)
+{
+    if (!s->text) {
+        s->text = qzen_qwen21_text_open(s->q_text, 0, error, cap);
+        if (!s->text) return 0;
+    }
+    uint32_t *ids = NULL;
+    int32_t *marks = NULL;
+    size_t tokens = 0;
+    if (!qzen_qwen21_text_encode_vision(s->tokenizer, prompt, pad_counts,
+                                        image_count, &ids, &tokens, &marks,
+                                        error, cap))
+        return 0;
+    if (!tokens || tokens > 4096) {
+        qzen_tokenizer_ids_free(ids); free(marks);
+        qzi_set_error_fmt(error, cap,
+            "the visual prompt tokenises to %zu rows; qwen21 accepts 1..4096",
+            tokens);
+        return 0;
+    }
+    if ((int)tokens <= 0) {
+        qzen_tokenizer_ids_free(ids); free(marks);
+        return 0;
+    }
+    int pad_n = 0;
+    for (int i = 0; i < image_count; i++) pad_n += pad_counts[i];
+    float *hidden = (float *)malloc(tokens * QZEN_QWEN21_TEXT_DIM * sizeof(float));
+    if (!hidden) {
+        qzen_tokenizer_ids_free(ids); free(marks);
+        qzi_set_error(error, cap, "out of memory for visual text rows");
+        return 0;
+    }
+    int ok = qzen_qwen21_text_forward_vision_ex(s->text, ids, tokens, visual,
+                                                marks, pad_n, deep,
+                                                pad_counts, grid_h, grid_w,
+                                                image_count, hidden, error, cap);
+    qzen_tokenizer_ids_free(ids);
+    if (!ok) { free(marks); free(hidden); return 0; }
+    *rows = hidden;
+    *count = (int)tokens;
+    if (pad_pos_out) *pad_pos_out = marks;
+    else free(marks);
+    if (pad_n_out) *pad_n_out = pad_n;
+    return 1;
+}
+
 /* ------------------------------------------------- zimage pack resolution */
 
 static qzi_status resolve_zimage_pack(qzen_state *s, const char *checkpoint,
                                       char *error, size_t cap)
 {
-    if (!*s->zimage_dir) {
+    if (!*s->zimage_dir && (!*s->zimage_dit_dir || !*s->zimage_vae_dir ||
+                            !*s->zimage_text_dir)) {
         qzi_set_error(error, cap,
             "zimage_dir is not configured (see QwenZImage.config.json)");
         return QZI_ERR_NOT_CONFIGURED;
     }
-    if (!component_dir(s->zimage_dir, "dit", s->z_dit, sizeof(s->z_dit)) ||
-        !component_dir(s->zimage_dir, "vae", s->z_vae, sizeof(s->z_vae)) ||
-        !component_dir(s->zimage_dir, "text_encoder", s->z_text,
-                       sizeof(s->z_text))) {
-        qzi_set_error(error, cap, "the zimage pack path is too long");
+    /* Per-component overrides let each of DiT / VAE / text come from its own
+     * file or directory (bf16 / FP8 / GGUF / nunchaku variants). An empty
+     * override keeps the historical <zimage_dir>/<component> derivation, so a
+     * single-pack setup is unchanged. A missing component still falls back to
+     * the pack so a partial override (e.g. only the VAE) keeps working. */
+#define RESOLVE_COMPONENT(override, pack, name, dest)                          \
+    do {                                                                       \
+        if (*(override)) {                                                     \
+            if (strlen(override) >= sizeof(dest)) {                            \
+                qzi_set_error(error, cap, "the zimage component path is too long"); \
+                return QZI_ERR_ENGINE;                                         \
+            }                                                                  \
+            copy_path((dest), sizeof((dest)), (override));                     \
+        } else if (*(pack) && !component_dir((pack), (name), (dest),           \
+                                             sizeof((dest)))) {                \
+            qzi_set_error(error, cap, "the zimage pack path is too long");      \
+            return QZI_ERR_ENGINE;                                             \
+        }                                                                      \
+    } while (0)
+    RESOLVE_COMPONENT(s->zimage_dit_dir, s->zimage_dir, "dit", s->z_dit);
+    RESOLVE_COMPONENT(s->zimage_vae_dir, s->zimage_dir, "vae", s->z_vae);
+    RESOLVE_COMPONENT(s->zimage_text_dir, s->zimage_dir, "text_encoder",
+                      s->z_text);
+#undef RESOLVE_COMPONENT
+
+    char tokenizer_path[QZEN_PATH_CAP];
+    if (*s->zimage_tokenizer_path) {
+        if (strlen(s->zimage_tokenizer_path) >= sizeof(tokenizer_path)) {
+            qzi_set_error(error, cap, "the zimage tokenizer path is too long");
+            return QZI_ERR_ENGINE;
+        }
+        copy_path(tokenizer_path, sizeof(tokenizer_path),
+                  s->zimage_tokenizer_path);
+    } else if (!join_path(tokenizer_path, sizeof(tokenizer_path), s->z_text,
+                          "tokenizer.json")) {
+        qzi_set_error(error, cap, "the zimage tokenizer path is too long");
         return QZI_ERR_ENGINE;
     }
-    char tokenizer_path[QZEN_PATH_CAP];
-    if (!join_path(tokenizer_path, sizeof(tokenizer_path), s->z_text,
-                   "tokenizer.json") || !is_regular(tokenizer_path)) {
-        qzi_set_error_fmt(error, cap, "zimage pack is missing %s/tokenizer.json",
-                          s->z_text);
-        return QZI_ERR_NOT_CONFIGURED;
+    /* A GGUF/FP8 text component may be a single file with no sidecar tokenizer
+     * in its own directory: in that case fall back to the pack's tokenizer. */
+    if (!is_regular(tokenizer_path)) {
+        char fallback[QZEN_PATH_CAP];
+        if (*s->zimage_dir &&
+            join_path(fallback, sizeof(fallback), s->zimage_dir,
+                      "tokenizer.json") &&
+            is_regular(fallback)) {
+            copy_path(tokenizer_path, sizeof(tokenizer_path), fallback);
+        } else if (*s->zimage_text_dir &&
+                   strstr(s->zimage_text_dir, "tokenizer.json") &&
+                   is_regular(s->zimage_text_dir)) {
+            copy_path(tokenizer_path, sizeof(tokenizer_path),
+                      s->zimage_text_dir);
+        } else {
+            qzi_set_error_fmt(error, cap,
+                              "zimage pack is missing tokenizer.json (looked in %s)",
+                              tokenizer_path);
+            return QZI_ERR_NOT_CONFIGURED;
+        }
     }
+    /* Store the resolved tokenizer path for the pipeline, which currently
+     * derives it from z_text. Reuse a new state field to carry the override. */
+    copy_path(s->z_tokenizer_path, sizeof(s->z_tokenizer_path), tokenizer_path);
 
     int bf16 = !checkpoint || !*checkpoint || !strcmp(checkpoint, "bf16");
     s->z_pack_file[0] = '\0';
@@ -909,6 +1053,14 @@ static qzi_status qzen_init(void **out_context,
               qzen_config_field(&file, "qwen21_lora_dir"));
     copy_path(s->zimage_nunchaku_dir, sizeof(s->zimage_nunchaku_dir),
               qzen_config_field(&file, "zimage_nunchaku_dir"));
+    copy_path(s->zimage_dit_dir, sizeof(s->zimage_dit_dir),
+              qzen_config_field(&file, "zimage_dit_dir"));
+    copy_path(s->zimage_vae_dir, sizeof(s->zimage_vae_dir),
+              qzen_config_field(&file, "zimage_vae_dir"));
+    copy_path(s->zimage_text_dir, sizeof(s->zimage_text_dir),
+              qzen_config_field(&file, "zimage_text_dir"));
+    copy_path(s->zimage_tokenizer_path, sizeof(s->zimage_tokenizer_path),
+              qzen_config_field(&file, "zimage_tokenizer_path"));
     /* The C ABI v1 has no ControlNet path field: it arrives through the
      * config file or QZI_ZIMAGE_CONTROL_DIR, both of which the managed side
      * publishes in a create-scoped environment block. */
@@ -1012,11 +1164,24 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     uint8_t *rgb = NULL, *packed = NULL, *alpha = NULL;
     uint8_t *reference = NULL, *canvas_mask = NULL, *latent_mask = NULL;
     uint8_t *red_canvas = NULL;
+    uint8_t *image_pad_mask = NULL;
     float *identity_latents[QZI_MAX_IDENTITY_REFS] = {NULL};
     const float *identity_ptrs[QZI_MAX_IDENTITY_REFS] = {NULL};
     int identity_heights[QZI_MAX_IDENTITY_REFS] = {0};
     int identity_widths[QZI_MAX_IDENTITY_REFS] = {0};
     uint8_t *identity_canvas = NULL;
+    uint8_t *visual_canvas = NULL;
+    const uint8_t *visual_rgb[QZI_MAX_IDENTITY_REFS] = {NULL};
+    uint32_t visual_w[QZI_MAX_IDENTITY_REFS] = {0};
+    uint32_t visual_h[QZI_MAX_IDENTITY_REFS] = {0};
+        int visual_pad_counts[QZI_MAX_IDENTITY_REFS] = {0};
+        int visual_grid_h[QZI_MAX_IDENTITY_REFS] = {0};
+        int visual_grid_w[QZI_MAX_IDENTITY_REFS] = {0};
+        float *visual_merged = NULL;
+        float *visual_deep[3] = {NULL, NULL, NULL};
+        int32_t *visual_pad_pos = NULL;
+        int visual_pad_count = 0;
+        int visual_pad_n = 0;
     char *prompt_owned = NULL;
     qzi_status status = QZI_ERR_ENGINE;
 
@@ -1058,11 +1223,92 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
         memcpy(prompt_owned + length, suffix, suffix_len + 1u);
         prompt = prompt_owned;
     }
-    if (!encode_text(s, prompt, &text, &text_tokens,
-                     local, sizeof(local))) {
+    if (identity) {
+        /* The visual tower and the VAE reference MUST see the same canvas:
+         * four merged Qwen3-VL image pads carry exactly one VAE latent cell
+         * in Wan2GP's 4-slot joint DiT. */
+        const uint32_t cap = identity->reference_encode_max_side
+                           ? identity->reference_encode_max_side
+                           : s->reference_encode_cap;
+        int ref_lw = 0, ref_lh = 0;
+        identity_reference_grid(identity, (int)request->width / 16,
+                                (int)request->height / 16, cap, &ref_lw, &ref_lh);
+        const uint32_t visual_w_px = (uint32_t)ref_lw * 16u;
+        const uint32_t visual_h_px = (uint32_t)ref_lh * 16u;
+        visual_canvas = (uint8_t *)malloc((size_t)visual_w_px * visual_h_px * 3u);
+        if (!visual_canvas) {
+            qzi_set_error(error, error_cap, "out of memory for the visual canvas");
+            status = QZI_ERR_OUT_OF_MEMORY;
+            goto done;
+        }
+        for (uint32_t index = 0; index < identity->reference_count; index++) {
+            if (!resample_planar_cover(identity->reference_rgb[index],
+                                       identity->reference_widths[index],
+                                       identity->reference_heights[index],
+                                       visual_w_px, visual_h_px, 3u,
+                                       visual_canvas)) {
+                qzi_set_error_fmt(error, error_cap,
+                                  "cannot fit visual reference %u",
+                                  (unsigned)index);
+                status = QZI_ERR_ENGINE;
+                goto done;
+            }
+            visual_rgb[index] = visual_canvas;
+            visual_w[index] = visual_w_px;
+            visual_h[index] = visual_h_px;
+            visual_pad_counts[index] = (ref_lw / 2) * (ref_lh / 2);
+            visual_grid_w[index] = ref_lw / 2;
+            visual_grid_h[index] = ref_lh / 2;
+        }
+        if (!s->text) {
+            s->text = qzen_qwen21_text_open(s->q_text, 0, error, error_cap);
+            if (!s->text) { status = QZI_ERR_ENGINE; goto done; }
+        }
+        if (!s->vision) {
+            s->vision = qzen_qwen21_vision_open(qzen_qwen21_text_header(s->text),
+                                                0, error, error_cap);
+            if (!s->vision) { status = QZI_ERR_ENGINE; goto done; }
+        }
+        local[0] = '\0';
+        if (!qzen_qwen21_vision_forward(s->vision, visual_rgb, visual_w, visual_h,
+                                        (int)identity->reference_count,
+                                        &visual_merged, visual_deep,
+                                        &visual_pad_n, local, sizeof(local))) {
+            qzi_set_error_fmt(error, error_cap, "visual tower: %s", local);
+            status = QZI_ERR_ENGINE;
+            goto done;
+        }
+        /* The tower only needs its device scratch during this forward; free
+         * it before the text / DiT / VAE contexts grow. */
+        qzen_qwen21_vision_close(s->vision);
+        s->vision = NULL;
+    }
+
+    int text_ok = identity
+        ? encode_text_vision(s, prompt, visual_pad_counts,
+                             visual_grid_h, visual_grid_w,
+                             (int)identity->reference_count, visual_merged,
+                             &visual_pad_pos, &visual_pad_count,
+                             (const float *const *)visual_deep,
+                             &text, &text_tokens, local, sizeof(local))
+        : encode_text(s, prompt, &text, &text_tokens, local, sizeof(local));
+    if (!text_ok) {
         qzi_set_error_fmt(error, error_cap, "text encode: %s", local);
         status = QZI_ERR_ENGINE;
         goto done;
+    }
+    if (identity && visual_pad_count > 0) {
+        image_pad_mask = (uint8_t *)calloc((size_t)text_tokens, 1u);
+        if (!image_pad_mask) {
+            qzi_set_error(error, error_cap,
+                          "out of memory for the DiT image pad mask");
+            status = QZI_ERR_OUT_OF_MEMORY;
+            goto done;
+        }
+        for (int i = 0; i < visual_pad_count; i++) {
+            int token = visual_pad_pos[i];
+            if (token >= 0 && token < text_tokens) image_pad_mask[token] = 1u;
+        }
     }
     if (!turbo) {
         if (request->negative_prompt && *request->negative_prompt) {
@@ -1113,30 +1359,16 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
     }
 
     if (identity) {
-        /* WanGP's image_refs_relative_size controls how large each reference
-         * is relative to the output: it is a RESOLUTION, not an attention
-         * weight. Encode every reference at (weight/100) of the target latent
-         * grid, cover-fitting the source into that rectangle. Weight 70 (the
-         * default used by the character pipeline) therefore gives 49% as many
-         * condition tokens as the target. reference_encode_max_side is an
-         * additional memory guard, not a second semantic knob. */
-        const float weight = identity->identity_ref_weight > 0.0f
-                           ? identity->identity_ref_weight : 70.0f;
-        /* An explicit request cap wins; the 0 sentinel adopts the active
-         * low-VRAM profile's cap (768 on high/balanced, 512/384 on low/lowest).
-         * This is the real memory lever: a 1024² reference at cap 768 still
-         * allocates a 768-channel F32 plane, so smaller budgets matter. */
+        /* Same even latent grid the visual tower just used. The identity
+         * weight selects a reference RESOLUTION, matching WanGP's
+         * image_refs_relative_size; reference_encode_max_side is the memory
+         * guard. Rounding to even cells keeps the 2x2 visual merge exact. */
         const uint32_t cap = identity->reference_encode_max_side
                            ? identity->reference_encode_max_side
                            : s->reference_encode_cap;
-        const double ratio = (double)weight / 100.0;
-        int ref_lw = (int)(latent_w * ratio + 0.5);
-        int ref_lh = (int)(latent_h * ratio + 0.5);
-        const int cap_latent = (int)(cap / 16u);
-        if (ref_lw < 1) ref_lw = 1;
-        if (ref_lh < 1) ref_lh = 1;
-        if (ref_lw > cap_latent) ref_lw = cap_latent;
-        if (ref_lh > cap_latent) ref_lh = cap_latent;
+        int ref_lw = 0, ref_lh = 0;
+        identity_reference_grid(identity, latent_w, latent_h, cap,
+                                &ref_lw, &ref_lh);
         const uint32_t ref_pixels = (uint32_t)ref_lw * (uint32_t)ref_lh;
         identity_canvas = (uint8_t *)malloc((size_t)ref_pixels * 16u * 16u * 3u);
         if (!identity_canvas) {
@@ -1381,7 +1613,8 @@ static qzi_status qzen_generate_qwen21_impl(void *context,
         identity ? identity_ptrs : NULL,
         identity ? identity_heights : NULL,
         identity ? identity_widths : NULL,
-        identity ? (int)identity->reference_count : 0
+        identity ? (int)identity->reference_count : 0,
+        image_pad_mask
     };
     local[0] = '\0';
     if (!qzen_qwen21_pipeline_run_ex(s->dit, s->vae, &sample, rgb,
@@ -1419,6 +1652,12 @@ done:
     for (uint32_t index = 0; index < QZI_MAX_IDENTITY_REFS; index++)
         free(identity_latents[index]);
     free(identity_canvas);
+    if (s->vision) { qzen_qwen21_vision_close(s->vision); s->vision = NULL; }
+    free(visual_canvas);
+    free(visual_merged);
+    free(visual_pad_pos);
+    free(image_pad_mask);
+    for (int i = 0; i < 3; i++) free(visual_deep[i]);
     free(latent_mask);
     free(canvas_mask);
     free(reference);
@@ -1586,8 +1825,9 @@ static qzi_status qzen_generate_zimage_impl(void *context,
     bridge_emit(&bridge, "text", 0, 1);
     if (!s->z_text_resident) {
         local[0] = '\0';
-        if (!qzen_zpipe_attach_text(s->zpipe, s->z_text, local,
-                                    sizeof(local))) {
+        if (!qzen_zpipe_attach_text_ex(s->zpipe, s->z_text,
+                                       s->z_tokenizer_path, local,
+                                       sizeof(local))) {
             qzi_set_error_fmt(error, error_cap, "text encoder: %s", local);
             status = QZI_ERR_ENGINE;
             goto done;
@@ -1953,6 +2193,7 @@ static qzi_status qzen_unload(void *context, char *error, size_t error_cap)
     qzen_state *s = (qzen_state *)context;
     if (!s) return QZI_ERR_INVALID_ARGUMENT;
     /* Release re-creatable state; never the DiT, which costs minutes. */
+    if (s->vision) { qzen_qwen21_vision_close(s->vision); s->vision = NULL; }
     if (s->text) { qzen_qwen21_text_close(s->text); s->text = NULL; }
     free(s->uncond);
     s->uncond = NULL;

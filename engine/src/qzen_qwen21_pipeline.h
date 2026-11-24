@@ -92,6 +92,9 @@ typedef struct {
     const int *ref_heights;
     const int *ref_widths;
     int ref_count;
+    /* One byte per positive text token; 1 marks an <|image_pad|> slot that
+     * expands to four DiT latent rows. NULL keeps the legacy layout. */
+    const uint8_t *image_pad_mask;
 } qzen_qwen21_sample;
 
 /* Phase progress for the resident service: "dit" with (step, steps) before each

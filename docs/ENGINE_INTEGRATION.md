@@ -58,6 +58,10 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
   "qwen21_lora_dir": "/models/qwen21/loras",
   "zimage_dir": "/models/zimage",
   "zimage_nunchaku_dir": "/models/zimage_nunchaku",
+  "zimage_dit_dir": "/models/zimage/dit.safetensors",
+  "zimage_vae_dir": "/models/zimage/vae.safetensors",
+  "zimage_text_dir": "/models/zimage/text_encoder.safetensors",
+  "zimage_tokenizer_path": "/models/zimage/tokenizer.json",
   "zimage_control_dir": "/models/zimage/control_union_2.1.safetensors",
   "text_cache_dir": "/models/cache"
 }
@@ -67,8 +71,10 @@ D10 之后已不再用「WebUI 连外部 HTTP 服务」这种方式绕过：真�
 | --- | --- |
 | `qwen21_dir` | Qwen-Image 2.1 权重包（turbo / base DiT、VAE、text tower、tokenizer） |
 | `qwen21_lora_dir` | LoRA 目录（**turbo / base 两个 tier 共用**）；`lora` 参数必须是裸文件名，会在此目录下解析 |
-| `zimage_dir` | Z-Image bf16 权重包 |
+| `zimage_dir` | Z-Image bf16 权重包（未设置逐组件覆盖时的默认来源） |
 | `zimage_nunchaku_dir` | Nunchaku / SVDQ int4 checkpoint 目录，`nunchaku-r<rank>` 在此枚举 |
+| `zimage_dit_dir` / `zimage_vae_dir` / `zimage_text_dir` | **逐组件覆盖**：DiT / VAE / text encoder 各自的文件或目录，可独立指向不同版本（bf16 / FP8 / GGUF / nunchaku）。留空 = 从 `zimage_dir` 按 `<pack>/<component>` 派生（原行为）。env：`QZI_ZIMAGE_DIT_DIR` / `QZI_ZIMAGE_VAE_DIR` / `QZI_ZIMAGE_TEXT_DIR` |
+| `zimage_tokenizer_path` | text 权重为单文件（FP8 / GGUF，无同目录 tokenizer.json）时显式指定分词器。留空 = `<zimage_text_dir>/tokenizer.json`，再回退 `<zimage_dir>/tokenizer.json`。env：`QZI_ZIMAGE_TOKENIZER_PATH` |
 | `zimage_control_dir` | Z-Image Turbo Fun **ControlNet Union 2.1** 权重（`.safetensors` 文件或目录）。只有 `zimage-control` 请求会懒加载它；未配置时返回 `QZI_ERR_NOT_CONFIGURED` |
 | `text_cache_dir` | 文本编码缓存 |
 | `device_id` / `thread_count` | `-1` / `0` = 自动 |
@@ -171,6 +177,23 @@ vtable 末尾的六个可选槽 `generate_qwen21_edit` / `generate_zimage_contro
 
 `control_type` 只做校验、归一化与确定性哈希，**不触发姿态 / 边缘 / 深度预处理**——对齐 WanGP 的 `guide_preprocessing = "V"`（Use Z-Image Raw Format），调用方必须自己提供已预处理的控制图。`control_scale = 0` 由 `qzi.c` 归一化为 `0.65`（WanGP Union 2.1 的 `control_net_weight_alt`）；backend 仍做一次 `> 0 ? scale : 0.65f` 兜底，防止自定义调用方绕过 ABI 层。取值依据与 `control_type` 白名单的核对过程见 [PARAMETERS.md](PARAMETERS.md)。
 
+## Z-Image 逐组件替换与量化格式
+
+Z-Image 的 DiT / VAE / text encoder 由三个独立的 `qzen_weight_store` 从各自路径加载，因此可以为每个组件单独指定权重文件或目录，混用不同版本与量化格式。`resolve_zimage_pack()` 解析顺序：组件级覆盖（`zimage_*_dir`）优先，留空则回退 `<zimage_dir>/<component>` 再 `<zimage_dir>`（历史单包布局，字节级不变）。tokenizer 可由 `zimage_tokenizer_path` 显式指定，text 权重是单文件时避免找不到同目录分词器。
+
+支持的容器 / 格式（由张量名与 dtype 自动识别，不靠文件扩展名猜）：
+
+| 组件 | safetensors BF16 | Quanto qint8 | Nunchaku SVDQ int4 | FP8 E4M3/E5M2 | GGUF 量化 |
+| --- | --- | --- | --- | --- | --- |
+| DiT | ✓ | — | ✓（`checkpoint=nunchaku[-r<rank>]`） | ✓ 反量化到 BF16 | ✓ Q4_0/1、Q5_0/1、Q8_0、Q2_K/Q3_K/Q4_K/Q5_K/Q6_K、F16/BF16 |
+| VAE | ✓ | — | — | ✓ 反量化到 BF16/F32 | ✓ 同上 |
+| text encoder | — | ✓（现有 `qwen3_quanto_bf16_int8`） | — | 组件走 quanto 路径，FP8 safetensors 不适用 | ✓（需自带 tokenizer 或用 `zimage_tokenizer_path`） |
+
+实现要点：
+- **FP8**：`engine/src/qzen_weights.c` 的 `qzen_weight_read_bf16_auto()` / `qzen_weight_read_f32_auto()` 把 E4M3/E5M2 解码到 F32、乘可选的 `<base>.weight_scale` / `<name>_scale` 标量、再按 BF16 round-to-nearest-even 舍入。DiT 的 `read_bf16()` 与 VAE 的 `zvae_read_bf16_f32()` 仅在检测到 FP8 时走该 helper，BF16 输入保持原字节路径不变。
+- **GGUF**：`engine/src/qzi_gguf.c/.h` 是从同一作者的 h3-dotnet-runtime 移植并验证过的读容器（header / KV / tensor table / k-quant 反量化，torch 布局与 HF 张量名规范化）。`qzen_weight_store_open()` 识别 `.gguf` 单文件或目录内 gguf，`qzen_weight_find()` 通过 4 槽环把 GGUF 张量包装成合成 `qzen_st_header`（`gguf` 回调在 `qzen_st_read_data()` 里分派反量化），所以三个组件加载器无需改动容器逻辑。已用本机 14 GB Q4_K GGUF 验证：902 张量正确解析、类型识别、F32/量化反量化非零且合理。
+- **约束**：DiT 仍是固定架构（dim 3840 / 30 heads / 30 层 / cap 2560 / latent 16 通道），换版本须保持这些形状；VAE 须含 decoder 与 encoder 两侧；ControlNet 要求 BF16 embedder + quanto 投影，并与 DiT 的 GPU context 绑定。混用不同量化 DiT 与 BF16 VAE 只要各自路径指向正确文件即可。
+
 ## Z-Image 遮罩重绘：33 通道 context 的后 17 个平面
 
 第四个增量补齐 WanGP `models/z_image/pipeline_z_image.py` 中 `control_in_dim == 33 && inpaint_mask is not None` 的分支。上面 ControlNet 章节里的 `qzen_zpipe_control_context()` 把 `keep_mask` / `inpaint_latent` 恒置 0（对应 WanGP 的 `inpaint_mask is None`）；`engine/src/qzen_zimage_pipeline.c` 新增的 `qzen_zpipe_control_context_ex()` 是它的超集，两者都传 `NULL` 时逐位复现原行为，因此普通 t2i / ControlNet 的数值不受影响。
@@ -186,32 +209,40 @@ vtable 末尾的六个可选槽 `generate_qwen21_edit` / `generate_zimage_contro
 
 progress bridge 把两次 VAE 编码都折算进同一个 `"image encode"` 阶段（真实后端仍是单次阶段上报）；参考后端为便于无 GPU 验证，会按两个独立阶段上报。能力位 `QZI_FEATURE_ZIMAGE_INPAINT = 0x8`、vtable 第 11 个槽与 `qzi_zimage_inpaint_layout()` 见 [NATIVE_ABI.md](NATIVE_ABI.md)，参数契约见 [PARAMETERS.md](PARAMETERS.md)。
 
-## 身份参考 / Wan2GP image_refs（第五增量，含真实 CUDA condition-prefix）
+## 身份参考 / Wan2GP image_refs（第五增量，含真实 CUDA 双条件 + 4-slot joint DiT）
 
 `qzi_generate_qwen21_identity_ref()` 与上面的 img2img 编辑是**两条独立路径**。ABI 层交付：1..10 张参考图数组、权重（默认 70，对齐 WanGP `image_refs_relative_size`）、编码分辨率上限（默认 768）、确定性参考后端、托管 `QziClient` / WebUI 数据管线与全量测试。参考图编码复用降采样方案，因此大图不会触发 768 通道全分辨率平面的 OOM。
 
 真实 CUDA backend 现在也实现了同一入口，采样器从**纯噪声**起步，参考图不是 `init_latent`：
 
 1. **参考编码尺寸 = 权重。** WanGP 的 `image_refs_relative_size` 控制参考图相对输出画布的分辨率，不是 attention 系数。本引擎把 `identity_ref_weight / 100` 乘到目标 latent 网格上：默认 70 得到约 49% 数量的 condition token；`reference_encode_max_side` 继续作为显存护栏。每张图先 cover-fit 到 `latent_w*16 × latent_h*16` 再 VAE 编码，不做 latent 上采样。
-2. **三段 joint 序列。** `qzen_qwen21_request` 新增 `image_refs` / `ref_heights` / `ref_widths` / `ref_count`；`q21_layout` 把序列排成 `[text ; ref_0 ... ref_n ; target]`。每段 latent 都过同一个 `img_in` 投影，整段 prefix 用 t=0 的 modulation 行，target 用实际 sigma 行；最终 `norm_out` / `proj_out` 只取 target tail。
-3. **分段注意力可见性。** CPU 侧 `q21_key_limit()` 生成逐行 key 上限；GPU 侧 `qzen_gpu_prefix_limited_bf16()` 在 flash SDPA 之后重算 prefix 行：text causal，每个 reference block 只看自己和之前的 prefix，target 看全部 keys。`ref_count == 0` 时仍走原来的 `qzen_gpu_prefix_causal_bf16()`，旧 t2i / 编辑路径字节级不变。
+2. **Wan2GP 4-slot joint 序列。** `qzen_qwen21_request` 新增 `image_refs` / `ref_heights` / `ref_widths` / `ref_count` / `image_pad_mask`，`q21_layout` 按 Wan2GP 的 `repeat_interleave(im_mask, 4)` 语义组装：文本序列里的每个 `<|image_pad|>` **原地展开成 4 行 VAE latent**，target latent 再追加到尾部。参考图、视觉塔画布共用同一个偶数 latent 网格，保证 `pad_count * 4 == ref_latent_rows`。每段 latent 都过同一个 `img_in` 投影，prefix（文本 + 条件图像）用 t=0 的 modulation 行，target 用实际 sigma 行；最终 `norm_out` / `proj_out` 只取 target tail。`ref_count == 0` 时不启用 4-slot 展开，旧 t2i / 编辑路径字节级不变。
+3. **分段注意力可见性。** CPU 侧 `q21_key_limit()` 生成逐行 key 上限；GPU 侧 `qzen_gpu_prefix_limited_bf16()` 在 flash SDPA 之后重算 prefix 行：text causal，每个相邻的同 block 图像段（一个图像块的 4-slot 槽连续排列）只看自己和之前的 prefix，target 看全部 keys。GPU scratch 缓存加入 layout hash，避免 pad 位置变化后复用旧 row map / key limit。
 4. **分块 RoPE。** `q21_rope_tables()` 按 layout 逐块生成：text token 的 frame/height/width 轴退化为 token 下标；每个 image block 共享一个 frame 位置，frame 在块间按 `max(h,w)` 递增，height/width 用块内居中栅格坐标。GPU scratch 按完整几何（token 数 + prefix 边界 + 每个 reference 的 h/w）缓存，避免相同 token 数不同布局时复用错误的 row map 或 RoPE。
 
-**保真度边界**：WanGP 的 text tower 是 Qwen3-VL，参考图会以 `<|image_pad|>` 槽位的形式得到视觉 embedding；本引擎的文本塔仍是 text-only，没有移植 `visual.*` 权重。因此 condition 信息完全由 VAE latent 前缀承载，姿态/服饰改动的自由度与 WanGP 不完全一致；但身份信息不再与衣服绑在同一个 img2img 起点上，能同时做到「锁脸 + 大改服装」。真图回归见 `artifacts/identity-verify/`：默认权重 70 保留发髻与面部并加上墨镜；权重 50 + 强烈换装提示词得到红色皮夹克/白 T 恤，背景同时改变，脸仍可辨认。
+**Qwen3-VL 视觉塔**：身份参考现在同时走两条条件通道。VAE latent 仍作为 condition prefix 注入 DiT；文本侧则加载同一个 `text_encoder_int8.safetensors` 中的 `visual.*`（567 张量、27 个 vision block、3 个 deepstack merger），由 `engine/src/qzen_qwen21_vision.c` 完成 patchify、`pos_embed` 双线性插值、axial RoPE、attention/MLP 与 merger。参考图按数量展开 `<imageN><|vision_start|><|image_pad|>...<|vision_end|>`，merged 输出覆盖 pad 位置的 embedding，deepstack 在文本第 0/1/2 层后加回，DiT 拿到的是 final RMSNorm 之前的 hidden（与 WanGP 的 hook 一致）。`qzen_tokenizer_encode_spans()` 返回的是完整模板中的 token 位置，视觉 embedding 写入与 DiT `image_pad_mask` 使用前都会转换到丢弃 14 个系统 token 后的下标；两处必须使用同一个 pad 位置数组，否则文字 token 会被错误地当成图像条件。视觉画布最长边受 profile 的 `reference_encode_cap` 约束，所有参考图合计约 1024 patch，避免多图时 attention 平方爆炸。opaque GPU context 在视觉 forward 后立即释放，不与文本 / DiT / VAE 争驻留。
+
+**保真度边界**：VAE 参考 latent 与 Qwen3-VL `<|image_pad|>` 视觉语义现在按 Wan2GP 的 4-slot joint 语义同时进入 DiT；文本塔还使用图像 grid 派生的 3D mRoPE。最新真图回归见 `artifacts/vision-verify-joint6/`：256×256、默认权重 70、参考图为黑发髻年轻男性时，输出保持同一发髻、五官、耳形和脸部轮廓，并按 prompt 换成红色皮夹克 / 白 T 恤；同 seed 的 t2i 输出 SHA-256 仍为 `622f020b36c40ba8...`，说明旧路径未受影响。这里提供的是身份语义级保真，不对任意照片承诺像素级“人脸完全不变”。
 
 构建后的 CUDA DLL 在 `artifacts/runtimes/win-x64/native/`；跑无 GPU 单测前请用 `scripts\stage-native.ps1` 切回确定性参考后端。
 
 ## 低显存 / 内存 profile（第六增量，对齐 WanGP mmgp）
 
-WanGP 能把 7B 模型跑在低显存卡上，靠的是 mmgp 的 profile 把权重留在 RAM、按块换入换出。本引擎保持 INT8 DiT 常驻，等价的可调杠杆有两个，被打包成命名 profile：
+WanGP 能把 7B 模型跑在低显存卡上，靠的是 mmgp 的 profile 把权重留在 RAM、按块换入换出。本引擎现在实现了真正的 **DiT 块换入换出（block swapping）**，配合两个可调杠杆，一起打包成命名 profile：
 
-1. **异步分配器释放阈值。** `qzen_gpu_create()`（原硬编码 24 GiB）现读取 `QZEN_GPU_POOL_RELEASE_MIB`（MiB）；小阈值让空闲块真正还给驱动，因此小卡在切换 tier / VAE 阶段时不会因为池一直占着显存而 OOM。`QZEN_GPU_SYNC_ALLOC=1` 仍可完全关闭池化。手工设置该环境变量优先于 profile。
-2. **参考图 VAE 编码上限。** 编辑与身份参考路径的默认编码边长（原固定 768）改为 profile 值（low=512 / lowest=384），避免 768 通道 F32 平面在小卡上 OOM。请求显式给 `reference_encode_max_side` 时仍以显式值为准。
+1. **DiT 逐块流式（LOW / LOWEST 启用）。** 模型包中 DiT 权重 6.8 GiB 是最大单项（text encoder 8.4 GiB 只以 F32 常驻**主机 RAM**，GPU 侧始终只有 1 层 INT8 权重；VAE 权重 1.3 GiB）。`qzen_qwen21_open(..., stream_blocks=1, ...)` 在 GPU 只保留 **1 个 transformer 层**的 INT8 权重槽；`q21_forward_device()` 的 32 层循环里，每层执行前用 `q21_gpu_load_block()` 从**常开的 checkpoint**（`model->header.path`）把该层权重经 pinned staging 读进这一个槽，再运行。加载函数复用已分配张量（不逐层 new/free），因此 DiT 驻留权重从 32 层降到 1 层（约 6.8 GiB → 0.2 GiB）。这是纯 IO 换显存，计算路径与常驻模式完全相同。
+   - **LoRA 互斥**：LoRA delta 合并进每层的设备权重张量，逐层重载会丢弃它。因此请求带 LoRA 时 backend 强制回退常驻模式（`stream_blocks=0`）；HIGH / BALANCED 永不启用流式。
+   - **数值无损**：`QZI_MEMORY_PROFILE=high` 与 `=lowest` 跑同一 fox 用例（seed 42 / turbo / 512²）输出 PNG 的 SHA-256 完全相同（`622f020b…cbffe`），逐字节一致。LOWEST 还略快（91.8s vs 117.0s，更紧的池阈值抵消了逐层 IO）。
+2. **异步分配器释放阈值。** `qzen_gpu_create()`（原硬编码 24 GiB）现读取 `QZEN_GPU_POOL_RELEASE_MIB`（MiB）；小阈值让空闲块真正还给驱动，因此小卡在切换 tier / VAE 阶段时不会因为池一直占着显存而 OOM。`QZEN_GPU_SYNC_ALLOC=1` 仍可完全关闭池化。手工设置该环境变量优先于 profile。
+3. **参考图 VAE 编码上限。** 编辑与身份参考路径的默认编码边长（原固定 768）改为 profile 值（low=512 / lowest=384），避免 768 通道 F32 平面在小卡上 OOM。请求显式给 `reference_encode_max_side` 时仍以显式值为准。
+
+text / DiT / VAE 各持一个独立 CUDA context；LOWEST 的 256 MiB 阈值分别作用于三个池，空闲时显存回落到接近实际用量。512² 下三者叠加约 3 GiB 权重 + 各自 scratch，6–8 GiB 卡可运行。
 
 profile 表与 `AUTO` 解析规则见 [NATIVE_ABI.md](NATIVE_ABI.md)「低显存 / 内存 profile」节。实现要点：
 
 - `native/src/qzi.c` 存 engine 级 `memory_profile`（默认 AUTO），`qzi_engine_create` 读 `QZI_MEMORY_PROFILE` 并解析后经 backend vtable 第 13 槽 `set_memory_profile` 推给真实后端；`qzi_engine_memory_plan()` 读取已解析预算。
-- `native/src/qzi_engine_backend.c` 的 `qzen_health()` 通过 `qzen_gpu_device_memory()` 上报**设备级** free/total VRAM（旧版固定 -1）；`qzen_set_memory_profile()` 解析预算并发布 `QZEN_GPU_POOL_RELEASE_MIB`。参考后端上报合成 16384/12288 MiB，保证无 GPU 也能测完整契约。
+- `native/src/qzi_engine_backend.c` 的 `qzen_health()` 通过 `qzen_gpu_device_memory()` 上报**设备级** free/total VRAM（旧版固定 -1）；`qzen_set_memory_profile()` 解析预算并发布 `QZEN_GPU_POOL_RELEASE_MIB`。`ensure_qwen21_dit()` 在加载时按 `memory_profile` 且无 LoRA 时把 `stream_blocks=1` 传给 `qzen_qwen21_open()`。参考后端上报合成 16384/12288 MiB，保证无 GPU 也能测完整契约。
+- `engine/src/qzen_qwen21_dit.c/.h` 的 block swapping：`q21_gpu_ctx` 增加 `stream_blocks` / 借用的 `header`；`q21_gpu_open(..., stream_blocks, ...)` 常驻模式加载全部 32 层（不变），流式模式只加载第 0 层。`q21_gpu_load_int8()` / `q21_gpu_load_bf16_into()` 复用已分配张量；`q21_forward_device()` 和 `qzen_qwen21_block_forward_device()` 在每层前调用 `q21_gpu_load_block()` 换入该层。
 - `engine/src/qzen_gpu.cu` 的池创建读取该 env（缺省 24 GiB 字节级不变），`engine/src/qzen_gpu.h` 同步注释。
 - 阈值对**后续新建**的显存上下文生效，因此 profile 应在首次生成前设置（config / env 即如此）；运行时 `POST /api/memory-profile` 切换后，已驻留的 DiT 不重载，下一次新建上下文才用新阈值。
 

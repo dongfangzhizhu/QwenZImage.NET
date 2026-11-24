@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "qzen_tokenizer.h"
+#include "qzen_safetensors.h"
 
 #define QZEN_QWEN21_TEXT_DIM 4096
 #define QZEN_QWEN21_TEXT_LAYERS 36
@@ -46,9 +47,46 @@ int qzen_qwen21_text_encode(const qzen_tokenizer *tokenizer, const char *prompt,
 int qzen_qwen21_text_forward(qzen_qwen21_text *model, const uint32_t *ids, size_t count,
                            float *hidden, float *trace, char *error, size_t error_size);
 
+/* Identity-reference template: one <imageN><|vision_start|> block per
+ * reference, with pad_counts[i] consecutive <|image_pad|> slots. `pad_pos`
+ * receives the trimmed-token index of every pad slot in encounter order. */
+int qzen_qwen21_text_encode_vision(const qzen_tokenizer *tokenizer,
+                                   const char *prompt, const int *pad_counts,
+                                   int image_count, uint32_t **ids, size_t *count,
+                                   int32_t **pad_pos, char *error, size_t error_size);
+
+/* Same forward as qzen_qwen21_text_forward(), but overwrites the listed token
+ * rows with `visual` ([pad_n][4096]) before layer 0 and adds `deep[i]` after
+ * text layers i=0..2. Both CPU and device paths are supported. */
+int qzen_qwen21_text_forward_vision(qzen_qwen21_text *model, const uint32_t *ids,
+                                    size_t count, const float *visual,
+                                    const int32_t *pad_pos, int pad_n,
+                                    const float *const deep[3], float *hidden,
+                                    char *error, size_t error_size);
+
+/* Same as qzen_qwen21_text_forward_vision(), but also supplies the merged
+ * image grid (grid_h[i] x grid_w[i]) for each reference. Wan2GP uses those
+ * grids to assign Qwen3-VL 3D mRoPE positions to <|image_pad|> tokens; plain
+ * sequential positions are only correct for text-only prompts. pad_counts,
+ * grid_h, grid_w and image_count must describe the same pad_pos groups. */
+int qzen_qwen21_text_forward_vision_ex(qzen_qwen21_text *model,
+                                       const uint32_t *ids, size_t count,
+                                       const float *visual,
+                                       const int32_t *pad_pos, int pad_n,
+                                       const float *const deep[3],
+                                       const int *pad_counts,
+                                       const int *grid_h, const int *grid_w,
+                                       int image_count,
+                                       float *hidden, char *error,
+                                       size_t error_size);
+
 /* Seconds spent moving layer weights: reading and dequantising them on the CPU
  * path, reading and uploading them on the device path. */
 double qzen_qwen21_text_weight_seconds(const qzen_qwen21_text *model);
+
+/* Borrowed checkpoint header, used by the visual tower to read visual.* from
+ * the same safetensors file. The pointer stays valid until text_close(). */
+qzen_st_header *qzen_qwen21_text_header(qzen_qwen21_text *model);
 
 /* 1 when the last forward ran on the device (QWEN21_TEXT_GPU=1 and the CUDA
  * context came up), 0 while the f32 CPU reference is in charge. The two paths

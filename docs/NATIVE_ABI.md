@@ -80,7 +80,7 @@
 | `qzi_status qzi_generate_zimage_control(...)` | 同步用 ControlNet Union 生成 Z-Image，见下节；backend 无 control 槽时返回 `QZI_ERR_UNSUPPORTED`，真实后端未配置权重时返回 `QZI_ERR_NOT_CONFIGURED` |
 | `qzi_status qzi_generate_qwen21_edit_ex(...)` | 同步高级编辑（Red Canvas / LanPaint / RGBA），见下节；backend 无 advanced-edit 槽时返回 `QZI_ERR_UNSUPPORTED` |
 | `qzi_status qzi_generate_zimage_inpaint(...)` | 同步 Z-Image Union 2.x 遮罩重绘，见下节；backend 无 inpaint 槽时返回 `QZI_ERR_UNSUPPORTED`，真实后端未配置 Union 权重或加载了 16 通道 v1 权重时分别返回 `QZI_ERR_NOT_CONFIGURED` / `QZI_ERR_ENGINE` |
-| `qzi_status qzi_generate_qwen21_identity_ref(...)` | 同步身份参考生成（Wan2GP `image_refs`），见下节；backend 无对应槽时返回 `QZI_ERR_UNSUPPORTED`，真实 CUDA backend 已实现 condition-prefix DiT 注入 |
+| `qzi_status qzi_generate_qwen21_identity_ref(...)` | 同步身份参考生成（Wan2GP `image_refs`），见下节；backend 无对应槽时返回 `QZI_ERR_UNSUPPORTED`，真实 CUDA backend 已实现 Qwen3-VL 视觉塔 + Wan2GP 4-slot joint DiT 注入 |
 | `qzi_status qzi_engine_set_memory_profile(qzi_engine *, qzi_memory_profile, char *, size_t)` | 第六增量：设置低显存预算 profile（控制面，不加载模型/不占 served 计数），见「低显存」节；backend 无对应槽时返回 `QZI_ERR_UNSUPPORTED` |
 | `qzi_status qzi_engine_memory_plan(qzi_engine *, qzi_memory_plan *, char *, size_t)` | 第六增量：读取已解析的预算与实时 VRAM（设备级 free/total，查询失败为 -1） |
 | `void qzi_image_release(qzi_engine *, qzi_image *)` | 释放 `data` 并把结构体清零；对已清零的结构体是幂等的 |
@@ -120,6 +120,7 @@
 - `lora` 切换、scale 改变或移除 adapter 都会触发 DiT 重载并上报一次 `"model load"` phase；真实后端在加载权重**之前**校验裸文件名与目录，合并失败会清空 DiT，不留半合并权重。
 - `QZI_QWEN21_LORA_DIR` / `QZI_ZIMAGE_NUNCHAKU_DIR` 不在 ABI 里：它们通过 `QZI_CONFIG` 指定的配置文件或环境变量传入，native 侧由 `qzen_config_apply_environment()` 在 `qzen_config_load()` 之后应用（支持 `~` 展开）。`QziClient` 在 `qzi_engine_create()` 期间把代码级 `QziClientOptions` 值**作用域发布**并在返回后还原，所以每个 engine 快照自己的配置；创建完成后再改环境变量不影响已有 engine。
 - `qzi_getenv()`（`native/include/qzi_env.h`）是**内部辅助函数，不是 ABI 导出**：Windows 上 CRT 的 `getenv()` 看不到托管侧通过 Win32 API 设置的值，所以 native 配置读取一律走它。ABI v1 的导出符号表与结构体布局没有因此改变。自行实现 backend 时若需要读 `QZI_*`，请从仓库源码编译 `native/src/qzi_env.c`（或照此使用 `GetEnvironmentVariableA`），不要裸用 `getenv()`。
+- Z-Image 的 `zimage_dit_dir` / `zimage_vae_dir` / `zimage_text_dir` / `zimage_tokenizer_path`（env `QZI_ZIMAGE_DIT_DIR` / `QZI_ZIMAGE_VAE_DIR` / `QZI_ZIMAGE_TEXT_DIR` / `QZI_ZIMAGE_TOKENIZER_PATH`）同样是**引擎配置而非请求字段**：组件级路径优先于 `Checkpoint` 派生的权重包布局，可混用 BF16 / FP8 / GGUF / 现有 INT4、INT8 组件；全部留空时旧路径逐字节不变。详见 [PARAMETERS.md](PARAMETERS.md) 与 [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md)。
 
 ## 图像编辑（ABI v1 增量扩展）
 
@@ -341,9 +342,10 @@ typedef struct qzi_qwen21_identity_ref_request {
 - `qzi_normalize_qwen21_identity_ref()` 只把两个 `0` sentinel 解析为 70 / 768；像素缓冲区只按指针借用，整个同步调用期间由调用方保证存活，ABI 不接管所有权。
 - `qzi_qwen21_identity_ref_layout()` **不占用** 6 个 layout 槽位；托管侧 `AbiGuard` 同时检查 `qzi_abi_features()`、`*_layout()`、`qzi_generate_qwen21_identity_ref()` 三个导出与结构体尺寸，缺一即视为不支持。
 - backend 侧 `generate_qwen21_identity_ref` 是 vtable 第 12 个槽位（第六增量的 `set_memory_profile` 追加在它之后，成为新的最后一位）。参考后端把每张参考图的像素 / 尺寸、数量、权重、编码上限混入确定性 PNG tag，并按参考图数量上报 `"image encode"` 阶段（每张 2 个进度事件），因此无 GPU 也能验证参数贯通。
-- **真实 CUDA backend 已实现 condition-prefix 注入**：`q21_layout` 把 DiT 序列排成 `[text ; ref_0 ... ref_n ; target]`，共享 `img_in`，prefix 用 t=0 modulation，target 用实际 sigma，最终只取 target tail；GPU 用 `qzen_gpu_prefix_limited_bf16()` 重算 prefix 行的可见 key 范围（text causal、每个 reference block 只看自己及更早 prefix、target 看全部），CPU 用 `q21_key_limit()` 同语义。RoPE 按块递增 frame 位置；`ref_count == 0` 时仍走旧的两段 kernels，t2i / 编辑字节级不变。
+- **真实 CUDA backend 已实现 4-slot joint 注入**：`q21_layout` 按 Wan2GP `repeat_interleave(im_mask, 4)` 组装 joint 序列：文本 `<|image_pad|>` 原地展开成 4 行 VAE latent，target latent 追加在尾段；共享 `img_in`，prefix 用 t=0 modulation，target 用实际 sigma，最终只取 target tail。GPU 用 `qzen_gpu_prefix_limited_bf16()` 重算 prefix 行的可见 key 范围（text causal、每个相邻同 block 图像段只看自己及更早 prefix、target 看全部），CPU 用 `q21_key_limit()` 同语义；scratch 缓存以 layout hash 失效。RoPE 按块递增 frame 位置；`ref_count == 0` 时仍走旧的两段 kernels，t2i / 编辑字节级不变（同 seed 输出 SHA-256 `622f020b36c40ba8...`）。
 - 权重语义：WanGP 的 `image_refs_relative_size` 是参考图**相对分辨率**，不是 attention 权重。真实后端把 `identity_ref_weight / 100` 乘到目标 latent 网格得到参考编码网格，再 cover-fit 源图到该尺寸直接 VAE 编码；`reference_encode_max_side` 只是显存护栏。编辑路径仍用 `encode_reference_capped()` 的降采样 + latent 上采样：最长边超过 cap 的参考图先 cover-fit 降采样再 VAE 编码，然后把 latent 双线性上采样回目标网格；参考图本身不超过 cap 时直接走原路径，旧行为字节级不变。两者共同避免 1024² 参考图在 768 通道 F32 平面上约 12.9 GiB 的分配。
-- 保真度边界：文本塔仍是 text-only，未移植 Qwen3-VL `visual.*` 权重与 `<|image_pad|>` 视觉 embedding；身份信息由 VAE latent 前缀承载。真图回归显示可锁脸并大改服装，但与 WanGP 的视觉语义条件不是逐像素等价。
+- 视觉语义条件：真实 CUDA backend 加载同一 text encoder 包中的 `visual.*`（27 个 vision block + 3 个 deepstack merger），把 merged 输出写到 `<|image_pad|>` 的 hidden 行，deepstack 在第 0/1/2 层后加回；文本塔使用图像 grid 派生的 3D mRoPE。`qzen_tokenizer_encode_spans()` 返回完整模板 token 位置，写入视觉 embedding 和构造 DiT pad mask 时都换算到裁剪后的下标，两者必须一致。
+- 保真度边界：VAE latent 与 Qwen3-VL 视觉语义现在都按 Wan2GP 4-slot joint 语义参与条件化；真图回归 `artifacts/vision-verify-joint6/` 显示发髻、五官与脸部轮廓可保持，同时能换成红皮夹克 / 白 T 恤。这里是身份语义级保真，不对任意照片承诺像素级不变。
 
 ```c
 if (!has_export("qzi_abi_features") ||
@@ -460,7 +462,7 @@ if (s == QZI_OK) qzi_image_release(engine, &result);
 
 ## 低显存 / 内存 profile（ABI v1 第六增量）
 
-WanGP 用 mmgp 把 7B 模型跑在小显存卡上；本引擎保持 INT8 DiT 常驻，等价的可调杠杆是「异步分配器的释放阈值」与「参考图 VAE 编码最长边」。`qzi_memory_profile` 把它们打成命名预设，避免调用方知道每个旋钮：
+WanGP 用 mmgp 把 7B 模型跑在小显存卡上，核心是权重留 RAM、按块换入换出。本引擎已实现真正的 **DiT 块换入换出**：LOW / LOWEST 下 GPU 只保留 1 层 DiT 权重，其余 31 层在每个去噪步从常开 checkpoint 逐层换入（text encoder 本来就只 1 层驻留，VAE 权重 1.3 GiB）。HIGH / BALANCED 保持 32 层全驻留、字节级不变。`qzi_memory_profile` 把块换出开关、分配器释放阈值与参考图编码上限打成命名预设，避免调用方知道每个旋钮：
 
 ```c
 typedef enum qzi_memory_profile {
@@ -480,12 +482,14 @@ typedef struct qzi_memory_plan {
 
 预算表（`AUTO` 按设备总显存解析：≥20480→high，≥12288→balanced，≥8192→low，否则 lowest；未知显存→balanced）：
 
-| profile | pool_release_mib | reference_encode_cap |
-|---|---|---|
-| high | 24576（历史默认，24 GiB） | 768 |
-| balanced | 4096 | 768 |
-| low | 1024 | 512 |
-| lowest | 256 | 384 |
+| profile | DiT block swap | pool_release_mib | reference_encode_cap |
+|---|---|---|---|
+| high | 否（32 层常驻） | 24576（历史默认，24 GiB） | 768 |
+| balanced | 否（32 层常驻） | 4096 | 768 |
+| low | **是（1 层驻留 + 逐层换入）** | 1024 | 512 |
+| lowest | **是（1 层驻留 + 逐层换入）** | 256 | 384 |
+
+块换出与 LoRA 互斥：请求带 LoRA 时 backend 强制回退 32 层常驻（LoRA delta 合并进每层设备权重，逐层重载会丢弃它）。块换出是纯 IO 换显存，计算路径不变：`high` 与 `lowest` 跑同一 seed/tier/分辨率输出 PNG 的 SHA-256 完全相同（已用 fox 512² 用例验证）。
 
 - `qzi_engine_set_memory_profile()` 是控制面调用：不加载模型、不占 `served` 计数、busy 时返回 `QZI_ERR_BUSY`；`AUTO` 会按实时 VRAM 重新解析。backend 无 `set_memory_profile` 槽时返回 `QZI_ERR_UNSUPPORTED`。
 - `qzi_engine_memory_plan()` 读取已解析预算与**设备级** free/total VRAM（`qzen_gpu_device_memory()`，即 nvidia-smi 口径，不是本进程占用），查询失败留 `-1`。

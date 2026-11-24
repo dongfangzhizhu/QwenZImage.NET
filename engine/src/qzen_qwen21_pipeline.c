@@ -77,8 +77,8 @@ static int q21_velocity_refs(qzen_qwen21_model *dit, const float *text,
                              int height, int width, float sigma,
                              const float *const *image_refs,
                              const int *ref_heights, const int *ref_widths,
-                             int ref_count, float *velocity, char *error,
-                             size_t error_size) {
+                             int ref_count, const uint8_t *image_pad_mask,
+                             float *velocity, char *error, size_t error_size) {
     qzen_qwen21_request request;
     memset(&request, 0, sizeof(request));
     request.text = text;
@@ -92,6 +92,7 @@ static int q21_velocity_refs(qzen_qwen21_model *dit, const float *text,
     request.ref_heights = ref_heights;
     request.ref_widths = ref_widths;
     request.ref_count = ref_count;
+    request.image_pad_mask = image_pad_mask;
     return qzen_qwen21_forward(dit, &request, velocity, NULL, error, error_size);
 }
 
@@ -99,7 +100,7 @@ static int q21_velocity(qzen_qwen21_model *dit, const float *text, int text_toke
                         const float *latent_grid, int height, int width, float sigma,
                         float *velocity, char *error, size_t error_size) {
     return q21_velocity_refs(dit, text, text_tokens, latent_grid, height, width,
-                             sigma, NULL, NULL, NULL, 0, velocity, error,
+                             sigma, NULL, NULL, NULL, 0, NULL, velocity, error,
                              error_size);
 }
 
@@ -476,7 +477,8 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
                                sample->height, sample->width, sigma,
                                sample->image_refs, sample->ref_heights,
                                sample->ref_widths, sample->ref_count,
-                               positive, error, error_size)) {
+                               sample->image_pad_mask, positive, error,
+                               error_size)) {
             goto done;
         }
         if (negative) {
@@ -485,7 +487,7 @@ int qzen_qwen21_pipeline_run_ex(qzen_qwen21_model *dit, qzen_qwen21_vae *vae,
                                    sample->height, sample->width, sigma,
                                    sample->image_refs, sample->ref_heights,
                                    sample->ref_widths, sample->ref_count,
-                                   negative, error, error_size)) {
+                                   NULL, negative, error, error_size)) {
                 goto done;
             }
             for (size_t index = 0; index < (size_t)tokens * Q21_LATENT_CHANNELS; index++) {

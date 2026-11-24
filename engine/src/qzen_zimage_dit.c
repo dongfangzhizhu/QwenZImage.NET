@@ -39,7 +39,10 @@ static int read_bf16(const qzen_weight_store *store, const char *name,
         return 0;
     }
     uint64_t elements = dim0 * dim1;
-    int shape_ok = tensor->dtype == QZEN_DTYPE_BF16;
+    int is_fp8 = tensor->dtype == QZEN_DTYPE_F8_E4M3 ||
+                 tensor->dtype == QZEN_DTYPE_F8_E5M2;
+    int dtype_ok = tensor->dtype == QZEN_DTYPE_BF16 || is_fp8;
+    int shape_ok = dtype_ok;
     if (shape_ok && tensor->ndim == 1) {
         shape_ok = dim1 == 1 && tensor->shape[0] == dim0;
     } else if (shape_ok && tensor->ndim == 2) {
@@ -55,6 +58,24 @@ static int read_bf16(const qzen_weight_store *store, const char *name,
                   (unsigned long long)tensor->shape[1],
                   (unsigned long long)dim0, (unsigned long long)dim1);
         return 0;
+    }
+    /* FP8 is decoded (scaled, BF16-rounded) via the shared helper. The plain
+     * BF16 path stays byte-for-byte identical. */
+    if (is_fp8) {
+        uint16_t *decoded = NULL;
+        uint64_t count = 0;
+        if (!qzen_weight_read_bf16_auto(store, name, &decoded, &count,
+                                         error, error_size))
+            return 0;
+        if (count != elements) {
+            free(decoded);
+            zimg_fail(error, error_size, "weight %s decoded %llu elements, expected %llu",
+                      name, (unsigned long long)count, (unsigned long long)elements);
+            return 0;
+        }
+        memcpy(out, decoded, (size_t)elements * 2);
+        free(decoded);
+        return 1;
     }
     return qzen_st_read_data(header, tensor, out, (size_t)elements * 2,
                            error, error_size);

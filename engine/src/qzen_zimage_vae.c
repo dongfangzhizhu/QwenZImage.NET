@@ -43,33 +43,47 @@ static int zvae_read_bf16_f32(const qzen_weight_store *store, const char *name,
         zvae_fail(error, error_size, "required VAE weight is absent: %s", name);
         return 0;
     }
-    if (tensor->dtype != QZEN_DTYPE_BF16) {
-        zvae_fail(error, error_size, "VAE weight %s is %s, expected BF16", name,
+    int is_fp8 = tensor->dtype == QZEN_DTYPE_F8_E4M3 ||
+                 tensor->dtype == QZEN_DTYPE_F8_E5M2;
+    if (tensor->dtype != QZEN_DTYPE_BF16 && !is_fp8) {
+        zvae_fail(error, error_size, "VAE weight %s is %s, expected BF16/FP8", name,
                   qzen_dtype_name(tensor->dtype));
         return 0;
     }
     uint64_t count = qzen_st_tensor_elements(tensor);
     ZVAE_TRACE_LOG("  read %s (%llu elements)\n", name, (unsigned long long)count);
-    uint16_t *staged = malloc((size_t)count * 2);
-    if (!staged) {
-        zvae_fail(error, error_size, "cannot stage %s", name);
-        return 0;
-    }
-    if (!qzen_st_read_data(header, tensor, staged, (size_t)count * 2, error, error_size)) {
+    float *values = NULL;
+    if (is_fp8) {
+        uint64_t decoded = 0;
+        if (!qzen_weight_read_f32_auto(store, name, &values, &decoded,
+                                        error, error_size)) return 0;
+        if (decoded != count) {
+            free(values);
+            zvae_fail(error, error_size, "VAE weight %s decoded wrong size", name);
+            return 0;
+        }
+    } else {
+        uint16_t *staged = malloc((size_t)count * 2);
+        if (!staged) {
+            zvae_fail(error, error_size, "cannot stage %s", name);
+            return 0;
+        }
+        if (!qzen_st_read_data(header, tensor, staged, (size_t)count * 2, error, error_size)) {
+            free(staged);
+            return 0;
+        }
+        values = zvae_alloc((size_t)count);
+        if (!values) {
+            free(staged);
+            zvae_fail(error, error_size, "cannot allocate %s", name);
+            return 0;
+        }
+        for (uint64_t index = 0; index < count; index++) {
+            uint32_t bits = (uint32_t)staged[index] << 16;
+            memcpy(&values[index], &bits, sizeof(float));
+        }
         free(staged);
-        return 0;
     }
-    float *values = zvae_alloc((size_t)count);
-    if (!values) {
-        free(staged);
-        zvae_fail(error, error_size, "cannot allocate %s", name);
-        return 0;
-    }
-    for (uint64_t index = 0; index < count; index++) {
-        uint32_t bits = (uint32_t)staged[index] << 16;
-        memcpy(&values[index], &bits, sizeof(float));
-    }
-    free(staged);
     ZVAE_TRACE_LOG("  read done %s\n", name);
     *out = values;
     *elements = count;

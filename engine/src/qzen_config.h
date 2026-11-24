@@ -25,6 +25,14 @@ typedef struct qzen_config {
     char qwen21_lora_dir[QZEN_CONFIG_PATH_MAX];
     char zimage_dir[QZEN_CONFIG_PATH_MAX];
     char zimage_nunchaku_dir[QZEN_CONFIG_PATH_MAX];
+    /* Optional per-component Z-Image overrides (file or directory). When empty,
+     * each component falls back to <zimage_dir>/<component> then <zimage_dir>,
+     * preserving the historical single-pack behaviour byte for byte. These let
+     * a caller mix e.g. an FP8 DiT with a BF16 VAE, or a GGUF text encoder. */
+    char zimage_dit_dir[QZEN_CONFIG_PATH_MAX];
+    char zimage_vae_dir[QZEN_CONFIG_PATH_MAX];
+    char zimage_text_dir[QZEN_CONFIG_PATH_MAX];
+    char zimage_tokenizer_path[QZEN_CONFIG_PATH_MAX];
     /* Z-Image Turbo Fun ControlNet Union checkpoint (file or directory). */
     char zimage_control_dir[QZEN_CONFIG_PATH_MAX];
     char text_cache_dir[QZEN_CONFIG_PATH_MAX];

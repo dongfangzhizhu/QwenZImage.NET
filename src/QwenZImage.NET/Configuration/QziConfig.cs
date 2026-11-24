@@ -55,6 +55,18 @@ public sealed record QziConfig
     /// <summary>Environment variable overriding <c>text_cache_dir</c>.</summary>
     public const string ModelCacheVariable = "QZI_MODEL_CACHE";
 
+    /// <summary>Environment variable overriding the Z-Image DiT component path.</summary>
+    public const string ZImageDitDirectoryVariable = "QZI_ZIMAGE_DIT_DIR";
+
+    /// <summary>Environment variable overriding the Z-Image VAE component path.</summary>
+    public const string ZImageVaeDirectoryVariable = "QZI_ZIMAGE_VAE_DIR";
+
+    /// <summary>Environment variable overriding the Z-Image text encoder component path.</summary>
+    public const string ZImageTextDirectoryVariable = "QZI_ZIMAGE_TEXT_DIR";
+
+    /// <summary>Environment variable overriding the Z-Image tokenizer.json path.</summary>
+    public const string ZImageTokenizerPathVariable = "QZI_ZIMAGE_TOKENIZER_PATH";
+
     /// <summary>Environment variable naming the native library to load.</summary>
     public const string NativeLibraryVariable = "QZI_NATIVE_LIBRARY";
 
@@ -79,7 +91,9 @@ public sealed record QziConfig
     {
         "qwen21_dir", "zimage_dir", "zimage_nunchaku_dir", "zimage_control_dir",
         "qwen21_lora_dir", "text_cache_dir", "device_id", "thread_count", "native_library",
-        "preprocess_dir", "memory_profile"
+        "preprocess_dir", "memory_profile",
+        // Per-component Z-Image overrides (file or directory, any supported format).
+        "zimage_dit_dir", "zimage_vae_dir", "zimage_text_dir", "zimage_tokenizer_path"
     };
 
     private static readonly HashSet<string> PlatformKeys = new(StringComparer.Ordinal)

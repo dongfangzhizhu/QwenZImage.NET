@@ -31,6 +31,9 @@ static struct q21_text_gpu *q21_text_gpu_open(char *error, size_t error_size);
 static void q21_text_gpu_free(struct q21_text_gpu *ctx);
 static int q21_text_gpu_forward(qzen_qwen21_text *model, const uint32_t *ids,
                                 size_t count, float *hidden_out, float *trace,
+                                const float *rope_cos, const float *rope_sin,
+                                const float *visual, const int32_t *pad_pos,
+                                int pad_n, const float *const deep[3],
                                 char *error, size_t error_size);
 
 #include "qzen_gpu.h"
@@ -216,6 +219,117 @@ int qzen_qwen21_text_encode(const qzen_tokenizer *tokenizer, const char *prompt,
     return 1;
 }
 
+int qzen_qwen21_text_encode_vision(const qzen_tokenizer *tokenizer,
+                                   const char *prompt, const int *pad_counts,
+                                   int image_count, uint32_t **ids, size_t *count,
+                                   int32_t **pad_pos, char *error,
+                                   size_t error_size) {
+    if (!tokenizer || !prompt || !ids || !count || !pad_pos ||
+        (image_count > 0 && !pad_counts)) {
+        snprintf(error, error_size, "invalid visual prompt request");
+        return 0;
+    }
+    size_t capacity = 16384 + strlen(prompt);
+    for (int i = 0; i < image_count; i++)
+        capacity += (size_t)pad_counts[i] * 20u + 64u;
+    char *text = malloc(capacity);
+    if (!text) {
+        snprintf(error, error_size, "out of memory for the visual prompt template");
+        return 0;
+    }
+    size_t used = 0;
+    int written = snprintf(text, capacity, "%s%s", q21_text_system, q21_text_user);
+    if (written < 0 || (size_t)written >= capacity) goto overflow;
+    used = (size_t)written;
+    for (int i = 0; i < image_count; i++) {
+        written = snprintf(text + used, capacity - used, "%s<image%d><|vision_start|>",
+                           i ? " " : "", i + 1);
+        if (written < 0 || (size_t)written >= capacity - used) goto overflow;
+        used += (size_t)written;
+        for (int pad = 0; pad < pad_counts[i]; pad++) {
+            written = snprintf(text + used, capacity - used, "<|image_pad|>");
+            if (written < 0 || (size_t)written >= capacity - used) goto overflow;
+            used += (size_t)written;
+        }
+        written = snprintf(text + used, capacity - used, "<|vision_end|>");
+        if (written < 0 || (size_t)written >= capacity - used) goto overflow;
+        used += (size_t)written;
+    }
+    written = snprintf(text + used, capacity - used, "%s%s",
+                       prompt[0] ? prompt : " ", q21_text_tail);
+    if (written < 0 || (size_t)written >= capacity - used) goto overflow;
+
+    uint32_t *encoded = NULL;
+    int32_t *marks = NULL;
+    size_t total = 0;
+    int ok = qzen_tokenizer_encode_spans(tokenizer, text, "<|image_pad|>",
+                                         &encoded, &marks, &total, error,
+                                         error_size);
+    free(text);
+    if (!ok) return 0;
+    if (total <= QZEN_QWEN21_TEXT_DROP) {
+        snprintf(error, error_size, "visual prompt tokenised to %zu rows", total);
+        qzen_tokenizer_ids_free(encoded);
+        free(marks);
+        return 0;
+    }
+    size_t kept = total - QZEN_QWEN21_TEXT_DROP;
+    uint32_t *trimmed = malloc(kept * sizeof(*trimmed));
+    int32_t *trimmed_marks = malloc(kept * sizeof(*trimmed_marks));
+    if (!trimmed || !trimmed_marks) {
+        snprintf(error, error_size, "out of memory for visual prompt tokens");
+        free(trimmed); free(trimmed_marks);
+        qzen_tokenizer_ids_free(encoded); free(marks);
+        return 0;
+    }
+    memcpy(trimmed, encoded + QZEN_QWEN21_TEXT_DROP, kept * sizeof(*trimmed));
+    int slots = 0;
+    for (size_t i = QZEN_QWEN21_TEXT_DROP; i < total; i++) {
+        if (marks[i] >= 0) {
+            if (slots >= (int)kept) {
+                snprintf(error, error_size, "too many image pad slots");
+                free(trimmed); free(trimmed_marks);
+                qzen_tokenizer_ids_free(encoded); free(marks);
+                return 0;
+            }
+            /* marks[] indexes the full templated sequence; callers consume
+             * pad_pos[] against the system-prefix-trimmed ids[]. Forgetting
+             * this offset writes visual rows into ordinary text tokens and
+             * desynchronises the DiT image-pad mask. */
+            int32_t relative = marks[i] - (int32_t)QZEN_QWEN21_TEXT_DROP;
+            if (relative < 0 || (size_t)relative >= kept) {
+                snprintf(error, error_size,
+                         "image pad slot %d is outside the trimmed prompt",
+                         (int)relative);
+                free(trimmed); free(trimmed_marks);
+                qzen_tokenizer_ids_free(encoded); free(marks);
+                return 0;
+            }
+            trimmed_marks[slots++] = relative;
+        }
+    }
+    int expected = 0;
+    for (int i = 0; i < image_count; i++) expected += pad_counts[i];
+    if (slots != expected) {
+        snprintf(error, error_size,
+                 "visual prompt produced %d image pad slots, expected %d",
+                 slots, expected);
+        free(trimmed); free(trimmed_marks);
+        qzen_tokenizer_ids_free(encoded); free(marks);
+        return 0;
+    }
+    qzen_tokenizer_ids_free(encoded);
+    free(marks);
+    *ids = trimmed;
+    *count = kept;
+    *pad_pos = trimmed_marks;
+    return 1;
+overflow:
+    free(text);
+    snprintf(error, error_size, "visual prompt template overflowed");
+    return 0;
+}
+
 /* ------------------------------------------------------------------ forward */
 
 static void q21_text_rope_tables(int tokens, float *cosine, float *sine) {
@@ -230,6 +344,82 @@ static void q21_text_rope_tables(int tokens, float *cosine, float *sine) {
             sine[(size_t)token * Q21_TEXT_GROUPS + pair] = (float)sin(angle);
         }
     }
+}
+
+/* Qwen3-VL uses multimodal RoPE: text tokens carry the same (t,h,w) position,
+ * image pads carry a constant temporal position plus row/column offsets from
+ * their merged image grid. Wan2GP composes the three frequency streams as
+ * mrope_section [24,20,20], i.e. h replaces pairs 1,4,...,58 and w replaces
+ * 2,5,...,59. The resulting 64-pair table is duplicated by the rotary kernel
+ * exactly like the text-only table. */
+static void q21_text_mrope_tables(int tokens, const int32_t *pad_pos, int pad_n,
+                                  const int *pad_counts, const int *grid_h,
+                                  const int *grid_w, int image_count,
+                                  float *cosine, float *sine) {
+    if (image_count <= 0 || pad_n <= 0 || !pad_pos || !pad_counts ||
+        !grid_h || !grid_w) {
+        q21_text_rope_tables(tokens, cosine, sine);
+        return;
+    }
+    int expected = 0;
+    for (int i = 0; i < image_count; i++) expected += pad_counts[i];
+    if (expected != pad_n || expected > tokens) {
+        q21_text_rope_tables(tokens, cosine, sine);
+        return;
+    }
+    int *position_t = calloc((size_t)tokens, sizeof(*position_t));
+    int *position_h = calloc((size_t)tokens, sizeof(*position_h));
+    int *position_w = calloc((size_t)tokens, sizeof(*position_w));
+    if (!position_t || !position_h || !position_w) {
+        free(position_t); free(position_h); free(position_w);
+        q21_text_rope_tables(tokens, cosine, sine);
+        return;
+    }
+    int current = 0;
+    int token = 0;
+    int slot = 0;
+    for (int image = 0; image < image_count; image++) {
+        int gh = grid_h[image] > 0 ? grid_h[image] : 1;
+        int gw = grid_w[image] > 0 ? grid_w[image] : 1;
+        int count = pad_counts[image];
+        while (token < tokens &&
+               (slot >= pad_n || pad_pos[slot] < 0 || token < pad_pos[slot])) {
+            position_t[token] = position_h[token] = position_w[token] = current;
+            current++;
+            token++;
+        }
+        for (int local = 0; local < count && token < tokens; local++, slot++, token++) {
+            int target = pad_pos[slot];
+            if (target < 0 || target >= tokens) continue;
+            position_t[target] = current;
+            position_h[target] = current + local / gw;
+            position_w[target] = current + local % gw;
+        }
+        int span = gh > gw ? gh : gw;
+        current += span > 0 ? span : 1;
+    }
+    while (token < tokens) {
+        position_t[token] = position_h[token] = position_w[token] = current;
+        current++;
+        token++;
+    }
+    double inverse[Q21_TEXT_GROUPS];
+    for (int pair = 0; pair < Q21_TEXT_GROUPS; pair++)
+        inverse[pair] = exp(-log(Q21_TEXT_THETA) *
+                            (double)(2 * pair) / (double)Q21_HEAD_DIM);
+    for (int t = 0; t < tokens; t++) {
+        double position[3] = {position_t[t], position_h[t], position_w[t]};
+        for (int pair = 0; pair < Q21_TEXT_GROUPS; pair++) {
+            double angle = position[0] * inverse[pair];
+            if (pair >= 1 && pair < 60 && (pair - 1) % 3 == 0)
+                angle = position[1] * inverse[pair];
+            else if (pair >= 2 && pair < 60 && (pair - 2) % 3 == 0)
+                angle = position[2] * inverse[pair];
+            cosine[(size_t)t * Q21_TEXT_GROUPS + pair] = (float)cos(angle);
+            sine[(size_t)t * Q21_TEXT_GROUPS + pair] = (float)sin(angle);
+        }
+    }
+    free(position_t); free(position_h); free(position_w);
 }
 
 /* rotate_half rotation: the second half of the head feeds the first. The same
@@ -348,9 +538,12 @@ static void q21_text_block_run(const q21_text_block *block, const q21_text_norms
     }
 }
 
-int qzen_qwen21_text_forward(qzen_qwen21_text *model, const uint32_t *ids, size_t count,
-                           float *hidden_out, float *trace, char *error,
-                           size_t error_size) {
+static int q21_text_forward_impl(qzen_qwen21_text *model, const uint32_t *ids,
+                                 size_t count, float *hidden_out, float *trace,
+                                 const float *rope_cos, const float *rope_sin,
+                                 const float *visual, const int32_t *pad_pos,
+                                 int pad_n, const float *const deep[3],
+                                 char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!model || !ids || !count || !hidden_out) {
         snprintf(error, error_size, "invalid Qwen3-VL text forward request");
@@ -376,8 +569,9 @@ int qzen_qwen21_text_forward(qzen_qwen21_text *model, const uint32_t *ids, size_
         }
     }
     if (model->gpu) {
-        return q21_text_gpu_forward(model, ids, count, hidden_out, trace, error,
-                                    error_size);
+        return q21_text_gpu_forward(model, ids, count, hidden_out, trace,
+                                    rope_cos, rope_sin, visual, pad_pos,
+                                    pad_n, deep, error, error_size);
     }
     const int tokens = (int)count;
     const int threads = model->threads;
@@ -411,7 +605,27 @@ int qzen_qwen21_text_forward(qzen_qwen21_text *model, const uint32_t *ids, size_
             goto done;
         }
     }
-    q21_text_rope_tables(tokens, cosine, sine);
+    if (pad_n > 0) {
+        if (!visual || !pad_pos) {
+            snprintf(error, error_size, "visual rows without pad positions");
+            goto done;
+        }
+        for (int slot = 0; slot < pad_n; slot++) {
+            int token = pad_pos[slot];
+            if (token < 0 || token >= tokens) {
+                snprintf(error, error_size, "image pad slot %d is outside the prompt", token);
+                goto done;
+            }
+            memcpy(hidden + (size_t)token * Q21_HIDDEN,
+                   visual + (size_t)slot * Q21_HIDDEN, Q21_HIDDEN * sizeof(float));
+        }
+    }
+    if (rope_cos && rope_sin) {
+        memcpy(cosine, rope_cos, (size_t)tokens * Q21_TEXT_GROUPS * sizeof(float));
+        memcpy(sine, rope_sin, (size_t)tokens * Q21_TEXT_GROUPS * sizeof(float));
+    } else {
+        q21_text_rope_tables(tokens, cosine, sine);
+    }
     for (int layer = 0; layer < QZEN_QWEN21_TEXT_LAYERS; layer++) {
         q21_text_block block;
         if (!q21_text_block_load(model, layer, &block, error, error_size)) goto done;
@@ -419,6 +633,14 @@ int qzen_qwen21_text_forward(qzen_qwen21_text *model, const uint32_t *ids, size_
                            attended, gate_out, up_out, projected, scores, cosine, sine,
                            threads);
         q21_text_block_free(&block);
+        if (deep && layer < 3 && deep[layer]) {
+            for (int slot = 0; slot < pad_n; slot++) {
+                int token = pad_pos[slot];
+                const float *row = deep[layer] + (size_t)slot * Q21_HIDDEN;
+                float *target = hidden + (size_t)token * Q21_HIDDEN;
+                for (int d = 0; d < Q21_HIDDEN; d++) target[d] += row[d];
+            }
+        }
         if (trace) {
             memcpy(trace + (size_t)layer * Q21_HIDDEN,
                    hidden + (size_t)(tokens - 1) * Q21_HIDDEN, Q21_HIDDEN * sizeof(float));
@@ -439,6 +661,72 @@ done:
     free(scores);
     free(cosine);
     free(sine);
+    return ok;
+}
+
+int qzen_qwen21_text_forward(qzen_qwen21_text *model, const uint32_t *ids,
+                             size_t count, float *hidden_out, float *trace,
+                             char *error, size_t error_size) {
+    return q21_text_forward_impl(model, ids, count, hidden_out, trace, NULL,
+                                 NULL, NULL, NULL, 0, NULL, error, error_size);
+}
+
+int qzen_qwen21_text_forward_vision(qzen_qwen21_text *model, const uint32_t *ids,
+                                    size_t count, const float *visual,
+                                    const int32_t *pad_pos, int pad_n,
+                                    const float *const deep[3], float *hidden,
+                                    char *error, size_t error_size) {
+    if (pad_n < 0) {
+        snprintf(error, error_size, "negative image pad count");
+        return 0;
+    }
+    if (pad_n > 0 && (!visual || !pad_pos)) {
+        snprintf(error, error_size, "visual rows need pad positions");
+        return 0;
+    }
+    return q21_text_forward_impl(model, ids, count, hidden, NULL, NULL, NULL,
+                                 visual, pad_pos, pad_n, deep, error, error_size);
+}
+
+int qzen_qwen21_text_forward_vision_ex(qzen_qwen21_text *model,
+                                       const uint32_t *ids, size_t count,
+                                       const float *visual,
+                                       const int32_t *pad_pos, int pad_n,
+                                       const float *const deep[3],
+                                       const int *pad_counts,
+                                       const int *grid_h, const int *grid_w,
+                                       int image_count,
+                                       float *hidden, char *error,
+                                       size_t error_size) {
+    if (pad_n < 0) {
+        snprintf(error, error_size, "negative image pad count");
+        return 0;
+    }
+    if (pad_n > 0 && (!visual || !pad_pos)) {
+        snprintf(error, error_size, "visual rows need pad positions");
+        return 0;
+    }
+    if (image_count > 0 && (!pad_counts || !grid_h || !grid_w)) {
+        snprintf(error, error_size, "visual grids need per-image dimensions");
+        return 0;
+    }
+    float *rope_cos = NULL, *rope_sin = NULL;
+    const size_t rope_values = (size_t)count * Q21_TEXT_GROUPS;
+    if (pad_n > 0 && image_count > 0) {
+        rope_cos = malloc(rope_values * sizeof(*rope_cos));
+        rope_sin = malloc(rope_values * sizeof(*rope_sin));
+        if (!rope_cos || !rope_sin) {
+            free(rope_cos); free(rope_sin);
+            snprintf(error, error_size, "out of memory for image mRoPE tables");
+            return 0;
+        }
+        q21_text_mrope_tables((int)count, pad_pos, pad_n, pad_counts, grid_h,
+                              grid_w, image_count, rope_cos, rope_sin);
+    }
+    int ok = q21_text_forward_impl(model, ids, count, hidden, NULL, rope_cos,
+                                   rope_sin, visual, pad_pos, pad_n, deep,
+                                   error, error_size);
+    free(rope_cos); free(rope_sin);
     return ok;
 }
 
@@ -484,6 +772,10 @@ void qzen_qwen21_text_close(qzen_qwen21_text *model) {
 
 double qzen_qwen21_text_weight_seconds(const qzen_qwen21_text *model) {
     return model ? model->weight_seconds : 0.0;
+}
+
+qzen_st_header *qzen_qwen21_text_header(qzen_qwen21_text *model) {
+    return model ? &model->header : NULL;
 }
 
 int qzen_qwen21_text_on_device(const qzen_qwen21_text *model) {
@@ -974,8 +1266,11 @@ static void q21_text_gpu_free(struct q21_text_gpu *ctx) {
 }
 
 static int q21_text_gpu_forward(qzen_qwen21_text *model, const uint32_t *ids, size_t count,
-                                float *hidden_out, float *trace, char *error,
-                                size_t error_size) {
+                                float *hidden_out, float *trace,
+                                const float *rope_cos, const float *rope_sin,
+                                const float *visual, const int32_t *pad_pos,
+                                int pad_n, const float *const deep[3],
+                                char *error, size_t error_size) {
     q21_text_gpu *ctx = model->gpu;
     const int tokens = (int)count;
     const size_t dim = (size_t)tokens * Q21_HIDDEN;
@@ -983,6 +1278,29 @@ static int q21_text_gpu_forward(qzen_qwen21_text *model, const uint32_t *ids, si
     if (ctx->tokens != tokens &&
         !q21_text_gpu_scratch_alloc(ctx, tokens, error, error_size)) {
         return 0;
+    }
+    if (rope_cos && rope_sin) {
+        uint16_t *staged = malloc((size_t)tokens * Q21_TEXT_GROUPS * sizeof(*staged));
+        if (!staged) {
+            snprintf(error, error_size, "out of memory for mRoPE upload");
+            return 0;
+        }
+        for (size_t i = 0; i < (size_t)tokens * Q21_TEXT_GROUPS; i++)
+            staged[i] = q21_text_bf16(rope_cos[i]);
+        int uploaded = qzen_gpu_tensor_write_bf16(ctx->rope_cos, staged,
+                                                  (size_t)tokens * Q21_TEXT_GROUPS);
+        if (uploaded) {
+            for (size_t i = 0; i < (size_t)tokens * Q21_TEXT_GROUPS; i++)
+                staged[i] = q21_text_bf16(rope_sin[i]);
+            uploaded = qzen_gpu_tensor_write_bf16(ctx->rope_sin, staged,
+                                                  (size_t)tokens * Q21_TEXT_GROUPS);
+        }
+        free(staged);
+        if (!uploaded) {
+            snprintf(error, error_size, "mRoPE upload failed: %s",
+                     qzen_gpu_error(ctx->gpu));
+            return 0;
+        }
     }
     float *embedding = malloc(dim * sizeof(float));
     if (!embedding) {
@@ -1002,6 +1320,22 @@ static int q21_text_gpu_forward(qzen_qwen21_text *model, const uint32_t *ids, si
             goto done;
         }
     }
+    if (pad_n > 0) {
+        if (!visual || !pad_pos) {
+            snprintf(error, error_size, "visual rows without pad positions");
+            goto done;
+        }
+        for (int slot = 0; slot < pad_n; slot++) {
+            int token = pad_pos[slot];
+            if (token < 0 || token >= tokens) {
+                snprintf(error, error_size, "image pad slot %d is outside the prompt",
+                         token);
+                goto done;
+            }
+            memcpy(embedding + (size_t)token * Q21_HIDDEN,
+                   visual + (size_t)slot * Q21_HIDDEN, Q21_HIDDEN * sizeof(float));
+        }
+    }
     if (!qzen_gpu_tensor_write_f32(ctx->carrier, embedding, dim)) {
         snprintf(error, error_size, "embedding upload failed: %s",
                  qzen_gpu_error(ctx->gpu));
@@ -1015,6 +1349,22 @@ static int q21_text_gpu_forward(qzen_qwen21_text *model, const uint32_t *ids, si
         }
         ctx->weight_seconds += q21_now() - load_started;
         if (!q21_text_gpu_block(ctx, tokens, error, error_size)) goto done;
+        if (deep && layer < 3 && deep[layer] && pad_n > 0) {
+            if (!qzen_gpu_tensor_read_f32(ctx->carrier, embedding, dim)) {
+                snprintf(error, error_size, "carrier read failed during deepstack %d", layer);
+                goto done;
+            }
+            for (int slot = 0; slot < pad_n; slot++) {
+                int token = pad_pos[slot];
+                const float *row = deep[layer] + (size_t)slot * Q21_HIDDEN;
+                float *target = embedding + (size_t)token * Q21_HIDDEN;
+                for (int d = 0; d < Q21_HIDDEN; d++) target[d] += row[d];
+            }
+            if (!qzen_gpu_tensor_write_f32(ctx->carrier, embedding, dim)) {
+                snprintf(error, error_size, "carrier upload failed during deepstack %d", layer);
+                goto done;
+            }
+        }
         if (trace) {
             /* Reading a row synchronises the stream, so the per-layer trace is
              * only collected when the caller asked for it (tests, diagnosis). */
