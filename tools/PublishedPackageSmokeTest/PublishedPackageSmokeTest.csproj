@@ -14,7 +14,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="QwenZImage.NET" Version="0.3.0" />
+    <PackageReference Include="QwenZImage.NET" Version="0.3.1" />
   </ItemGroup>
 
 </Project>

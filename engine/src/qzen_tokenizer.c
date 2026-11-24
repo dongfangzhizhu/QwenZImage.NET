@@ -1190,11 +1190,19 @@ int qzen_tokenizer_encode_spans(const qzen_tokenizer *tokenizer, const char *utf
             if (!plain) goto done;
             memcpy(plain, utf8 + start, match_start - start);
             plain[match_start - start] = '\0';
+            /* qzen_encode_plain() APPENDS to output: only the delta belongs in
+             * marks_count. Using output.count (the running total) here shifts
+             * every later marker slot to the right by the number of tokens
+             * emitted before this span, so callers scanning marks[0..count)
+             * silently miss markers once the prompt has several special tokens
+             * (e.g. <|im_start|> / <|im_end|> before a short image-pad run). */
+            size_t before_plain = output.count;
             int plain_ok = qzen_encode_plain(tokenizer, plain, &output, error, error_size);
             free(plain);
             if (!plain_ok) goto done;
-            if (marks_count + output.count > marks_cap) {
-                size_t wanted = marks_count + output.count;
+            size_t plain_tokens = output.count - before_plain;
+            if (marks_count + plain_tokens > marks_cap) {
+                size_t wanted = marks_count + plain_tokens;
                 int32_t *grown = realloc(marks, wanted * sizeof(*grown));
                 if (!grown) {
                     qzen_tok_error(error, error_size, "out of memory encoding prompt");
@@ -1205,7 +1213,7 @@ int qzen_tokenizer_encode_spans(const qzen_tokenizer *tokenizer, const char *utf
                 marks = grown;
                 marks_cap = wanted;
             }
-            marks_count += output.count;
+            marks_count += plain_tokens;
         }
         uint32_t token_id;
         if (!qzen_map_get(&tokenizer->added_tokens, added, &token_id)) {

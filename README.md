@@ -4,7 +4,7 @@
 
 - NuGet：<https://www.nuget.org/packages/QwenZImage.NET>
 - 仓库：<https://github.com/dongfangzhizhu/QwenZImage.NET>
-- 当前版本：**0.3.0**
+- 当前版本：**0.3.1**
 
 ## 目录
 
@@ -72,6 +72,8 @@ Console.WriteLine(client.GetHealth().IsReferenceBackend
 | Z-Image 逐组件替换 | DiT / VAE / text encoder / tokenizer 可分别指向 BF16、Quanto INT8、Nunchaku int4、FP8 或 GGUF 文件；不设置时保持原单包行为 | `zimage_*_dir` 配置项或 `QZI_ZIMAGE_*` 环境变量 |
 
 这三项改动已通过 **C ABI 冒烟测试 + 250 个托管单元测试**，并在本机 RTX 4090 + 本地模型上用真实 CUDA 后端完成出图验证；验证方式见[发布包真机验证](#发布包真机验证)。
+
+**0.3.1 补丁**：修复 Qwen3-VL 视觉提示的 tokenizer 标记偏移计数——少量 `<|image_pad|>`（例如 256×256 身份参考）时标记错位会导致 `visual prompt produced N image pad slots` 错误；现在任意 pad 数量都能正确对齐。
 
 ## 能力
 
@@ -183,7 +185,7 @@ ASP.NET Core Minimal API，Windows / Linux 同一套代码，提供 health、pre
 
 ## NuGet 包内容
 
-以 `QwenZImage.NET.0.3.0.nupkg` 为例：
+以 `QwenZImage.NET.0.3.1.nupkg` 为例：
 
 ```text
 ├─ lib/net10.0/QwenZImage.NET.dll
@@ -224,7 +226,7 @@ dotnet pack  src/QwenZImage.NET/QwenZImage.NET.csproj -c Release -o artifacts/pa
 
 ## 发布
 
-发布走 **NuGet Trusted Publishing**：`.github/workflows/release.yml` 在 `v*` tag 上触发（或手动 dispatch），用 GitHub OIDC token 换短期 API key，仓库不保存长期 `NUGET_API_KEY`。版本以 `v<version>` tag 为准（tag 会覆盖 csproj 里的 `<Version>` 作为打包版本）。已发布版本：`0.1.0`、`0.2.0`、`0.2.1`、`0.3.0`。
+发布走 **NuGet Trusted Publishing**：`.github/workflows/release.yml` 在 `v*` tag 上触发（或手动 dispatch），用 GitHub OIDC token 换短期 API key，仓库不保存长期 `NUGET_API_KEY`。版本以 `v<version>` tag 为准（tag 会覆盖 csproj 里的 `<Version>` 作为打包版本）。已发布版本：`0.1.0`、`0.2.0`、`0.2.1`、`0.3.0`、`0.3.1`。
 
 从源码发版：
 
@@ -234,7 +236,7 @@ dotnet build QwenZImage.NET.sln -c Release
 dotnet test  QwenZImage.NET.sln -c Release --no-build
 
 # 2. 提升 csproj <Version>，提交后打 tag 推送，CI 自动打包发布
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.3.1 && git push origin v0.3.1
 ```
 
 ### 发布包真机验证
