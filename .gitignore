@@ -63,3 +63,6 @@ PLAN.md
 # It verifies the package via PackageReference and writes sample PNGs for
 # manual review; keeping it out of the repo avoids shipping a tools/ consumer.
 tools/VerifyNuGetPackage/
+
+# Local NuGet caches used when restoring the published package into the smoke test.
+tools/PublishedPackageSmokeTest/.nuget-cache*/
